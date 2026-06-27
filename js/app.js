@@ -2071,7 +2071,9 @@ async function loadAdminOpsPanel() {
         <button class="btn btn-secondary" onclick="loadOpsMetrics()">↻ Refresh Metrics</button>
       </div>
       <div class="text-muted" style="font-size:12px;margin-top:6px">
-        Engine-wide counters, cumulative since startup. Sample twice to compute rates.
+        Engine-wide counters, cumulative since startup. In-memory only — reset to zero on
+        restart (some are repopulated by recovery work on the way up). Sample twice to
+        compute rates. Hover any label for what it measures.
       </div>
     </div>
     <div id="admin-ops-metrics"><div class="spinner"></div></div>
@@ -2097,7 +2099,7 @@ function renderOpsMetricsHtml(m) {
 
   const ratioPct = (x) => `${((x ?? 0) * 100).toFixed(1)}%`;
   const ratioCls = (x, warnBelow) => (x ?? 0) >= warnBelow ? 'good' : (x ?? 0) >= warnBelow * 0.6 ? 'warn' : 'bad';
-  const row = (k, v, cls) => `<div class="stat-row"><span class="stat-key">${k}</span>
+  const row = (k, v, cls, tip) => `<div class="stat-row"><span class="stat-key"${tip ? ` title="${esc(tip)}"` : ''}>${k}</span>
     <span class="stat-val ${cls ?? ''}">${v}</span></div>`;
   const bar = (ratio, label) => `
     <div style="margin:6px 0 10px">
@@ -2114,56 +2116,56 @@ function renderOpsMetricsHtml(m) {
   return `
     <div class="admin-grid">
       <div class="admin-card">
-        <div class="admin-card-title">READS</div>
+        <div class="admin-card-title" title="User-facing read path. In-memory counters, reset to zero on restart.">READS</div>
         ${bar(r.read_hit_ratio, `${ratioPct(r.read_hit_ratio)} hit ratio`)}
-        ${row('Reads', fmt(r.reads))}
-        ${row('Hits', fmt(r.read_hits), 'good')}
-        ${row('Misses', fmt(r.read_misses), (r.read_misses ?? 0) > 0 ? 'warn' : '')}
-        ${row('Hit Ratio', ratioPct(r.read_hit_ratio), ratioCls(r.read_hit_ratio, 0.8))}
-        ${row('Scans', fmt(r.scans))}
-        ${row('Scan Rows', fmt(r.scan_rows))}
+        ${row('Reads', fmt(r.reads), '', 'User-facing point reads (GET by key) since startup.')}
+        ${row('Hits', fmt(r.read_hits), 'good', 'Reads that found a live value.')}
+        ${row('Misses', fmt(r.read_misses), (r.read_misses ?? 0) > 0 ? 'warn' : '', 'Reads that found nothing — absent or tombstoned key.')}
+        ${row('Hit Ratio', ratioPct(r.read_hit_ratio), ratioCls(r.read_hit_ratio, 0.8), 'Hits / Reads.')}
+        ${row('Scans', fmt(r.scans), '', 'Multi-key scans (range / prefix) executed.')}
+        ${row('Scan Rows', fmt(r.scan_rows), '', 'Total rows returned across all scans.')}
       </div>
 
       <div class="admin-card">
-        <div class="admin-card-title">LSM LOOKUPS</div>
+        <div class="admin-card-title" title="Internal LSM-tree probes behind the read path. In-memory, reset on restart.">LSM LOOKUPS</div>
         ${bar(l.fast_path_hit_ratio, `${ratioPct(l.fast_path_hit_ratio)} fast-path`)}
-        ${row('Lookups', fmt(l.lookups))}
-        ${row('Fast-path Hits', fmt(l.fast_path_hits), 'good')}
-        ${row('Fast-path Ratio', ratioPct(l.fast_path_hit_ratio), ratioCls(l.fast_path_hit_ratio, 0.5))}
-        ${row('L0 Probes', fmt(l.l0_probes))}
-        ${row('L1 Probes', fmt(l.l1_probes))}
-        ${row('Bloom Rejects', fmt(l.bloom_rejects))}
+        ${row('Lookups', fmt(l.lookups), '', 'LSM point lookups. ≥ Reads — also counts GC-validation reads and WAL-replay probes (so it jumps after a restart).')}
+        ${row('Fast-path Hits', fmt(l.fast_path_hits), 'good', 'Lookups served by the active memtable without scanning lower layers.')}
+        ${row('Fast-path Ratio', ratioPct(l.fast_path_hit_ratio), ratioCls(l.fast_path_hit_ratio, 0.5), 'Fast-path Hits / Lookups.')}
+        ${row('L0 Probes', fmt(l.l0_probes), '', 'Lookups that scanned at least one L0 SSTable.')}
+        ${row('L1 Probes', fmt(l.l1_probes), '', 'Lookups that scanned the L1 SSTable (not rejected by the bloom filter).')}
+        ${row('Bloom Rejects', fmt(l.bloom_rejects), '', 'L1 lookups short-circuited by the bloom filter ("definitely absent") — work avoided.')}
       </div>
 
       <div class="admin-card">
-        <div class="admin-card-title">WRITES</div>
-        ${row('Puts', fmt(w.puts))}
-        ${row('Deletes', fmt(w.deletes))}
-        ${row('No-WAL Puts', fmt(w.no_wal_puts))}
-        ${row('WAL Appended', fmtBytes(w.wal_bytes_appended))}
-        ${row('WAL Fsyncs', fmt(w.wal_fsyncs))}
-        ${row('Apply Failures', fmt(w.apply_failures), apFailCls)}
+        <div class="admin-card-title" title="Write path throughput and durability cost. In-memory, reset on restart.">WRITES</div>
+        ${row('Puts', fmt(w.puts), '', 'WAL-backed upserts applied.')}
+        ${row('Deletes', fmt(w.deletes), '', 'WAL-backed deletes applied.')}
+        ${row('No-WAL Puts', fmt(w.no_wal_puts), '', 'Upserts written bypassing the WAL (skip_wal path, e.g. vector payloads).')}
+        ${row('WAL Appended', fmtBytes(w.wal_bytes_appended), '', 'Total bytes appended to the WAL.')}
+        ${row('WAL Fsyncs', fmt(w.wal_fsyncs), '', 'WAL fsyncs — one per WAL-backed write. The durability cost of writes.')}
+        ${row('Apply Failures', fmt(w.apply_failures), apFailCls, 'In-memory applies that failed after retry. Data is still durable in the WAL.')}
       </div>
 
       <div class="admin-card">
-        <div class="admin-card-title">COMPACTION</div>
-        ${row('Memtable Flushes', fmt(c.memtable_flushes))}
-        ${row('L0→L1 Compactions', fmt(c.l0_l1_compactions))}
-        ${row('Bytes Merged', fmtBytes(c.compaction_bytes_merged))}
-        ${row('Duration', fmtMillis(c.compaction_duration_ms))}
+        <div class="admin-card-title" title="LSM memtable flushes and level compactions. In-memory, reset on restart.">COMPACTION</div>
+        ${row('Memtable Flushes', fmt(c.memtable_flushes), '', 'Memtable → L0 SSTable flushes.')}
+        ${row('L0→L1 Compactions', fmt(c.l0_l1_compactions), '', 'L0 → L1 compactions run.')}
+        ${row('Bytes Merged', fmtBytes(c.compaction_bytes_merged), '', 'Total bytes merged during compactions.')}
+        ${row('Duration', fmtMillis(c.compaction_duration_ms), '', 'Cumulative time spent compacting.')}
       </div>
 
       <div class="admin-card">
-        <div class="admin-card-title">GARBAGE COLLECTION</div>
-        ${row('VLog GC Runs', fmt(g.vlog_gc_runs))}
-        ${row('VLog GC Duration', fmtMillis(g.vlog_gc_duration_ms))}
-        ${row('WAL GC Runs', fmt(g.wal_gc_runs))}
-        ${row('WAL Segments Deleted', fmt(g.wal_segments_deleted))}
+        <div class="admin-card-title" title="Value-log and WAL space reclamation. In-memory, reset on restart.">GARBAGE COLLECTION</div>
+        ${row('VLog GC Runs', fmt(g.vlog_gc_runs), '', 'Value-log GC passes run.')}
+        ${row('VLog GC Duration', fmtMillis(g.vlog_gc_duration_ms), '', 'Cumulative value-log GC time.')}
+        ${row('WAL GC Runs', fmt(g.wal_gc_runs), '', 'WAL GC passes run.')}
+        ${row('WAL Segments Deleted', fmt(g.wal_segments_deleted), '', 'WAL segments reclaimed by GC.')}
       </div>
 
       <div class="admin-card">
         <div class="admin-card-title">UPTIME</div>
-        ${row('Since Startup', fmtUptime(m.uptime_s))}
+        ${row('Since Startup', fmtUptime(m.uptime_s), '', 'Seconds since the server process started.')}
       </div>
     </div>
   `;
@@ -2215,40 +2217,40 @@ async function loadStorageStats() {
         </div>
 
         <div class="admin-card">
-          <div class="admin-card-title">STORAGE STATS</div>
-          <div class="stat-row"><span class="stat-key">Live Data</span>
+          <div class="admin-card-title" title="Engine-wide value-log aggregate, recomputed from on-disk state on every request — survives restart.">STORAGE STATS</div>
+          <div class="stat-row"><span class="stat-key" title="Live (non-garbage) bytes in the value log.">Live Data</span>
             <span class="stat-val">${fmtBytes(s.live_bytes)}</span></div>
-          <div class="stat-row"><span class="stat-key">Garbage</span>
+          <div class="stat-row"><span class="stat-key" title="Reclaimable dead bytes across the value log (superseded or deleted records awaiting GC).">Garbage</span>
             <span class="stat-val ${wasteClass}">${fmtBytes(s.garbage_bytes)}</span></div>
-          <div class="stat-row"><span class="stat-key">Waste Ratio</span>
+          <div class="stat-row"><span class="stat-key" title="Dead / total written. High = value-log GC is overdue.">Waste Ratio</span>
             <span class="stat-val ${wasteClass}">${s.waste_ratio_pct.toFixed(1)}%</span></div>
-          <div class="stat-row"><span class="stat-key">Free Space</span>
+          <div class="stat-row"><span class="stat-key" title="Free fraction of the allocated value-log region.">Free Space</span>
             <span class="stat-val">${s.free_space_ratio_pct.toFixed(1)}%</span></div>
-          <div class="stat-row"><span class="stat-key">GC Runs</span>
+          <div class="stat-row"><span class="stat-key" title="Value-log GC passes ever run (persisted in metadata).">GC Runs</span>
             <span class="stat-val">${fmt(s.total_gc_runs)}</span></div>
-          <div class="stat-row"><span class="stat-key">Bytes Reclaimed</span>
+          <div class="stat-row"><span class="stat-key" title="Bytes ever reclaimed by value-log GC (persisted).">Bytes Reclaimed</span>
             <span class="stat-val">${fmtBytes(s.total_bytes_reclaimed)}</span></div>
         </div>
 
         <div class="admin-card">
-          <div class="admin-card-title">WAL</div>
-          <div class="stat-row"><span class="stat-key">Total Entries</span>
+          <div class="admin-card-title" title="Write-ahead log metadata, read from on-disk state — survives restart.">WAL</div>
+          <div class="stat-row"><span class="stat-key" title="Entries currently tracked in the WAL.">Total Entries</span>
             <span class="stat-val">${fmt(w.total_entries)}</span></div>
-          <div class="stat-row"><span class="stat-key">Persisted</span>
+          <div class="stat-row"><span class="stat-key" title="Entries already applied and persisted to the LSM tree.">Persisted</span>
             <span class="stat-val good">${fmt(w.persisted_entries)}</span></div>
-          <div class="stat-row"><span class="stat-key">Pending</span>
+          <div class="stat-row"><span class="stat-key" title="Total − Persisted. Entries that would be replayed on the next open. A large backlog hints at flush lag.">Pending</span>
             <span class="stat-val ${pendClass}">${fmt(w.pending_entries)}</span></div>
-          <div class="stat-row"><span class="stat-key">GC Runs</span>
+          <div class="stat-row"><span class="stat-key" title="WAL GC passes ever run (persisted).">GC Runs</span>
             <span class="stat-val">${fmt(w.total_gc_runs)}</span></div>
-          <div class="stat-row"><span class="stat-key">Bytes Reclaimed</span>
+          <div class="stat-row"><span class="stat-key" title="Bytes ever reclaimed by WAL GC (persisted).">Bytes Reclaimed</span>
             <span class="stat-val">${fmtBytes(w.total_bytes_reclaimed)}</span></div>
           ${w.live_segments != null ? `
-          <div class="stat-row"><span class="stat-key">Live Segments</span>
+          <div class="stat-row"><span class="stat-key" title="Tracked WAL segments still carrying entries (lower segments have been trimmed).">Live Segments</span>
             <span class="stat-val">${fmt(w.live_segments)}${w.base_segment_id != null ? ` <span class="text-muted" style="font-size:11px">from #${fmt(w.base_segment_id)}</span>` : ''}</span></div>` : ''}
           ${w.last_sequence != null ? `
-          <div class="stat-row"><span class="stat-key">Last Sequence</span>
+          <div class="stat-row"><span class="stat-key" title="Highest write sequence number the WAL has observed.">Last Sequence</span>
             <span class="stat-val">${fmt(w.last_sequence)}</span></div>` : ''}
-          <div class="stat-row"><span class="stat-key">Head → Tail</span>
+          <div class="stat-row"><span class="stat-key" title="WAL byte offsets of the live window (start → end).">Head → Tail</span>
             <span class="stat-val" style="font-size:11px">${fmt(w.head)} → ${fmt(w.tail)}</span></div>
         </div>
 
@@ -2478,10 +2480,10 @@ function renderIndexWasteSection(waste) {
           ${f.over_threshold ? '<span class="badge badge-error">over threshold</span>' : ''}
         </span>
         <span class="sys-store-meta">
-          <span class="stat-key">bitmap</span> ${wasteCell(f.bitmap_waste_ratio)}
-          <span class="stat-key" style="margin-left:12px">keymap</span> ${wasteCell(f.keymap_waste_ratio)}
+          <span class="stat-key" title="Reclaimable fraction of the bitmap blob store (one blob per distinct value, re-appended on every write). Grows with per-document churn.">bitmap</span> ${wasteCell(f.bitmap_waste_ratio)}
+          <span class="stat-key" style="margin-left:12px" title="Reclaimable fraction of the keymap blob store (slot → value). Grows under distinct-value churn.">keymap</span> ${wasteCell(f.keymap_waste_ratio)}
           ${f.distinct_count != null
-            ? `<span class="stat-key" style="margin-left:12px">distinct</span>
+            ? `<span class="stat-key" style="margin-left:12px" title="Distinct indexed values for this field.">distinct</span>
                <span class="stat-val">${fmt(f.distinct_count)}</span>` : ''}
         </span>
       </div>`).join('');
@@ -3158,15 +3160,15 @@ function renderVectorQueueSummarySection(summary) {
       </div>
       <div class="admin-grid" style="max-width:480px">
         <div class="admin-card">
-          <div class="stat-row"><span class="stat-key">Max Retries</span>
+          <div class="stat-row"><span class="stat-key" title="Max embedding attempts per queue entry before it becomes exhausted (vector_index.max_retries config).">Max Retries</span>
             <span class="stat-val">${maxRetries}</span></div>
-          <div class="stat-row"><span class="stat-key">Total Pending</span>
+          <div class="stat-row"><span class="stat-key" title="Documents enqueued and awaiting embedding across all namespaces (actionable + retrying + exhausted).">Total Pending</span>
             <span class="stat-val ${pendingClass}">${fmt(totalPending)}</span></div>
-          <div class="stat-row"><span class="stat-key">Actionable</span>
+          <div class="stat-row"><span class="stat-key" title="Entries the worker will process now — not yet failed, or past their retry back-off.">Actionable</span>
             <span class="stat-val">${fmt(totalActionable)}</span></div>
-          <div class="stat-row"><span class="stat-key">Retrying</span>
+          <div class="stat-row"><span class="stat-key" title="Entries that failed at least once but are still within the retry budget (waiting out back-off).">Retrying</span>
             <span class="stat-val ${retryingClass}">${fmt(totalRetrying)}</span></div>
-          <div class="stat-row"><span class="stat-key">Exhausted</span>
+          <div class="stat-row"><span class="stat-key" title="Entries that spent their retry budget — stuck until manually reset (Retry Failed) or removed.">Exhausted</span>
             <span class="stat-val ${exhaustedClass}">${fmt(totalExhausted)}</span></div>
         </div>
       </div>
@@ -3219,7 +3221,10 @@ function renderVectorCorruptionSection(metrics) {
         <table class="tbl ns-ops-tbl">
           <colgroup><col class="ns-ops-col-ns"><col><col><col></colgroup>
           <thead><tr>
-            <th>Namespace</th><th>Sparse (Pass-1)</th><th>Dense (Pass-2)</th><th>Total Skipped</th>
+            <th>Namespace</th>
+            <th title="Sparse-vector entries (search Pass 1) skipped because their stored bytes failed to deserialize.">Sparse (Pass-1)</th>
+            <th title="Dense-vector entries (search Pass 2) skipped because their stored bytes failed to deserialize.">Dense (Pass-2)</th>
+            <th title="Total entries skipped on read since startup (in-memory, resets on restart). Rising = stored vectors are corrupt and queries are silently degraded — run a validating Reconcile.">Total Skipped</th>
           </tr></thead>
           <tbody>${rows}</tbody>
           ${entries.length > 1 ? `
@@ -3343,7 +3348,9 @@ function renderNamespaceControlsSection(byNs) {
           <col class="ns-ops-col-ns"><col><col class="ns-ops-col-actions">
         </colgroup>
         <thead><tr>
-          <th>Namespace</th><th>Queue Depth</th><th>Operations</th>
+          <th>Namespace</th>
+          <th title="Embedding queue backlog for this namespace — pending (awaiting embedding) and exhausted (gave up after max retries) counts. 'idle' means the queue is empty.">Queue Depth</th>
+          <th>Operations</th>
         </tr></thead>
         <tbody>${vectorRows.join('') || emptyRow(3, 'No stores with semantic search enabled')}</tbody>
       </table>

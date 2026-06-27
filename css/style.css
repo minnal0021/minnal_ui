@@ -416,6 +416,10 @@ select { cursor: pointer; }
             padding: 5px 0; border-bottom: 1px solid var(--border); }
 .stat-row:last-child { border-bottom: none; }
 .stat-key { color: var(--text-2); font-size: 12px; }
+/* Labels carrying an explanatory tooltip get a help cursor + dotted underline. */
+.stat-key[title], .admin-card-title[title] { cursor: help; }
+.stat-key[title] { border-bottom: 1px dotted var(--border-light); }
+.tbl th[title] { cursor: help; text-decoration: underline dotted var(--text-3); text-underline-offset: 3px; }
 .stat-val { font-weight: 600; font-family: monospace; color: var(--text); }
 .stat-val.good { color: var(--success); }
 .stat-val.warn { color: var(--warning); }
