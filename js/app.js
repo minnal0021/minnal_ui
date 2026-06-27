@@ -2045,7 +2045,8 @@ async function loadAdminStoragePanel() {
         <button class="btn btn-ghost" onclick="adminTriggerGc()">⚡ Trigger GC</button>
         <button class="btn btn-ghost" onclick="adminTriggerWalGc()">⚡ Trigger WAL GC</button>
         <button class="btn btn-ghost" onclick="adminCompact()">⚡ Compact LSM</button>
-        <button class="btn btn-ghost" onclick="adminIndexCheckpoint()">⚡ Index Checkpoint</button>
+        <button class="btn btn-ghost" onclick="adminIndexCheckpoint(this)"
+                title="Flush and compact field indices in the background — only one run at a time">⚡ Index Checkpoint</button>
         <button class="btn btn-secondary" onclick="adminRefresh()">↻ Refresh Stats</button>
         <button class="btn btn-ghost" onclick="adminImportSchema()">⬆ Import Schema</button>
         <button class="btn btn-danger" onclick="adminClearQueryCache()">🗑 Clear Query Cache</button>
@@ -2898,19 +2899,23 @@ async function adminCompact() {
   }
 }
 
-async function adminIndexCheckpoint() {
+async function adminIndexCheckpoint(btn) {
   const el = document.getElementById('admin-action-result');
   if (!el) return;
+  if (btn) btn.disabled = true;
   el.innerHTML = '<div class="spinner"></div>';
   try {
-    const r = await Api.indexCheckpoint();
-    el.innerHTML = `<div class="alert alert-success">
-      Index checkpoint complete — ${fmt(r.fields_checkpointed)} field index(es) checkpointed.
-    </div>`;
-    toast('Index checkpoint complete');
+    await Api.indexCheckpoint();
+    const msg = 'Index checkpoint started — the flush and compaction run in the background. '
+      + 'Check the server log file for progress and the checkpointed field count.';
+    el.innerHTML = `<div class="alert alert-success">${msg}</div>`;
+    toast('Index checkpoint started — see log for progress');
     loadStorageStats();
   } catch (e) {
     el.innerHTML = `<div class="alert alert-error">${esc(e.message)}</div>`;
+    toast(`Index checkpoint failed: ${e.message}`, 'error');
+  } finally {
+    if (btn) btn.disabled = false;
   }
 }
 
