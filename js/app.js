@@ -2040,6 +2040,14 @@ async function loadAdminStoragePanel() {
   if (!panel) return;
   panel.innerHTML = `
     <div class="section">
+      <div class="section-header"><span class="section-title">SCHEMA MANAGEMENT</span></div>
+      <div class="admin-actions">
+        <button class="btn btn-ghost" onclick="adminImportSchema()">⬆ Import Schema</button>
+      </div>
+      <input type="file" id="admin-import-file" accept=".json,application/json" style="display:none"
+             onchange="adminImportSchemaFile(this)">
+    </div>
+    <div class="section">
       <div class="section-header"><span class="section-title">ACTIONS</span></div>
       <div class="admin-actions">
         <button class="btn btn-ghost" onclick="adminTriggerGc()">⚡ Trigger GC</button>
@@ -2047,12 +2055,9 @@ async function loadAdminStoragePanel() {
         <button class="btn btn-ghost" onclick="adminCompact()">⚡ Compact LSM</button>
         <button class="btn btn-ghost" onclick="adminIndexCheckpoint(this)"
                 title="Flush and compact field indices in the background — only one run at a time">⚡ Index Checkpoint</button>
-        <button class="btn btn-secondary" onclick="adminRefresh()">↻ Refresh Stats</button>
-        <button class="btn btn-ghost" onclick="adminImportSchema()">⬆ Import Schema</button>
         <button class="btn btn-danger" onclick="adminClearQueryCache()">🗑 Clear Query Cache</button>
+        <button class="btn btn-secondary" style="margin-left:auto" onclick="adminRefresh()">↻ Refresh Stats</button>
       </div>
-      <input type="file" id="admin-import-file" accept=".json,application/json" style="display:none"
-             onchange="adminImportSchemaFile(this)">
       <div id="admin-action-result"></div>
     </div>
     <div id="admin-storage-stats"><div class="spinner"></div></div>
@@ -2182,10 +2187,9 @@ async function loadStorageStats() {
   const area = document.getElementById('admin-storage-stats');
   if (!area) return;
   try {
-    const [h, s, w, sys, lsmArr, vlogArr, wasteRes] = await Promise.all([
+    const [h, s, w, sys, lsmArr, vlogArr] = await Promise.all([
       Api.health(), Api.stats(), Api.wal(), Api.systemStores(), Api.lsm(),
       Api.valueLog().catch(() => null),
-      Api.indexWaste().catch(() => null),
     ]);
     state.adminStats = s; state.adminWal = w;
     state.adminLsm  = Object.fromEntries((lsmArr  ?? []).map(x => [x.namespace, x]));
@@ -2286,7 +2290,6 @@ async function loadStorageStats() {
       </div>
 
       ${renderSystemStoresSection(sys)}
-      ${renderIndexWasteSection(wasteRes)}
       ${renderDocStoresSection(state.stores, state.adminLsm, state.adminRowCounts)}
       ${renderKvStoresSection(state.kvStores, state.adminLsm)}
     `;
@@ -3028,6 +3031,7 @@ async function loadAdminIndexPanel() {
         ${renderVqBrowserHtml()}
       </div>
     </div>
+    <div id="admin-index-waste"></div>
     <div id="admin-index-operations"></div>
   `;
   await adminIndexRefresh();
@@ -3036,25 +3040,29 @@ async function loadAdminIndexPanel() {
 async function adminIndexRefresh() {
   const builds  = document.getElementById('admin-index-builds');
   const vstats  = document.getElementById('admin-index-vector-stats');
+  const waste   = document.getElementById('admin-index-waste');
   const ops     = document.getElementById('admin-index-operations');
   if (!vstats) return;
   vstats.innerHTML = '<div class="spinner"></div>';
   try {
-    const [progress, summary, corruption] = await Promise.all([
+    const [progress, summary, corruption, wasteRes] = await Promise.all([
       Api.indicesProgress(),
       Api.vectorQueueSummary(),
       Api.vectorCorruptionMetrics().catch(() => null),
+      Api.indexWaste().catch(() => null),
     ]);
     vqState.maxRetries = summary?.max_retries_configured ?? 0;
     // Attribute (field) builds sit above the frame; vector stats fill the
-    // frame; index operations go below. The queue browser is a persistent
-    // child of the frame and is not re-rendered here so its results survive.
+    // frame; field-index waste and index operations go below. The queue
+    // browser is a persistent child of the frame and is not re-rendered
+    // here so its results survive.
     if (builds) builds.innerHTML = renderAttributeBuildsSection(progress?.attribute_builds ?? []);
     vstats.innerHTML = `
       ${renderVectorProgressSection(progress?.vector_progress ?? [])}
       ${renderVectorQueueSummarySection(summary)}
       ${renderVectorCorruptionSection(corruption)}
     `;
+    if (waste) waste.innerHTML = renderIndexWasteSection(wasteRes);
     if (ops) ops.innerHTML = renderNamespaceControlsSection(summary?.by_namespace ?? []);
     refreshVqNsSelect(summary?.by_namespace ?? []);
   } catch (e) {
