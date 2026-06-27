@@ -223,6 +223,21 @@ select { cursor: pointer; }
 
 /* ── Sections ─────────────────────────────────────────────────────────── */
 .section       { margin-bottom: 28px; }
+
+/* Frame grouping related sections (e.g. all vector-index controls) together. */
+.index-frame {
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius);
+  background: var(--bg-1);
+  padding: 18px 18px 6px;
+  margin-bottom: 28px;
+}
+.index-frame-title {
+  font-size: 12px; font-weight: 700; letter-spacing: 1px;
+  color: var(--accent); text-transform: uppercase; margin-bottom: 16px;
+}
+.index-frame > .section:last-child { margin-bottom: 0; }
+#admin-index-queue-browser .section { margin-bottom: 0; }
 .section-header {
   display: flex; align-items: center; justify-content: space-between;
   margin-bottom: 12px; padding-bottom: 8px;
@@ -245,6 +260,14 @@ select { cursor: pointer; }
   background: var(--bg-2);
 }
 .tbl td { padding: 10px 12px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+
+/* Index Operations: fix the namespace column and shrink the operations
+   column to its buttons (width:1% + nowrap), letting the middle (details)
+   column absorb the remaining width so every row's columns line up. */
+.ns-ops-col-ns      { width: 200px; }
+.ns-ops-col-actions { width: 1%; }
+.ns-ops-actions     { white-space: nowrap; }
+.tbl tfoot td { border-top: 2px solid var(--border); background: var(--bg-2); }
 .tbl tr:last-child td { border-bottom: none; }
 .tbl tr:hover td { background: var(--bg-hover); }
 .tbl-wrap {

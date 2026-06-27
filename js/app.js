@@ -3018,18 +3018,25 @@ async function loadAdminIndexPanel() {
               title="Scan all vector-indexed namespaces and re-enqueue any documents missing a vector entry">⚡ Reconcile Vector Index</button>
     </div>
     <div id="admin-index-action-result"></div>
-    <div id="admin-index-stats"><div class="spinner"></div></div>
-    <div id="admin-index-queue-browser" style="margin-top:4px">
-      ${renderVqBrowserHtml()}
+    <div id="admin-index-builds"></div>
+    <div class="index-frame">
+      <div class="index-frame-title">VECTOR INDEX</div>
+      <div id="admin-index-vector-stats"><div class="spinner"></div></div>
+      <div id="admin-index-queue-browser">
+        ${renderVqBrowserHtml()}
+      </div>
     </div>
+    <div id="admin-index-operations"></div>
   `;
   await adminIndexRefresh();
 }
 
 async function adminIndexRefresh() {
-  const area = document.getElementById('admin-index-stats');
-  if (!area) return;
-  area.innerHTML = '<div class="spinner"></div>';
+  const builds  = document.getElementById('admin-index-builds');
+  const vstats  = document.getElementById('admin-index-vector-stats');
+  const ops     = document.getElementById('admin-index-operations');
+  if (!vstats) return;
+  vstats.innerHTML = '<div class="spinner"></div>';
   try {
     const [progress, summary, corruption] = await Promise.all([
       Api.indicesProgress(),
@@ -3037,21 +3044,20 @@ async function adminIndexRefresh() {
       Api.vectorCorruptionMetrics().catch(() => null),
     ]);
     vqState.maxRetries = summary?.max_retries_configured ?? 0;
-    area.innerHTML = renderIndexStatsHtml(progress, summary, corruption);
+    // Attribute (field) builds sit above the frame; vector stats fill the
+    // frame; index operations go below. The queue browser is a persistent
+    // child of the frame and is not re-rendered here so its results survive.
+    if (builds) builds.innerHTML = renderAttributeBuildsSection(progress?.attribute_builds ?? []);
+    vstats.innerHTML = `
+      ${renderVectorProgressSection(progress?.vector_progress ?? [])}
+      ${renderVectorQueueSummarySection(summary)}
+      ${renderVectorCorruptionSection(corruption)}
+    `;
+    if (ops) ops.innerHTML = renderNamespaceControlsSection(summary?.by_namespace ?? []);
     refreshVqNsSelect(summary?.by_namespace ?? []);
   } catch (e) {
-    area.innerHTML = `<div class="alert alert-error">Failed to load index data: ${esc(e.message)}</div>`;
+    vstats.innerHTML = `<div class="alert alert-error">Failed to load index data: ${esc(e.message)}</div>`;
   }
-}
-
-function renderIndexStatsHtml(progress, summary, corruption) {
-  return `
-    ${renderAttributeBuildsSection(progress?.attribute_builds ?? [])}
-    ${renderVectorProgressSection(progress?.vector_progress ?? [])}
-    ${renderVectorQueueSummarySection(summary)}
-    ${renderVectorCorruptionSection(corruption)}
-    ${renderNamespaceControlsSection(summary?.by_namespace ?? [])}
-  `;
 }
 
 function renderAttributeBuildsSection(builds) {
@@ -3171,32 +3177,59 @@ function renderVectorQueueSummarySection(summary) {
 // ── Vector index corruption metrics ──────────────────────────────────────────
 // Process-wide, monotonic since startup. A non-zero/rising value means stored
 // vectors are corrupt and are being skipped at query time — reindex to repair.
+// Shape: { "<namespace>": { sparse, dense, total }, ... } (per-namespace snapshot).
 function renderVectorCorruptionSection(metrics) {
   if (!metrics) return '';
-  const total  = metrics.total_corrupt_skipped  ?? 0;
-  const sparse = metrics.sparse_corrupt_skipped ?? 0;
-  const dense  = metrics.dense_corrupt_skipped  ?? 0;
-  const totalClass = total > 0 ? 'bad' : 'good';
+
+  // Sort by total skipped (worst first), then namespace name.
+  const entries = Object.entries(metrics)
+    .map(([ns, m]) => ({
+      ns,
+      sparse: m?.sparse ?? 0,
+      dense:  m?.dense  ?? 0,
+      total:  m?.total  ?? 0,
+    }))
+    .sort((a, b) => b.total - a.total || a.ns.localeCompare(b.ns));
+
+  const grandTotal  = entries.reduce((n, e) => n + e.total,  0);
+  const grandSparse = entries.reduce((n, e) => n + e.sparse, 0);
+  const grandDense  = entries.reduce((n, e) => n + e.dense,  0);
+
+  const rows = entries.length
+    ? entries.map(e => `
+        <tr>
+          <td class="text-mono">${esc(e.ns)}</td>
+          <td><span class="stat-val ${e.sparse > 0 ? 'warn' : ''}">${fmt(e.sparse)}</span></td>
+          <td><span class="stat-val ${e.dense  > 0 ? 'warn' : ''}">${fmt(e.dense)}</span></td>
+          <td><span class="stat-val ${e.total  > 0 ? 'bad'  : 'good'}">${fmt(e.total)}</span></td>
+        </tr>`).join('')
+    : `<tr><td colspan="4" class="text-muted" style="padding:14px 12px">No namespaces with vector indices</td></tr>`;
 
   return `
     <div class="section">
       <div class="section-header">
-        <span class="section-title">VECTOR INDEX CORRUPTION</span>
+        <span class="section-title">VECTOR INDEX CORRUPTION METRICS</span>
         <span class="text-muted" style="font-size:12px">
-          entries skipped on read since startup${total > 0
+          entries skipped on read since startup${grandTotal > 0
             ? ' · <span class="stat-val bad">corrupt vectors present</span> — reindex affected namespaces'
             : ' · no corruption detected'}
         </span>
       </div>
-      <div class="admin-grid" style="max-width:480px">
-        <div class="admin-card">
-          <div class="stat-row"><span class="stat-key">Total Skipped</span>
-            <span class="stat-val ${totalClass}">${fmt(total)}</span></div>
-          <div class="stat-row"><span class="stat-key">Sparse (Pass-1)</span>
-            <span class="stat-val ${sparse > 0 ? 'warn' : ''}">${fmt(sparse)}</span></div>
-          <div class="stat-row"><span class="stat-key">Dense (Pass-2)</span>
-            <span class="stat-val ${dense > 0 ? 'warn' : ''}">${fmt(dense)}</span></div>
-        </div>
+      <div class="tbl-wrap">
+        <table class="tbl ns-ops-tbl">
+          <colgroup><col class="ns-ops-col-ns"><col><col><col></colgroup>
+          <thead><tr>
+            <th>Namespace</th><th>Sparse (Pass-1)</th><th>Dense (Pass-2)</th><th>Total Skipped</th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+          ${entries.length > 1 ? `
+          <tfoot><tr>
+            <td class="text-mono"><strong>All namespaces</strong></td>
+            <td><span class="stat-val ${grandSparse > 0 ? 'warn' : ''}">${fmt(grandSparse)}</span></td>
+            <td><span class="stat-val ${grandDense  > 0 ? 'warn' : ''}">${fmt(grandDense)}</span></td>
+            <td><span class="stat-val ${grandTotal  > 0 ? 'bad'  : 'good'}">${fmt(grandTotal)}</span></td>
+          </tr></tfoot>` : ''}
+        </table>
       </div>
     </div>
   `;
@@ -3215,31 +3248,32 @@ function renderNamespaceControlsSection(byNs) {
 
   if (relevantStores.length === 0) return `
     <div class="section">
-      <div class="section-header"><span class="section-title">NAMESPACE OPERATIONS</span></div>
+      <div class="section-header"><span class="section-title">INDEX OPERATIONS</span></div>
       <div class="text-muted" style="padding:8px 0">No stores with field indices or semantic search</div>
     </div>
   `;
 
-  // Emit one row per index type so buttons align with the index they operate on.
-  const rows = relevantStores.flatMap(s => {
+  // Split by index type so each sub-tab holds a homogeneous, well-aligned table.
+  const fieldRows = [];
+  const vectorRows = [];
+
+  relevantStores.forEach(s => {
     const ns         = s.namespace;
     const qStats     = byNsMap[ns];
     const hasIndices = s.storeType === 'doc' && (s.indices?.length ?? 0) > 0;
     const hasVector  = !!s.semantic_search_enabled;
     const pending    = qStats?.pending   ?? 0;
     const exhausted  = qStats?.exhausted ?? 0;
-    const result     = [];
 
     if (hasIndices) {
       const indicesHtml = s.indices.map(ix =>
         `<span class="badge badge-attr" style="margin-right:2px">${esc(ix.field)} <span style="opacity:.6">${esc(ix.index_type)}</span></span>`
       ).join('');
-      result.push(`
+      fieldRows.push(`
         <tr>
           <td class="text-mono">${esc(ns)}</td>
-          <td><span class="badge badge-indexed">Attribute</span></td>
           <td>${indicesHtml}</td>
-          <td class="gap-8" style="white-space:nowrap">
+          <td class="ns-ops-actions gap-8">
             <button class="btn btn-xs btn-ghost" onclick="toggleFieldBlobStats('${esc(ns)}',this)"
                     title="On-disk blob growth/waste per field (complements fleet-wide Field Index Waste)">Blob Stats ▾</button>
             <button class="btn btn-xs btn-ghost" onclick="showReindexDocFieldModal('${esc(ns)}')"
@@ -3251,7 +3285,7 @@ function renderNamespaceControlsSection(byNs) {
           </td>
         </tr>
         <tr id="blob-row-${esc(ns)}" style="display:none">
-          <td colspan="4" id="blob-cell-${esc(ns)}" style="padding:0"></td>
+          <td colspan="3" id="blob-cell-${esc(ns)}" style="padding:0"></td>
         </tr>`);
     }
 
@@ -3262,12 +3296,11 @@ function renderNamespaceControlsSection(byNs) {
             pending   > 0 ? `<span class="stat-val warn" style="font-size:11px">${fmt(pending)} pending</span>`     : '',
             exhausted > 0 ? `<span class="stat-val bad"  style="font-size:11px">${fmt(exhausted)} exhausted</span>` : '',
           ].filter(Boolean).join(' ');
-      result.push(`
+      vectorRows.push(`
         <tr>
           <td class="text-mono">${esc(ns)}</td>
-          <td><span class="badge badge-vec_f32">Vector Semantic</span></td>
           <td>${queueDepthHtml}</td>
-          <td class="gap-8" style="white-space:nowrap">
+          <td class="ns-ops-actions gap-8">
             <button class="btn btn-xs btn-ghost" onclick="showReindexDocVectorModal('${esc(ns)}')"
                     title="Re-enqueue a single document for embedding">Reindex Doc…</button>
             <button class="btn btn-xs btn-ghost" onclick="adminVectorReindexAll('${esc(ns)}',this)"
@@ -3281,25 +3314,66 @@ function renderNamespaceControlsSection(byNs) {
           </td>
         </tr>`);
     }
-
-    return result;
   });
+
+  const activeTab = state.nsOpsTab === 'vector' && vectorRows.length ? 'vector'
+                  : state.nsOpsTab === 'field'  && fieldRows.length  ? 'field'
+                  : fieldRows.length ? 'field' : 'vector';
+
+  const emptyRow = (cols, msg) =>
+    `<tr><td colspan="${cols}" class="text-muted" style="padding:14px 12px">${msg}</td></tr>`;
+
+  const fieldTable = `
+    <div class="tbl-wrap">
+      <table class="tbl ns-ops-tbl">
+        <colgroup>
+          <col class="ns-ops-col-ns"><col><col class="ns-ops-col-actions">
+        </colgroup>
+        <thead><tr>
+          <th>Namespace</th><th>Indexed Fields</th><th>Operations</th>
+        </tr></thead>
+        <tbody>${fieldRows.join('') || emptyRow(3, 'No stores with field indices')}</tbody>
+      </table>
+    </div>`;
+
+  const vectorTable = `
+    <div class="tbl-wrap">
+      <table class="tbl ns-ops-tbl">
+        <colgroup>
+          <col class="ns-ops-col-ns"><col><col class="ns-ops-col-actions">
+        </colgroup>
+        <thead><tr>
+          <th>Namespace</th><th>Queue Depth</th><th>Operations</th>
+        </tr></thead>
+        <tbody>${vectorRows.join('') || emptyRow(3, 'No stores with semantic search enabled')}</tbody>
+      </table>
+    </div>`;
 
   return `
     <div class="section">
       <div class="section-header">
-        <span class="section-title">NAMESPACE OPERATIONS (${relevantStores.length})</span>
+        <span class="section-title">INDEX OPERATIONS (${relevantStores.length})</span>
       </div>
-      <div class="tbl-wrap">
-        <table class="tbl">
-          <thead><tr>
-            <th>Namespace</th><th>Index Type</th><th>Details</th><th>Operations</th>
-          </tr></thead>
-          <tbody>${rows.join('')}</tbody>
-        </table>
+      <div class="sub-tab-nav">
+        <button class="sub-tab-btn ${activeTab === 'field' ? 'active' : ''}"
+                data-nsops-tab="field" onclick="switchNsOpsTab('field')">Field Indices (${fieldRows.length})</button>
+        <button class="sub-tab-btn ${activeTab === 'vector' ? 'active' : ''}"
+                data-nsops-tab="vector" onclick="switchNsOpsTab('vector')">Vector Semantic (${vectorRows.length})</button>
       </div>
+      <div id="nsops-field-panel" class="sub-panel ${activeTab === 'field' ? 'active' : ''}">${fieldTable}</div>
+      <div id="nsops-vector-panel" class="sub-panel ${activeTab === 'vector' ? 'active' : ''}">${vectorTable}</div>
     </div>
   `;
+}
+
+function switchNsOpsTab(tab) {
+  state.nsOpsTab = tab;
+  document.querySelectorAll('[data-nsops-tab]').forEach(b =>
+    b.classList.toggle('active', b.dataset.nsopsTab === tab));
+  ['field', 'vector'].forEach(t => {
+    const p = document.getElementById(`nsops-${t}-panel`);
+    if (p) p.classList.toggle('active', t === tab);
+  });
 }
 
 function renderVqBrowserHtml() {
