@@ -339,6 +339,7 @@ function renderSchemaTab() {
       <div class="section-header">
         <span class="section-title">ATTRIBUTES</span>
         <button class="btn btn-sm btn-accent"
+                ${s.semantic_search_enabled ? 'disabled title="A vector index already exists — drop it before adding a new one"' : ''}
                 onclick="showAddAttributeModal('${esc(s.namespace)}')">+ Add Vector Index</button>
       </div>
       <div class="tbl-wrap">
