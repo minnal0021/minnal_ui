@@ -397,6 +397,13 @@ select { cursor: pointer; }
   font-size: 11px; font-weight: 700; letter-spacing: .5px; color: var(--text-3);
 }
 .add-field-row { margin-top: 6px; }
+/* Vector-index field list — a single name input plus a remove button per row. */
+.vec-field-row {
+  display: grid; grid-template-columns: 1fr 28px; gap: 8px; align-items: center;
+  padding: 8px 10px;
+  background: var(--bg-3); border: 1px solid var(--border); border-radius: var(--radius);
+}
+.vec-field-row input[type="text"] { padding: 5px 8px; font-size: 13px; }
 
 /* ── Admin inner tabs ────────────────────────────────────────────────────── */
 .admin-inner-nav {

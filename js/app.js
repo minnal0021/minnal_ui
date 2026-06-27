@@ -875,24 +875,33 @@ function showAddAttributeModal(ns) {
   openModal(`
     <div class="modal-title">Add Vector Index — ${esc(ns)}</div>
     <div class="modal-section">
-      <div class="form-group" style="margin-bottom:14px">
-        <label>FIELD NAME</label>
-        <input type="text" id="attr-name" placeholder="e.g. description" style="max-width:280px" />
-      </div>
-      <div class="form-group">
-        <label>DESCRIPTION <span class="text-muted">(optional)</span></label>
-        <input type="text" id="attr-desc" placeholder="short description" />
-      </div>
-      <p class="text-muted" style="margin-top:10px">
-        Adds a <strong>str</strong> attribute and registers it as an embedding field for
-        semantic search. Semantic search will be enabled on this store if not already active.
+      <div class="modal-section-title">EMBEDDING FIELDS</div>
+      <p class="text-muted" style="margin:0 0 12px">
+        Each name declares a new <strong>str</strong> attribute that feeds the namespace's
+        single vector index. The text of all listed fields is embedded together for
+        semantic search. To change the field set later, drop the vector index and add it again.
       </p>
+      <div id="vec-fields" class="field-builder"></div>
+      <div class="add-field-row">
+        <button class="btn btn-sm btn-ghost" onclick="addVectorIndexField()">+ Add Field</button>
+      </div>
     </div>
     <div class="modal-actions">
       <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
-      <button class="btn btn-accent" onclick="submitAddAttribute('${esc(ns)}')">Add Vector Index</button>
+      <button class="btn btn-accent" onclick="submitAddVectorIndex('${esc(ns)}')">Create Vector Index</button>
     </div>
   `);
+  addVectorIndexField();
+}
+
+function addVectorIndexField() {
+  const row = document.createElement('div');
+  row.className = 'vec-field-row';
+  row.innerHTML = `
+    <input type="text" class="vec-field-input" placeholder="e.g. description" />
+    <button class="field-remove-btn" onclick="this.closest('.vec-field-row').remove()" title="Remove">✕</button>
+  `;
+  document.getElementById('vec-fields').appendChild(row);
 }
 
 function showEditAttributeModal(ns, name, type, desc) {
@@ -924,15 +933,16 @@ function showEditAttributeModal(ns, name, type, desc) {
   `);
 }
 
-async function submitAddAttribute(ns) {
-  const name = document.getElementById('attr-name').value.trim();
-  const desc = document.getElementById('attr-desc').value.trim();
-  if (!name) { toast('Field name is required', 'error'); return; }
-  const op = { op: 'add_embedding_attribute', name };
-  if (desc) op.description = desc;
+async function submitAddVectorIndex(ns) {
+  const fields = [...document.querySelectorAll('#vec-fields .vec-field-input')]
+    .map(i => i.value.trim())
+    .filter(Boolean);
+  if (fields.length === 0) { toast('At least one field is required', 'error'); return; }
+  if (new Set(fields).size !== fields.length) { toast('Duplicate field names', 'error'); return; }
   try {
-    await Api.amendSchema(ns, op);
-    closeModal(); toast(`Vector index field '${name}' added`);
+    await Api.amendSchema(ns, { op: 'enable_vector_index', fields });
+    closeModal();
+    toast(`Vector index created over ${fields.length} field${fields.length !== 1 ? 's' : ''}`);
     await loadStores(); renderSchemaTab();
   } catch (e) { toast(e.message, 'error'); }
 }
