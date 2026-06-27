@@ -3355,13 +3355,11 @@ async function adminVectorReconcile(btn) {
   btn.disabled = true;
   if (el) el.innerHTML = '<div class="spinner"></div>';
   try {
-    const result = await Api.vectorReconcile();
-    const n = result?.reenqueued ?? 0;
-    const msg = n === 0
-      ? 'Vector index reconcile complete — all documents are already indexed'
-      : `Vector index reconcile complete — ${fmt(n)} document${n === 1 ? '' : 's'} re-enqueued for embedding`;
+    await Api.vectorReconcile();
+    const msg = 'Vector index reconcile started — it runs in the background. '
+      + 'Check the server log file for progress, the re-enqueued count, and any errors.';
     if (el) el.innerHTML = `<div class="alert alert-success">${msg}</div>`;
-    toast(`Reconcile complete (${fmt(n)} re-enqueued)`);
+    toast('Reconcile started — see log for progress');
     await adminIndexRefresh();
   } catch (e) {
     if (el) el.innerHTML = `<div class="alert alert-error">${esc(e.message)}</div>`;
