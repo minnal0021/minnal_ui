@@ -1,0 +1,3778 @@
+/**
+ * app.js — application state, rendering, and event handling.
+ */
+
+// ── State ────────────────────────────────────────────────────────────────────
+const state = {
+  baseUrl:           'http://localhost:8080',
+  stores:            [],   // DocStoreSchema[]
+  kvStores:          [],   // KvStoreSchema[]
+  selectedStore:     null, // DocStoreSchema | KvStoreSchema | null
+  selectedStoreType: null, // 'doc' | 'kv' | null
+  activeTab:         'schema',
+
+  // Documents / KV sub-tab
+  docSubTab:      'get',
+  docResult:      null,
+  docList:        [],
+
+  // Query sub-tab
+  querySubTab:    'predicate',
+  queryResults:   [],
+
+  // Admin cached data
+  adminStats:     null,
+  adminWal:       null,
+  adminLsm:       null,
+  adminVlog:      null,
+  adminTab:       'storage', // 'storage' | 'ops' | 'index'
+  adminRowCounts: {}, // { [namespace]: number }
+
+  // Progress polling: { 'ns::field': intervalId }
+  progressPolls: {},
+
+  // Last semantic search results (for popup callback)
+  _semanticResults: [],
+
+  // Last doc list results (range / query / get — for popup callback)
+  _docResults: [],
+
+  // Create-store field rows counter (for unique IDs)
+  fieldRowSeq: 0,
+
+  // Cursor-based scan pagination state
+  scanCursors: {},   // { [scanId]: { stack: [null, ...], idx: 0 } }
+  _nextCursors: {},  // { [scanId]: nextCursor } — written by renderCursorNav, read by scanNext
+};
+
+// ── Utilities ─────────────────────────────────────────────────────────────────
+function fmt(n) { return n?.toLocaleString() ?? '—'; }
+function fmtBytes(b) {
+  if (b == null) return '—';
+  if (b < 1024)          return b + ' B';
+  if (b < 1024 * 1024)   return (b / 1024).toFixed(1) + ' KB';
+  if (b < 1024 ** 3)     return (b / 1024 / 1024).toFixed(2) + ' MB';
+  return (b / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+}
+function fmtUptime(s) {
+  if (!s && s !== 0) return '';
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${sec}s`;
+  return `${sec}s`;
+}
+function esc(str) {
+  return String(str)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function keyTypeBadge(kt) {
+  return `<span class="badge badge-${kt}">${kt}</span>`;
+}
+function idxTypeBadge(it) {
+  return `<span class="badge badge-${it}">${it}</span>`;
+}
+function kvValueTypeBadge(vt) {
+  const cls = vt === 'vec_f32' ? 'badge-vec_f32' : `badge-${vt}`;
+  return `<span class="badge ${cls}">${vt}</span>`;
+}
+function isKvStore() {
+  return state.selectedStoreType === 'kv';
+}
+
+/** Syntax-highlight a JSON value into HTML. */
+function prettyJson(obj) {
+  const raw = JSON.stringify(obj, null, 2);
+  return raw.replace(
+    /("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?)/g,
+    (m) => {
+      let cls = 'json-number';
+      if (/^"/.test(m)) cls = /:$/.test(m) ? 'json-key' : 'json-string';
+      else if (/true|false/.test(m)) cls = 'json-bool';
+      else if (/null/.test(m))       cls = 'json-null';
+      return `<span class="${cls}">${esc(m)}</span>`;
+    }
+  );
+}
+
+// ── Toasts ────────────────────────────────────────────────────────────────────
+function toast(msg, type = 'success', duration = 3500) {
+  const el = document.createElement('div');
+  el.className = `toast toast-${type}`;
+  el.textContent = msg;
+  document.getElementById('toast-container').appendChild(el);
+  setTimeout(() => el.remove(), duration);
+}
+
+// ── Modal ─────────────────────────────────────────────────────────────────────
+function openModal(html) {
+  document.getElementById('modal-content').innerHTML = html;
+  document.getElementById('modal').classList.add('open');
+}
+function closeModal() {
+  document.getElementById('modal').classList.remove('open');
+  document.getElementById('modal-content').innerHTML = '';
+}
+function handleModalOverlayClick(e) {
+  if (e.target === document.getElementById('modal')) closeModal();
+}
+
+// ── Connection ────────────────────────────────────────────────────────────────
+async function connect() {
+  const url = document.getElementById('base-url-input').value.trim();
+  if (!url) return;
+  state.baseUrl = url;
+  Api.setBaseUrl(url);
+  localStorage.setItem('minnal_base_url', url);
+
+  const badge = document.getElementById('health-badge');
+  badge.className = 'badge badge-unknown';
+  badge.textContent = '● connecting…';
+
+  try {
+    const h = await Api.health();
+    badge.className = 'badge badge-ok';
+    badge.textContent = '● connected';
+    document.getElementById('uptime-label').textContent = 'up ' + fmtUptime(h.uptime_s);
+  } catch {
+    badge.className = 'badge badge-error';
+    badge.textContent = '● unreachable';
+    document.getElementById('uptime-label').textContent = '';
+  }
+
+  await loadStores();
+}
+
+// ── Stores ─────────────────────────────────────────────────────────────────────
+async function loadStores() {
+  const [docResult, kvResult] = await Promise.allSettled([
+    Api.listStores(),
+    Api.listKvStores(),
+  ]);
+  state.stores   = docResult.status === 'fulfilled' ? (docResult.value  ?? []) : [];
+  state.kvStores = kvResult.status  === 'fulfilled' ? (kvResult.value   ?? []) : [];
+  if (docResult.status === 'rejected') toast('Failed to load doc stores: ' + docResult.reason?.message, 'error');
+  if (kvResult.status  === 'rejected') toast('Failed to load KV stores: '  + kvResult.reason?.message,  'error');
+
+  renderSidebar();
+
+  if (state.selectedStore) {
+    const ns   = state.selectedStore.namespace;
+    const list = isKvStore() ? state.kvStores : state.stores;
+    const fresh = list.find(s => s.namespace === ns);
+    state.selectedStore = fresh ?? null;
+    if (!fresh) state.selectedStoreType = null;
+    renderActiveTab();
+  }
+}
+
+function renderSidebar() {
+  const el = document.getElementById('store-list');
+  const hasDoc = state.stores.length > 0;
+  const hasKv  = state.kvStores.length > 0;
+
+  if (!hasDoc && !hasKv) {
+    el.innerHTML = '<div class="empty-sidebar">No stores yet</div>';
+    return;
+  }
+
+  const selNs   = state.selectedStore?.namespace;
+  const selType = state.selectedStoreType;
+  const hasBoth = hasDoc && hasKv;
+
+  const docItems = state.stores.map(s => `
+    <div class="store-item ${selType === 'doc' && selNs === s.namespace ? 'active' : ''}"
+         onclick="selectStore('${esc(s.namespace)}', 'doc')">
+      <span class="store-name">${esc(s.namespace)}</span>
+      ${keyTypeBadge(s.key_type)}
+    </div>
+  `).join('');
+
+  const kvItems = state.kvStores.map(s => `
+    <div class="store-item ${selType === 'kv' && selNs === s.namespace ? 'active' : ''}"
+         onclick="selectStore('${esc(s.namespace)}', 'kv')">
+      <span class="store-name">${esc(s.namespace)}</span>
+      <span class="badge badge-kv">KV</span>
+      ${kvValueTypeBadge(s.value_type)}
+    </div>
+  `).join('');
+
+  if (hasBoth) {
+    el.innerHTML =
+      `<div class="store-section-title">Doc</div>${docItems}` +
+      `<div class="store-section-title">KV</div>${kvItems}`;
+  } else {
+    el.innerHTML = docItems + kvItems;
+  }
+}
+
+function selectStore(ns, type = 'doc') {
+  state.selectedStoreType = type;
+  const list = type === 'kv' ? state.kvStores : state.stores;
+  state.selectedStore = list.find(s => s.namespace === ns) ?? null;
+  updateTabLabels();
+  renderSidebar();
+  if (state.activeTab === 'admin') return;
+  if (state.activeTab === 'schema') renderSchemaTab();
+  else switchTab(state.activeTab);
+}
+
+function updateTabLabels() {
+  const kv = isKvStore();
+  const docsBtn = document.querySelector('.tab-btn[data-tab="documents"]');
+  if (docsBtn) docsBtn.textContent = kv ? 'KV' : 'Documents';
+}
+
+// ── Tab switching ─────────────────────────────────────────────────────────────
+function switchTab(name) {
+  state.activeTab = name;
+  document.querySelectorAll('.tab-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.tab === name);
+  });
+  document.querySelectorAll('.tab-panel').forEach(p => {
+    p.classList.toggle('active', p.id === `tab-${name}`);
+  });
+  updateTabLabels();
+  renderActiveTab();
+}
+
+function renderActiveTab() {
+  const t = state.activeTab;
+  if      (t === 'schema')    renderSchemaTab();
+  else if (t === 'documents') renderDocumentsTab();
+  else if (t === 'query')     renderQueryTab();
+  else if (t === 'admin')     renderAdminTab();
+}
+
+// ── Schema tab ────────────────────────────────────────────────────────────────
+function renderSchemaTab() {
+  const el = document.getElementById('tab-schema');
+  const s  = state.selectedStore;
+  if (!s) {
+    el.innerHTML = `<div class="welcome">
+      <p class="welcome-icon">🗄</p>
+      <p>Select a store from the sidebar or create a new one.</p></div>`;
+    return;
+  }
+
+  if (isKvStore()) { renderKvSchemaTab(el, s); return; }
+
+  const indices       = s.indices ?? [];
+  const attrs         = s.attributes ?? [];
+  const embedFields   = new Set(s.embedding_fields ?? []);
+  const limit         = 5;
+
+  const indiceRows = indices.length
+    ? indices.map(ix => `
+        <tr>
+          <td class="text-mono">${esc(ix.field)}</td>
+          <td>${idxTypeBadge(ix.index_type)}</td>
+          <td><span class="badge badge-indexed">● Active</span></td>
+          <td id="progress-${esc(ix.field)}"></td>
+          <td>
+            <button class="btn btn-xs btn-danger"
+                    onclick="confirmDropIndex('${esc(s.namespace)}','${esc(ix.field)}')">
+              Drop
+            </button>
+          </td>
+        </tr>`).join('')
+    : '<tr><td colspan="5" class="text-muted" style="padding:12px">No indices defined</td></tr>';
+
+  const attrRows = attrs.length
+    ? attrs.map(a => `
+        <tr>
+          <td class="text-mono">${esc(a.name)}</td>
+          <td>${idxTypeBadge(a.attr_type)}</td>
+          <td>${a.description ? esc(a.description) : '<span class="text-muted">—</span>'}</td>
+          <td style="text-align:center">
+            ${embedFields.has(a.name) ? '<span class="badge badge-indexed">✓ Embed</span>' : ''}
+          </td>
+          <td>
+            <div class="gap-8">
+              <button class="btn btn-xs btn-ghost"
+                      onclick="showEditAttributeModal('${esc(s.namespace)}','${esc(a.name)}','${esc(a.attr_type)}','${esc(a.description??'')}')">
+                Edit
+              </button>
+              <button class="btn btn-xs btn-danger"
+                      onclick="confirmRemoveAttribute('${esc(s.namespace)}','${esc(a.name)}')">
+                Remove
+              </button>
+            </div>
+          </td>
+        </tr>`).join('')
+    : '<tr><td colspan="5" class="text-muted" style="padding:12px">No attributes defined</td></tr>';
+
+  el.innerHTML = `
+    <div class="store-header">
+      <span class="store-ns">${esc(s.namespace)}</span>
+      ${keyTypeBadge(s.key_type)}
+      ${s.semantic_search_enabled
+          ? '<span class="badge badge-indexed">✨ Semantic ON</span>'
+          : '<span class="badge badge-attr">✨ Semantic OFF</span>'}
+      <div style="margin-left:auto;display:flex;gap:8px">
+        <button class="btn btn-ghost btn-sm"
+                onclick="adminExportSchema('${esc(s.namespace)}')">⬇ Export Schema</button>
+        <button class="btn btn-danger btn-sm"
+                onclick="confirmDeleteStore('${esc(s.namespace)}')">🗑 Delete Store</button>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-header">
+        <span class="section-title">INDICES (${indices.length} / ${limit})</span>
+        <button class="btn btn-sm btn-accent"
+                ${indices.length >= limit ? 'disabled title="Max 5 indices"' : ''}
+                onclick="showAddIndexModal('${esc(s.namespace)}')">+ Add Index</button>
+      </div>
+      <div class="tbl-wrap">
+        <table class="tbl">
+          <thead><tr>
+            <th>Field</th><th>Type</th><th>Status</th><th style="width:200px">Progress</th><th></th>
+          </tr></thead>
+          <tbody>${indiceRows}</tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-header">
+        <span class="section-title">ATTRIBUTES</span>
+        <button class="btn btn-sm btn-accent"
+                onclick="showAddAttributeModal('${esc(s.namespace)}')">+ Add Vector Index</button>
+      </div>
+      <div class="tbl-wrap">
+        <table class="tbl">
+          <thead><tr><th>Name</th><th>Type</th><th>Description</th><th>Embed</th><th></th></tr></thead>
+          <tbody>${attrRows}</tbody>
+        </table>
+      </div>
+    </div>`;
+}
+
+function renderKvSchemaTab(el, s) {
+  el.innerHTML = `
+    <div class="store-header">
+      <span class="store-ns">${esc(s.namespace)}</span>
+      <span class="badge badge-kv">KV</span>
+      ${keyTypeBadge(s.key_type)}
+      ${kvValueTypeBadge(s.value_type)}
+      ${s.semantic_search_enabled
+          ? '<span class="badge badge-indexed">✨ Semantic ON</span>'
+          : '<span class="badge badge-attr">✨ Semantic OFF</span>'}
+      <div style="margin-left:auto;display:flex;gap:8px">
+        <button class="btn btn-ghost btn-sm"
+                onclick="adminExportKvSchema('${esc(s.namespace)}')">⬇ Export Schema</button>
+        <button class="btn btn-danger btn-sm"
+                onclick="confirmDeleteStore('${esc(s.namespace)}')">🗑 Delete Store</button>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-header">
+        <span class="section-title">KV STORE SCHEMA</span>
+      </div>
+      <div class="admin-grid" style="margin-top:0">
+        <div class="admin-card">
+          <div class="admin-card-title">CONFIGURATION</div>
+          <div class="stat-row"><span class="stat-key">Namespace</span>
+            <span class="stat-val text-mono">${esc(s.namespace)}</span></div>
+          <div class="stat-row"><span class="stat-key">Key Type</span>
+            <span class="stat-val">${keyTypeBadge(s.key_type)}</span></div>
+          <div class="stat-row"><span class="stat-key">Value Type</span>
+            <span class="stat-val">${kvValueTypeBadge(s.value_type)}</span></div>
+          <div class="stat-row"><span class="stat-key">Semantic Search</span>
+            <span class="stat-val">${s.semantic_search_enabled
+              ? '<span class="badge badge-indexed">Enabled</span>'
+              : '<span class="badge badge-attr">Disabled</span>'}</span></div>
+          ${s.ns_id != null
+            ? `<div class="stat-row"><span class="stat-key">NS ID</span>
+               <span class="stat-val">#${s.ns_id}</span></div>` : ''}
+        </div>
+        <div class="admin-card">
+          <div class="admin-card-title">RESTRICTIONS</div>
+          <p class="text-muted" style="line-height:1.6">
+            KV stores have typed keys (<strong>str</strong> or <strong>int</strong>) and
+            typed values (<strong>int</strong>, <strong>str</strong>, <strong>f32</strong>,
+            or <strong>vec_f32</strong>).<br><br>
+            Field indices and attributes are not supported. Use the <em>KV</em> tab to
+            get, set, and delete individual entries.
+            ${s.semantic_search_enabled
+              ? '<br><br>Semantic search is enabled — use the <em>Query</em> tab to search by text.'
+              : ''}
+          </p>
+        </div>
+      </div>
+    </div>`;
+}
+
+// ── Index progress polling ─────────────────────────────────────────────────────
+function startProgressPoll(ns, field) {
+  const key = `${ns}::${field}`;
+  if (state.progressPolls[key]) return;
+
+  state.progressPolls[key] = setInterval(async () => {
+    try {
+      const progress = await Api.indicesProgressNs(ns);
+      const cell = document.getElementById(`progress-${field}`);
+      if (!cell) { stopProgressPoll(ns, field); return; }
+
+      const build = (progress?.attribute_builds ?? []).find(b =>
+        b.id?.kind === 'field' && b.id?.namespace === ns && b.id?.field === field
+      );
+
+      if (!build) {
+        cell.innerHTML = '<span class="badge badge-indexed">✓ Built</span>';
+        stopProgressPoll(ns, field);
+        return;
+      }
+
+      const status = (build.status ?? '').toLowerCase();
+      if (status === 'running') {
+        const pct = build.total > 0 ? (build.indexed / build.total * 100) : 0;
+        cell.innerHTML = `
+          <div class="progress-wrap"><div class="progress-bar" style="width:${pct.toFixed(1)}%"></div></div>
+          <div class="progress-label">${pct.toFixed(1)}% (${fmt(build.indexed)} / ${fmt(build.total)})</div>`;
+      } else if (status === 'complete') {
+        cell.innerHTML = '<span class="badge badge-indexed">✓ Built</span>';
+        stopProgressPoll(ns, field);
+      } else {
+        cell.innerHTML = `<span class="badge badge-error">${esc(build.status)}</span>`;
+        stopProgressPoll(ns, field);
+      }
+    } catch { stopProgressPoll(ns, field); }
+  }, 2000);
+}
+
+function stopProgressPoll(ns, field) {
+  const key = `${ns}::${field}`;
+  clearInterval(state.progressPolls[key]);
+  delete state.progressPolls[key];
+}
+
+// ── Cursor-based scan pagination ──────────────────────────────────────────────
+function _getScanState(id) {
+  if (!state.scanCursors[id]) state.scanCursors[id] = { stack: [null], idx: 0 };
+  return state.scanCursors[id];
+}
+function resetScanCursors(id)  { state.scanCursors[id] = { stack: [null], idx: 0 }; }
+function currentScanCursor(id) { const s = _getScanState(id); return s.stack[s.idx] ?? null; }
+function isScanFirstPage(id)   { return _getScanState(id).idx === 0; }
+function getScanPageNum(id)    { return _getScanState(id).idx + 1; }
+function advanceScan(id, nextCursor) {
+  const s = _getScanState(id);
+  s.stack = s.stack.slice(0, s.idx + 1);
+  s.stack.push(nextCursor);
+  s.idx++;
+}
+function retreatScan(id) { const s = _getScanState(id); if (s.idx > 0) s.idx--; }
+function runScanById(id) {
+  const fns = { docRange: doRangeScan, docQueryRange: doQueryRangeScan,
+                docPrefix: doPrefixScan, kvRange: doKvRangeScan, kvPrefix: doKvPrefixScan };
+  fns[id]?.();
+}
+function freshScan(id) { resetScanCursors(id); runScanById(id); }
+function scanNext(id)  { advanceScan(id, state._nextCursors?.[id]); runScanById(id); }
+function scanPrev(id)  { retreatScan(id); runScanById(id); }
+
+// ── Create store modal ────────────────────────────────────────────────────────
+function showCreateStoreModal() {
+  state.fieldRowSeq = 0;
+  openModal(`
+    <div class="modal-title">Create New Store</div>
+
+    <div class="modal-section">
+      <div class="form-group" style="margin-bottom:16px">
+        <label>STORE TYPE</label>
+        <div class="radio-group">
+          <label><input type="radio" name="cs-type" value="doc" checked
+                        onchange="onCreateStoreTypeChange()"> Doc Store</label>
+          <label><input type="radio" name="cs-type" value="kv"
+                        onchange="onCreateStoreTypeChange()"> KV Store</label>
+        </div>
+      </div>
+      <div class="form-group" style="margin-bottom:16px">
+        <label>NAMESPACE</label>
+        <input type="text" id="cs-ns" placeholder="e.g. users, orders, products"
+               style="max-width:320px" />
+      </div>
+
+      <!-- Doc Store key types -->
+      <div id="cs-doc-key" class="form-group">
+        <label>KEY TYPE</label>
+        <div class="radio-group">
+          <label><input type="radio" name="cs-kt" value="uuid" checked> uuid</label>
+          <label><input type="radio" name="cs-kt" value="u64"> u64</label>
+          <label><input type="radio" name="cs-kt" value="u128"> u128</label>
+        </div>
+      </div>
+
+      <!-- KV Store fields (hidden by default) -->
+      <div id="cs-kv-fields" style="display:none">
+        <div class="form-group" style="margin-bottom:12px">
+          <label>KEY TYPE</label>
+          <div class="radio-group">
+            <label><input type="radio" name="cs-kv-kt" value="str" checked> str</label>
+            <label><input type="radio" name="cs-kv-kt" value="int"> int</label>
+          </div>
+        </div>
+        <div class="form-group" style="margin-bottom:12px">
+          <label>VALUE TYPE</label>
+          <div class="radio-group">
+            <label><input type="radio" name="cs-kv-vt" value="str" checked
+                          onchange="onKvValueTypeChange()"> str</label>
+            <label><input type="radio" name="cs-kv-vt" value="int"
+                          onchange="onKvValueTypeChange()"> int</label>
+            <label><input type="radio" name="cs-kv-vt" value="f32"
+                          onchange="onKvValueTypeChange()"> f32</label>
+            <label><input type="radio" name="cs-kv-vt" value="vec_f32"
+                          onchange="onKvValueTypeChange()"> vec_f32</label>
+          </div>
+        </div>
+        <div id="cs-kv-semantic-row" class="form-group">
+          <label class="radio-group" style="gap:8px">
+            <input type="checkbox" id="cs-kv-semantic" />
+            Enable semantic search <span class="text-muted">(str value type only)</span>
+          </label>
+        </div>
+      </div>
+    </div>
+
+    <!-- Doc Store: fields builder (hidden for KV) -->
+    <div id="cs-doc-fields-section" class="modal-section">
+      <div class="modal-section-title">FIELDS
+        <span class="text-muted" style="font-weight:400;margin-left:8px">
+          — toggle "Indexed" to control whether a field becomes an index or attribute
+        </span>
+      </div>
+      <div class="field-builder-header">
+        <span>Field Name</span><span>Type</span><span style="text-align:center">Indexed</span>
+        <span>Description</span><span style="text-align:center" title="Check to include this field in semantic search embedding (str type only)">Embed</span><span></span>
+      </div>
+      <div id="cs-fields" class="field-builder"></div>
+      <div class="add-field-row">
+        <button class="btn btn-sm btn-ghost" onclick="addCreateStoreField()">+ Add Field</button>
+      </div>
+    </div>
+
+    <!-- Doc Store: semantic search -->
+    <div id="cs-doc-semantic-section" class="modal-section">
+      <div class="modal-section-title">SEMANTIC SEARCH</div>
+      <div class="form-group">
+        <label class="radio-group" style="gap:8px">
+          <input type="checkbox" id="cs-semantic-enabled" onchange="onSemanticEnabledChange()" />
+          Enable semantic search — check one or more <strong>Embed</strong> fields above (str type only)
+        </label>
+      </div>
+    </div>
+
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-accent" onclick="submitCreateStore()">Create Store</button>
+    </div>
+  `);
+  addCreateStoreField();
+}
+
+function onCreateStoreTypeChange() {
+  const isKv = document.querySelector('input[name="cs-type"]:checked')?.value === 'kv';
+  document.getElementById('cs-doc-key').style.display          = isKv ? 'none' : '';
+  document.getElementById('cs-kv-fields').style.display        = isKv ? '' : 'none';
+  document.getElementById('cs-doc-fields-section').style.display = isKv ? 'none' : '';
+  document.getElementById('cs-doc-semantic-section').style.display = isKv ? 'none' : '';
+}
+
+function onKvValueTypeChange() {
+  const vt = document.querySelector('input[name="cs-kv-vt"]:checked')?.value;
+  const semRow = document.getElementById('cs-kv-semantic-row');
+  const semCb  = document.getElementById('cs-kv-semantic');
+  if (vt !== 'str') {
+    semRow.style.opacity = '0.4';
+    if (semCb) { semCb.checked = false; semCb.disabled = true; }
+  } else {
+    semRow.style.opacity = '';
+    if (semCb) semCb.disabled = false;
+  }
+}
+
+function addCreateStoreField() {
+  const idx = state.fieldRowSeq++;
+  const row = document.createElement('div');
+  row.className = 'field-row';
+  row.id = `cs-field-${idx}`;
+  row.innerHTML = `
+    <input type="text" class="field-name" placeholder="field_name" />
+    <select class="field-type" onchange="onFieldTypeChange(this, ${idx})">
+      <option value="str">str</option>
+      <option value="int">int</option>
+      <option value="bool">bool</option>
+    </select>
+    <label class="indexed-toggle">
+      <input type="checkbox" class="field-indexed"
+             onchange="onIndexedChange(this, ${idx})" />
+      Indexed
+    </label>
+    <input type="text" class="field-desc" placeholder="description (optional)" />
+    <label class="embed-toggle" style="text-align:center" title="Include this str field in semantic search embedding">
+      <input type="checkbox" class="field-semantic"
+             onchange="onEmbedFieldToggle()" />
+    </label>
+    <button class="field-remove-btn" onclick="removeCreateStoreField(${idx})" title="Remove">✕</button>
+  `;
+  document.getElementById('cs-fields').appendChild(row);
+}
+
+function onIndexedChange(cb, idx) {
+  const row  = document.getElementById(`cs-field-${idx}`);
+  const desc = row.querySelector('.field-desc');
+  desc.disabled = cb.checked;
+  if (cb.checked) desc.value = '';
+  // Indexed fields cannot be embedding fields
+  const embedCb = row.querySelector('.field-semantic');
+  if (cb.checked && embedCb.checked) {
+    embedCb.checked = false;
+    syncSemanticEnabled();
+  }
+  embedCb.disabled = cb.checked;
+}
+
+function removeCreateStoreField(idx) {
+  const row = document.getElementById(`cs-field-${idx}`);
+  const wasEmbed = row?.querySelector('.field-semantic')?.checked;
+  row?.remove();
+  if (wasEmbed) syncSemanticEnabled();
+}
+
+function onFieldTypeChange(select, idx) {
+  const row    = document.getElementById(`cs-field-${idx}`);
+  const embedCb = row.querySelector('.field-semantic');
+  const isStr  = select.value === 'str';
+  if (!isStr && embedCb.checked) {
+    embedCb.checked = false;
+    syncSemanticEnabled();
+  }
+  // Only str fields are eligible for embedding; also respect indexed-disabled state
+  const indexed = row.querySelector('.field-indexed').checked;
+  embedCb.disabled = !isStr || indexed;
+}
+
+function onEmbedFieldToggle() {
+  // Auto-enable/disable the semantic search checkbox based on current selections
+  syncSemanticEnabled();
+}
+
+function syncSemanticEnabled() {
+  const anyChecked = document.querySelectorAll('#cs-fields .field-semantic:checked').length > 0;
+  document.getElementById('cs-semantic-enabled').checked = anyChecked;
+}
+
+function onSemanticEnabledChange() {
+  // If the user manually unchecks, clear all embed checkbox selections
+  if (!document.getElementById('cs-semantic-enabled').checked) {
+    document.querySelectorAll('#cs-fields .field-semantic').forEach(cb => { cb.checked = false; });
+  }
+}
+
+async function submitCreateStore() {
+  const ns       = document.getElementById('cs-ns').value.trim();
+  if (!ns) { toast('Namespace is required', 'error'); return; }
+  const storeType = document.querySelector('input[name="cs-type"]:checked')?.value ?? 'doc';
+
+  const btn = document.querySelector('#modal-content .btn-accent');
+  btn.disabled = true; btn.textContent = 'Creating…';
+
+  if (storeType === 'kv') {
+    const keyType   = document.querySelector('input[name="cs-kv-kt"]:checked')?.value ?? 'str';
+    const valueType = document.querySelector('input[name="cs-kv-vt"]:checked')?.value ?? 'str';
+    const semantic  = document.getElementById('cs-kv-semantic')?.checked ?? false;
+    if (semantic && valueType !== 'str') {
+      toast('Semantic search requires value_type = str', 'error');
+      btn.disabled = false; btn.textContent = 'Create Store'; return;
+    }
+    const payload = { namespace: ns, key_type: keyType, value_type: valueType };
+    if (semantic) payload.semantic_search_enabled = true;
+    try {
+      await Api.createKvStore(payload);
+      closeModal();
+      toast(`KV store '${ns}' created`);
+      await loadStores();
+      selectStore(ns, 'kv');
+      switchTab('schema');
+    } catch (e) {
+      toast(e.message, 'error');
+      btn.disabled = false; btn.textContent = 'Create Store';
+    }
+    return;
+  }
+
+  // Doc store path
+  const keyType = document.querySelector('input[name="cs-kt"]:checked')?.value ?? 'uuid';
+  const rows    = document.querySelectorAll('#cs-fields .field-row');
+  const indices = [], attributes = [];
+
+  rows.forEach(row => {
+    const name    = row.querySelector('.field-name').value.trim();
+    const type    = row.querySelector('.field-type').value;
+    const indexed = row.querySelector('.field-indexed').checked;
+    const desc    = row.querySelector('.field-desc').value.trim();
+    if (!name) return;
+    if (indexed) {
+      indices.push({ field: name, index_type: type });
+    } else {
+      const a = { name, attr_type: type };
+      if (desc) a.description = desc;
+      attributes.push(a);
+    }
+  });
+
+  if (indices.length > 5) {
+    toast('Max 5 indexed fields allowed', 'error');
+    btn.disabled = false; btn.textContent = 'Create Store'; return;
+  }
+
+  const semanticEnabled = document.getElementById('cs-semantic-enabled')?.checked ?? false;
+  const embeddingFields = Array.from(
+    document.querySelectorAll('#cs-fields .field-semantic:checked')
+  ).map(cb => cb.closest('.field-row').querySelector('.field-name').value.trim())
+   .filter(Boolean);
+
+  if (semanticEnabled && embeddingFields.length === 0) {
+    toast('Check at least one Embed field (str type) for semantic search', 'error');
+    btn.disabled = false; btn.textContent = 'Create Store'; return;
+  }
+
+  const payload = { namespace: ns, key_type: keyType, indices, attributes };
+  if (semanticEnabled) {
+    payload.semantic_search_enabled = true;
+    payload.embedding_fields = embeddingFields;
+  }
+
+  try {
+    await Api.createStore(payload);
+    closeModal();
+    toast(`Store '${ns}' created`);
+    await loadStores();
+    selectStore(ns, 'doc');
+    switchTab('schema');
+  } catch (e) {
+    toast(e.message, 'error');
+    btn.disabled = false; btn.textContent = 'Create Store';
+  }
+}
+
+// ── Delete store ──────────────────────────────────────────────────────────────
+function confirmDeleteStore(ns) {
+  const typeLabel = isKvStore() ? 'KV store' : 'store';
+  const detail    = isKvStore()
+    ? 'all its entries and schema'
+    : 'all its documents, indices, and schema';
+  openModal(`
+    <div class="modal-title">Delete ${typeLabel.charAt(0).toUpperCase() + typeLabel.slice(1)}</div>
+    <p class="confirm-msg">
+      Permanently delete <span class="confirm-ns">${esc(ns)}</span> and ${detail}?
+      This cannot be undone.
+    </p>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-danger" onclick="doDeleteStore('${esc(ns)}')">Delete</button>
+    </div>
+  `);
+}
+
+async function doDeleteStore(ns) {
+  try {
+    if (isKvStore()) {
+      await Api.deleteKvStore(ns);
+    } else {
+      await Api.deleteStore(ns);
+    }
+    closeModal();
+    toast(`Store '${ns}' deleted`);
+    if (state.selectedStore?.namespace === ns) {
+      state.selectedStore = null;
+      state.selectedStoreType = null;
+      updateTabLabels();
+    }
+    await loadStores();
+    renderSchemaTab();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+// ── Add index modal ───────────────────────────────────────────────────────────
+function showAddIndexModal(ns) {
+  openModal(`
+    <div class="modal-title">Add Index — ${esc(ns)}</div>
+    <div class="modal-section">
+      <div class="form-group" style="margin-bottom:14px">
+        <label>FIELD NAME</label>
+        <input type="text" id="ai-field" placeholder="e.g. status" style="max-width:280px" />
+      </div>
+      <div class="form-group">
+        <label>INDEX TYPE</label>
+        <select id="ai-type" style="max-width:160px">
+          <option value="str">str</option>
+          <option value="int">int</option>
+          <option value="bool">bool</option>
+        </select>
+      </div>
+      <p class="text-muted" style="margin-top:10px">
+        If the store already has documents, a background rebuild will start automatically.
+      </p>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-accent" onclick="submitAddIndex('${esc(ns)}')">Add Index</button>
+    </div>
+  `);
+}
+
+async function submitAddIndex(ns) {
+  const field = document.getElementById('ai-field').value.trim();
+  const type  = document.getElementById('ai-type').value;
+  if (!field) { toast('Field name is required', 'error'); return; }
+
+  try {
+    await Api.addIndex(ns, { field, index_type: type });
+    closeModal();
+    toast(`Index on '${field}' added — rebuild may be running`);
+    await loadStores();
+    renderSchemaTab();
+    // Start progress polling for the new index
+    setTimeout(() => startProgressPoll(ns, field), 500);
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+// ── Drop index ────────────────────────────────────────────────────────────────
+function confirmDropIndex(ns, field) {
+  openModal(`
+    <div class="modal-title">Drop Index</div>
+    <p class="confirm-msg">
+      Drop the index on <span class="confirm-ns">${esc(field)}</span> in
+      <strong>${esc(ns)}</strong>?
+      The field data is kept; the field becomes a plain attribute.
+    </p>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-danger" onclick="doDropIndex('${esc(ns)}','${esc(field)}')">Drop Index</button>
+    </div>
+  `);
+}
+
+async function doDropIndex(ns, field) {
+  try {
+    await Api.dropIndex(ns, field);
+    stopProgressPoll(ns, field);
+    closeModal();
+    toast(`Index on '${field}' dropped`);
+    await loadStores();
+    renderSchemaTab();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+// ── Add vector index attribute ────────────────────────────────────────────────
+function showAddAttributeModal(ns) {
+  openModal(`
+    <div class="modal-title">Add Vector Index — ${esc(ns)}</div>
+    <div class="modal-section">
+      <div class="form-group" style="margin-bottom:14px">
+        <label>FIELD NAME</label>
+        <input type="text" id="attr-name" placeholder="e.g. description" style="max-width:280px" />
+      </div>
+      <div class="form-group">
+        <label>DESCRIPTION <span class="text-muted">(optional)</span></label>
+        <input type="text" id="attr-desc" placeholder="short description" />
+      </div>
+      <p class="text-muted" style="margin-top:10px">
+        Adds a <strong>str</strong> attribute and registers it as an embedding field for
+        semantic search. Semantic search will be enabled on this store if not already active.
+      </p>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-accent" onclick="submitAddAttribute('${esc(ns)}')">Add Vector Index</button>
+    </div>
+  `);
+}
+
+function showEditAttributeModal(ns, name, type, desc) {
+  openModal(`
+    <div class="modal-title">Edit Attribute — ${esc(name)}</div>
+    <div class="modal-section">
+      <div class="form-group" style="margin-bottom:14px">
+        <label>NAME</label>
+        <input type="text" value="${esc(name)}" disabled style="max-width:280px;opacity:.6" />
+      </div>
+      <div class="form-group" style="margin-bottom:14px">
+        <label>TYPE</label>
+        <select id="attr-type" style="max-width:160px">
+          <option value="str"  ${type==='str'  ?'selected':''}>str</option>
+          <option value="int"  ${type==='int'  ?'selected':''}>int</option>
+          <option value="bool" ${type==='bool' ?'selected':''}>bool</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>DESCRIPTION <span class="text-muted">(optional)</span></label>
+        <input type="text" id="attr-desc" value="${esc(desc)}" placeholder="short description" />
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-accent"
+              onclick="submitUpdateAttribute('${esc(ns)}','${esc(name)}')">Save</button>
+    </div>
+  `);
+}
+
+async function submitAddAttribute(ns) {
+  const name = document.getElementById('attr-name').value.trim();
+  const desc = document.getElementById('attr-desc').value.trim();
+  if (!name) { toast('Field name is required', 'error'); return; }
+  const op = { op: 'add_embedding_attribute', name };
+  if (desc) op.description = desc;
+  try {
+    await Api.amendSchema(ns, op);
+    closeModal(); toast(`Vector index field '${name}' added`);
+    await loadStores(); renderSchemaTab();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function submitUpdateAttribute(ns, name) {
+  const type = document.getElementById('attr-type').value;
+  const desc = document.getElementById('attr-desc').value.trim();
+  const op = { op: 'update_attribute', name, attr_type: type };
+  if (desc) op.description = desc;
+  try {
+    await Api.amendSchema(ns, op);
+    closeModal(); toast(`Attribute '${name}' updated`);
+    await loadStores(); renderSchemaTab();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+function confirmRemoveAttribute(ns, name) {
+  openModal(`
+    <div class="modal-title">Remove Attribute</div>
+    <p class="confirm-msg">
+      Remove attribute <span class="confirm-ns">${esc(name)}</span> from the schema of
+      <strong>${esc(ns)}</strong>?
+      Existing document data is unaffected.
+    </p>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-danger"
+              onclick="doRemoveAttribute('${esc(ns)}','${esc(name)}')">Remove</button>
+    </div>
+  `);
+}
+
+async function doRemoveAttribute(ns, name) {
+  try {
+    await Api.amendSchema(ns, { op: 'remove_attribute', name });
+    closeModal(); toast(`Attribute '${name}' removed`);
+    await loadStores(); renderSchemaTab();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+// ── Documents / KV tab ────────────────────────────────────────────────────────
+function renderDocumentsTab() {
+  const el = document.getElementById('tab-documents');
+  const rangeLimit = parseInt(document.getElementById('range-limit')?.value) || 20;
+  const s  = state.selectedStore;
+  if (!s) {
+    el.innerHTML = `<div class="welcome"><p class="welcome-icon">📄</p>
+      <p>Select a store first to browse and edit entries.</p></div>`;
+    return;
+  }
+
+  if (isKvStore()) { renderKvTab(el, s); return; }
+
+  const sub = state.docSubTab;
+  el.innerHTML = `
+    <div class="sub-tab-nav">
+      ${['get','put','delete','range'].map(t => `
+        <button class="sub-tab-btn ${sub===t?'active':''}"
+                onclick="switchDocSubTab('${t}')">${t === 'range' ? 'Range Scan' : t.charAt(0).toUpperCase()+t.slice(1)}</button>
+      `).join('')}
+    </div>
+
+    <!-- GET -->
+    <div id="doc-get" class="sub-panel ${sub==='get'?'active':''}">
+      <div class="form-row" style="margin-bottom:14px">
+        <div class="form-group" style="flex:1">
+          <label>DOCUMENT ID</label>
+          <input type="text" id="get-id" placeholder="${s.key_type === 'uuid' ? 'e.g. 550e8400-e29b-41d4-a716-446655440000' : 'e.g. 42'}" />
+        </div>
+        <button class="btn btn-accent" onclick="doGetDoc()">Fetch</button>
+      </div>
+      <div id="get-result"></div>
+    </div>
+
+    <!-- PUT -->
+    <div id="doc-put" class="sub-panel ${sub==='put'?'active':''}">
+      <div class="form-row" style="margin-bottom:14px">
+        <div class="form-group" style="flex:1">
+          <label>DOCUMENT ID</label>
+          <input type="text" id="put-id" placeholder="${s.key_type === 'uuid' ? 'e.g. 550e8400-...' : 'e.g. 42'}" />
+        </div>
+        <button class="btn btn-accent" onclick="doPutDoc()">Upsert</button>
+      </div>
+      <div class="form-group" style="margin-bottom:10px">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+          <label>JSON BODY</label>
+          <button class="btn btn-sm btn-secondary" onclick="triggerJsonFilePicker()">📁 Browse JSON File</button>
+        </div>
+        <textarea id="put-body" rows="10" placeholder='{"name": "Alice", "status": "active", "age": 30}'></textarea>
+      </div>
+      <div id="put-result"></div>
+    </div>
+
+    <!-- DELETE -->
+    <div id="doc-delete" class="sub-panel ${sub==='delete'?'active':''}">
+      <div class="form-row" style="margin-bottom:14px">
+        <div class="form-group" style="flex:1">
+          <label>DOCUMENT ID</label>
+          <input type="text" id="del-id" placeholder="Document ID to delete" />
+        </div>
+        <button class="btn btn-danger" onclick="confirmDeleteDoc()">Delete</button>
+      </div>
+      <div id="del-result"></div>
+    </div>
+
+    <!-- RANGE SCAN -->
+    <div id="doc-range" class="sub-panel ${sub==='range'?'active':''}">
+      <div class="form-row" style="margin-bottom:14px">
+        <div class="form-group" style="flex:1">
+          <label>START KEY <span class="text-muted">(inclusive)</span></label>
+          <input type="text" id="range-start" placeholder="${s.key_type === 'uuid' ? '00000000-0000-...' : '0'}" />
+        </div>
+        <div class="form-group" style="flex:1">
+          <label>END KEY <span class="text-muted">(exclusive, optional)</span></label>
+          <input type="text" id="range-end" placeholder="leave blank for open scan" />
+        </div>
+        <div class="form-group" style="max-width:100px">
+          <label>LIMIT</label>
+          <input type="number" id="range-limit" value="${rangeLimit}" min="1" max="500" />
+        </div>
+        <button class="btn btn-accent" onclick="freshScan('docRange')">Scan</button>
+      </div>
+      <div id="range-result"></div>
+    </div>
+  `;
+}
+
+function renderKvTab(el, s) {
+  const sub = state.docSubTab === 'put' ? 'set' : state.docSubTab;
+  const validSubs = ['get', 'set', 'delete'];
+  const activeSub = validSubs.includes(sub) ? sub : 'get';
+
+  const keyPlaceholder = s.key_type === 'int' ? 'e.g. 42' : 'e.g. session:abc123';
+
+  const valueInput = (() => {
+    switch (s.value_type) {
+      case 'int':
+        return `<input type="number" id="kv-value" placeholder="e.g. 42" style="max-width:240px" />`;
+      case 'f32':
+        return `<input type="number" id="kv-value" placeholder="e.g. 3.14" step="any" style="max-width:240px" />`;
+      case 'vec_f32':
+        return `<textarea id="kv-value" rows="4" placeholder="[0.1, 0.2, 0.3, ...]"></textarea>`;
+      default: // str
+        return `<input type="text" id="kv-value" placeholder="e.g. hello world" />`;
+    }
+  })();
+
+  el.innerHTML = `
+    <div class="sub-tab-nav">
+      ${['get','set','delete'].map(t => `
+        <button class="sub-tab-btn ${activeSub===t?'active':''}"
+                onclick="switchKvSubTab('${t}')">${t.charAt(0).toUpperCase()+t.slice(1)}</button>
+      `).join('')}
+    </div>
+
+    <!-- GET -->
+    <div id="kv-get" class="sub-panel ${activeSub==='get'?'active':''}">
+      <div class="form-row" style="margin-bottom:14px">
+        <div class="form-group" style="flex:1">
+          <label>KEY</label>
+          <input type="${s.key_type === 'int' ? 'number' : 'text'}" id="kv-get-key"
+                 placeholder="${keyPlaceholder}" />
+        </div>
+        <button class="btn btn-accent" onclick="doGetKv()">Fetch</button>
+      </div>
+      <div id="kv-get-result"></div>
+    </div>
+
+    <!-- SET -->
+    <div id="kv-set" class="sub-panel ${activeSub==='set'?'active':''}">
+      <div class="form-row" style="margin-bottom:14px">
+        <div class="form-group" style="flex:1">
+          <label>KEY</label>
+          <input type="${s.key_type === 'int' ? 'number' : 'text'}" id="kv-set-key"
+                 placeholder="${keyPlaceholder}" />
+        </div>
+        <button class="btn btn-accent" onclick="doPutKv()">Set</button>
+      </div>
+      <div class="form-group" style="margin-bottom:10px">
+        <label>VALUE <span class="badge badge-kv" style="margin-left:4px">${esc(s.value_type)}</span></label>
+        ${valueInput}
+      </div>
+      <div id="kv-set-result"></div>
+    </div>
+
+    <!-- DELETE -->
+    <div id="kv-delete" class="sub-panel ${activeSub==='delete'?'active':''}">
+      <div class="form-row" style="margin-bottom:14px">
+        <div class="form-group" style="flex:1">
+          <label>KEY</label>
+          <input type="${s.key_type === 'int' ? 'number' : 'text'}" id="kv-del-key"
+                 placeholder="${keyPlaceholder}" />
+        </div>
+        <button class="btn btn-danger" onclick="confirmDeleteKv()">Delete</button>
+      </div>
+      <div id="kv-del-result"></div>
+    </div>
+  `;
+}
+
+function switchKvSubTab(t) {
+  state.docSubTab = t;
+  renderDocumentsTab();
+}
+
+async function doGetKv() {
+  const key = document.getElementById('kv-get-key').value.trim();
+  const ns  = state.selectedStore?.namespace;
+  const el  = document.getElementById('kv-get-result');
+  if (!key || !ns) return;
+  el.innerHTML = '<div class="spinner"></div>';
+  try {
+    const value = await Api.getKv(ns, key);
+    if (value == null) {
+      el.innerHTML = '<div class="alert alert-error">Key not found</div>';
+    } else {
+      el.innerHTML = `
+        <div class="results-header"><span class="result-count">1 result</span></div>
+        <div class="tbl-wrap"><table class="tbl">
+          <thead><tr><th>Key</th><th>Value</th></tr></thead>
+          <tbody><tr>
+            <td class="text-mono">${esc(key)}</td>
+            <td><div class="json-view" style="max-height:200px;overflow:auto">${prettyJson(value)}</div></td>
+          </tr></tbody>
+        </table></div>`;
+    }
+  } catch (e) {
+    el.innerHTML = `<div class="alert alert-error">${esc(e.message)}</div>`;
+  }
+}
+
+async function doPutKv() {
+  const key   = document.getElementById('kv-set-key').value.trim();
+  const rawVal = document.getElementById('kv-value').value.trim();
+  const ns    = state.selectedStore?.namespace;
+  const el    = document.getElementById('kv-set-result');
+  if (!key || !ns) return;
+
+  let value;
+  const vt = state.selectedStore?.value_type;
+  try {
+    if (vt === 'int') {
+      value = parseInt(rawVal, 10);
+      if (isNaN(value)) throw new Error('Value must be an integer');
+    } else if (vt === 'f32') {
+      value = parseFloat(rawVal);
+      if (isNaN(value)) throw new Error('Value must be a number');
+    } else if (vt === 'vec_f32') {
+      value = JSON.parse(rawVal);
+      if (!Array.isArray(value)) throw new Error('Value must be a JSON array');
+    } else {
+      value = rawVal; // str — send as bare string JSON
+    }
+  } catch (parseErr) {
+    el.innerHTML = `<div class="alert alert-error">${esc(parseErr.message)}</div>`;
+    return;
+  }
+
+  el.innerHTML = '<div class="spinner"></div>';
+  try {
+    await Api.putKv(ns, key, value);
+    el.innerHTML = '<div class="alert alert-success">Value set successfully</div>';
+    toast('Value set');
+  } catch (e) {
+    el.innerHTML = `<div class="alert alert-error">${esc(e.message)}</div>`;
+  }
+}
+
+function confirmDeleteKv() {
+  const key = document.getElementById('kv-del-key').value.trim();
+  const ns  = state.selectedStore?.namespace;
+  if (!key || !ns) { toast('Enter a key', 'error'); return; }
+  openModal(`
+    <div class="modal-title">Delete KV Entry</div>
+    <p class="confirm-msg">
+      Delete key <span class="confirm-ns">${esc(key)}</span>
+      from <strong>${esc(ns)}</strong>?
+    </p>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-danger" onclick="doDeleteKv('${esc(ns)}','${esc(key)}')">Delete</button>
+    </div>
+  `);
+}
+
+async function doDeleteKv(ns, key) {
+  try {
+    await Api.deleteKv(ns, key);
+    closeModal();
+    const el = document.getElementById('kv-del-result');
+    if (el) el.innerHTML = '<div class="alert alert-success">Key deleted</div>';
+    toast('Key deleted');
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+function switchDocSubTab(t) {
+  state.docSubTab = t;
+  renderDocumentsTab();
+}
+
+async function doGetDoc() {
+  const id  = document.getElementById('get-id').value.trim();
+  const ns  = state.selectedStore?.namespace;
+  const el  = document.getElementById('get-result');
+  if (!id || !ns) return;
+  el.innerHTML = '<div class="spinner"></div>';
+  try {
+    const doc = await Api.getDoc(ns, id);
+    el.innerHTML = doc == null
+      ? '<div class="alert alert-error">Document not found</div>'
+      : renderDocResults([{ id, doc }]);
+  } catch (e) {
+    el.innerHTML = `<div class="alert alert-error">${esc(e.message)}</div>`;
+  }
+}
+
+// File picker bridge for the PUT textarea
+function triggerJsonFilePicker() {
+  document.getElementById('json-file-input').click();
+}
+
+function handleJsonFile(e) {
+  const file = e.target.files?.[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = (ev) => {
+    try {
+      const parsed = JSON.parse(ev.target.result);
+      const ta = document.getElementById('put-body');
+      if (ta) {
+        ta.value = JSON.stringify(parsed, null, 2);
+        toast(`Loaded ${file.name}`);
+      }
+    } catch (err) {
+      toast('Invalid JSON: ' + err.message, 'error');
+    }
+  };
+  reader.readAsText(file);
+  e.target.value = ''; // reset so same file can be re-selected
+}
+
+async function doPutDoc() {
+  const id   = document.getElementById('put-id').value.trim();
+  const body = document.getElementById('put-body').value.trim();
+  const ns   = state.selectedStore?.namespace;
+  const el   = document.getElementById('put-result');
+  if (!id || !ns) return;
+  let doc;
+  try { doc = JSON.parse(body); }
+  catch { el.innerHTML = '<div class="alert alert-error">Invalid JSON body</div>'; return; }
+  el.innerHTML = '<div class="spinner"></div>';
+  try {
+    await Api.putDoc(ns, id, doc);
+    el.innerHTML = '<div class="alert alert-success">Document upserted successfully</div>';
+    toast('Document saved');
+  } catch (e) {
+    el.innerHTML = `<div class="alert alert-error">${esc(e.message)}</div>`;
+  }
+}
+
+function confirmDeleteDoc() {
+  const id = document.getElementById('del-id').value.trim();
+  const ns = state.selectedStore?.namespace;
+  if (!id || !ns) { toast('Enter a document ID', 'error'); return; }
+  openModal(`
+    <div class="modal-title">Delete Document</div>
+    <p class="confirm-msg">
+      Delete document <span class="confirm-ns">${esc(id)}</span>
+      from <strong>${esc(ns)}</strong>?
+    </p>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-danger" onclick="doDeleteDoc('${esc(ns)}','${esc(id)}')">Delete</button>
+    </div>
+  `);
+}
+
+async function doDeleteDoc(ns, id) {
+  try {
+    await Api.deleteDoc(ns, id);
+    closeModal();
+    const el = document.getElementById('del-result');
+    if (el) el.innerHTML = '<div class="alert alert-success">Document deleted</div>';
+    toast('Document deleted');
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function doRangeScan() {
+  const start = document.getElementById('range-start').value.trim();
+  const end   = document.getElementById('range-end').value.trim() || undefined;
+  const limit = parseInt(document.getElementById('range-limit').value) || 20;
+  const ns    = state.selectedStore?.namespace;
+  const el    = document.getElementById('range-result');
+  if (!start || !ns) { toast('Start key is required', 'error'); return; }
+  el.innerHTML = '<div class="spinner"></div>';
+  try {
+    const data   = await Api.rangeScan(ns, start, end, currentScanCursor('docRange'), limit);
+    el.innerHTML = renderDocResults(data, 'docRange');
+  } catch (e) {
+    el.innerHTML = `<div class="alert alert-error">${esc(e.message)}</div>`;
+  }
+}
+
+// ── Query tab ─────────────────────────────────────────────────────────────────
+function renderQueryTab() {
+  const el = document.getElementById('tab-query');
+  const qRangeLimit  = parseInt(document.getElementById('q-range-limit')?.value)  || 20;
+  const qPrefixLimit = parseInt(document.getElementById('q-prefix-limit')?.value) || 20;
+  const s  = state.selectedStore;
+  if (!s) {
+    el.innerHTML = `<div class="welcome"><p class="welcome-icon">🔍</p>
+      <p>Select a store first to run queries.</p></div>`;
+    return;
+  }
+
+  if (isKvStore()) { renderKvQueryTab(el, s); return; }
+
+  const sub = state.querySubTab;
+  const indices = s.indices ?? [];
+  const indexHint = indices.length
+    ? indices.map(i => `${i.field} (${i.index_type})`).join(', ')
+    : 'No indices defined';
+  const semanticTab = s.semantic_search_enabled
+    ? `<button class="sub-tab-btn ${sub==='semantic'?'active':''}"
+               onclick="switchQuerySubTab('semantic')">Semantic Search</button>` : '';
+
+  el.innerHTML = `
+    <div class="sub-tab-nav">
+      <button class="sub-tab-btn ${sub==='predicate'?'active':''}"
+              onclick="switchQuerySubTab('predicate')">Predicate Query</button>
+      <button class="sub-tab-btn ${sub==='range'?'active':''}"
+              onclick="switchQuerySubTab('range')">Range Scan</button>
+      <button class="sub-tab-btn ${sub==='prefix'?'active':''}"
+              onclick="switchQuerySubTab('prefix')">Prefix Scan</button>
+      ${semanticTab}
+    </div>
+
+    <!-- Predicate -->
+    <div id="q-predicate" class="sub-panel ${sub==='predicate'?'active':''}">
+      <p class="text-muted" style="margin-bottom:10px">
+        Indexed fields: <strong>${esc(indexHint)}</strong><br>
+        Syntax: <code style="font-family:monospace">status = "active" AND age >= 18</code>
+      </p>
+      <div class="form-row" style="margin-bottom:14px">
+        <div class="form-group" style="flex:1">
+          <label>PREDICATE</label>
+          <input type="text" id="q-pred-input" placeholder='status = "active" AND age >= 18' />
+        </div>
+        <div class="form-group" style="max-width:80px">
+          <label>PAGE</label>
+          <input type="number" id="q-pred-page" value="1" min="1" />
+        </div>
+        <div class="form-group" style="max-width:100px">
+          <label>PAGE SIZE</label>
+          <input type="number" id="q-pred-page-size" value="20" min="1" max="500" />
+        </div>
+        <button class="btn btn-accent" onclick="doPredicateQuery()">Execute</button>
+      </div>
+      <div id="q-pred-result"></div>
+    </div>
+
+    <!-- Range -->
+    <div id="q-range" class="sub-panel ${sub==='range'?'active':''}">
+      <div class="form-row" style="margin-bottom:14px">
+        <div class="form-group" style="flex:1">
+          <label>START KEY <span class="text-muted">(inclusive)</span></label>
+          <input type="text" id="q-range-start" placeholder="${s.key_type === 'uuid' ? '00000000-0000-...' : '0'}" />
+        </div>
+        <div class="form-group" style="flex:1">
+          <label>END KEY <span class="text-muted">(exclusive, optional)</span></label>
+          <input type="text" id="q-range-end" placeholder="leave blank for open scan" />
+        </div>
+        <div class="form-group" style="max-width:100px">
+          <label>LIMIT</label>
+          <input type="number" id="q-range-limit" value="${qRangeLimit}" min="1" max="500" />
+        </div>
+        <button class="btn btn-accent" onclick="freshScan('docQueryRange')">Scan</button>
+      </div>
+      <div id="q-range-result"></div>
+    </div>
+
+    <!-- Prefix -->
+    <div id="q-prefix" class="sub-panel ${sub==='prefix'?'active':''}">
+      <p class="text-muted" style="margin-bottom:10px">
+        Enter the doc ID prefix as a hex string (e.g. <code style="font-family:monospace">deadbeef</code> or a partial UUID without hyphens).
+      </p>
+      <div class="form-row" style="margin-bottom:14px">
+        <div class="form-group" style="flex:1">
+          <label>PREFIX <span class="text-muted">(hex bytes)</span></label>
+          <input type="text" id="q-prefix-input" placeholder="e.g. deadbeef or 550e8400e29b" />
+        </div>
+        <div class="form-group" style="max-width:100px">
+          <label>LIMIT</label>
+          <input type="number" id="q-prefix-limit" value="${qPrefixLimit}" min="1" max="500" />
+        </div>
+        <button class="btn btn-accent" onclick="freshScan('docPrefix')">Scan</button>
+      </div>
+      <div id="q-prefix-result"></div>
+    </div>
+
+    <!-- Semantic -->
+    <div id="q-semantic" class="sub-panel ${sub==='semantic'?'active':''}">
+      <div class="form-group" style="margin-bottom:14px">
+        <label>SEARCH QUERY</label>
+        <input type="text" id="q-sem-query" placeholder="e.g. senior Rust engineer with distributed systems experience" />
+      </div>
+      <div class="form-group" style="margin-bottom:14px">
+        <label>PREDICATE FILTER <span class="text-muted">(optional)</span></label>
+        <input type="text" id="q-sem-pred" placeholder='status = "active"' />
+      </div>
+      <div class="form-row" style="margin-bottom:14px;align-items:flex-end">
+        <div class="form-group" style="max-width:120px">
+          <label>TOP-K</label>
+          <input type="number" id="q-sem-topk" value="10" min="1" max="100" />
+        </div>
+        <div class="form-group" style="max-width:80px">
+          <label>PAGE</label>
+          <input type="number" id="q-sem-page" value="1" min="1" />
+        </div>
+        <div class="form-group" style="max-width:100px">
+          <label>PAGE SIZE</label>
+          <input type="number" id="q-sem-page-size" value="20" min="1" max="500" />
+        </div>
+        <button class="btn btn-accent" onclick="doSemanticSearch()">Search</button>
+      </div>
+      <div id="q-sem-result"></div>
+    </div>
+  `;
+}
+
+function switchQuerySubTab(t) {
+  state.querySubTab = t;
+  renderQueryTab();
+}
+
+function renderKvQueryTab(el, s) {
+  const kvRangeLimit  = parseInt(document.getElementById('kv-range-limit')?.value)  || 20;
+  const kvPrefixLimit = parseInt(document.getElementById('kv-prefix-limit')?.value) || 20;
+  // Normalise sub-tab: only 'range', 'prefix', 'semantic' are valid for KV
+  const validKvSubs = ['range', 'prefix', 'semantic'];
+  const sub = validKvSubs.includes(state.querySubTab) ? state.querySubTab : 'range';
+
+  const keyPlaceholder = s.key_type === 'int' ? 'e.g. 42' : 'e.g. my-key';
+
+  const semanticTab = s.semantic_search_enabled
+    ? `<button class="sub-tab-btn ${sub==='semantic'?'active':''}"
+               onclick="switchKvQuerySubTab('semantic')">Semantic Search</button>`
+    : '';
+
+  el.innerHTML = `
+    <div class="sub-tab-nav">
+      <button class="sub-tab-btn ${sub==='range'?'active':''}"
+              onclick="switchKvQuerySubTab('range')">Range Scan</button>
+      <button class="sub-tab-btn ${sub==='prefix'?'active':''}"
+              onclick="switchKvQuerySubTab('prefix')">Prefix Scan</button>
+      ${semanticTab}
+    </div>
+
+    <!-- Range Scan -->
+    <div id="kv-q-range" class="sub-panel ${sub==='range'?'active':''}">
+      <p class="text-muted" style="margin-bottom:10px">
+        Scan entries whose key falls within [start, end). Leave <em>End</em> blank for an open-ended scan.
+        Keys are compared as ${s.key_type === 'int' ? '<strong>integers</strong>' : '<strong>strings</strong>'}.
+      </p>
+      <div class="form-row" style="margin-bottom:14px">
+        <div class="form-group" style="flex:1">
+          <label>START KEY <span class="text-muted">(inclusive)</span></label>
+          <input type="${s.key_type === 'int' ? 'number' : 'text'}"
+                 id="kv-range-start" placeholder="${keyPlaceholder}" />
+        </div>
+        <div class="form-group" style="flex:1">
+          <label>END KEY <span class="text-muted">(exclusive, optional)</span></label>
+          <input type="${s.key_type === 'int' ? 'number' : 'text'}"
+                 id="kv-range-end" placeholder="leave blank for open scan" />
+        </div>
+        <div class="form-group" style="max-width:100px">
+          <label>LIMIT</label>
+          <input type="number" id="kv-range-limit" value="${kvRangeLimit}" min="1" max="500" />
+        </div>
+        <button class="btn btn-accent" onclick="freshScan('kvRange')">Scan</button>
+      </div>
+      <div id="kv-range-result"></div>
+    </div>
+
+    <!-- Prefix Scan -->
+    <div id="kv-q-prefix" class="sub-panel ${sub==='prefix'?'active':''}">
+      <p class="text-muted" style="margin-bottom:10px">
+        ${s.key_type === 'int'
+          ? 'Enter a numeric prefix — returns all integer keys whose decimal representation starts with this string.'
+          : 'Enter a string prefix — returns all keys that start with this value.'}
+      </p>
+      <div class="form-row" style="margin-bottom:14px">
+        <div class="form-group" style="flex:1">
+          <label>PREFIX</label>
+          <input type="text" id="kv-prefix-input"
+                 placeholder="${s.key_type === 'int' ? 'e.g. 4 (matches 4, 40, 41…)' : 'e.g. user:'}" />
+        </div>
+        <div class="form-group" style="max-width:100px">
+          <label>LIMIT</label>
+          <input type="number" id="kv-prefix-limit" value="${kvPrefixLimit}" min="1" max="500" />
+        </div>
+        <button class="btn btn-accent" onclick="freshScan('kvPrefix')">Scan</button>
+      </div>
+      <div id="kv-prefix-result"></div>
+    </div>
+
+    <!-- Semantic Search -->
+    <div id="kv-q-semantic" class="sub-panel ${sub==='semantic'?'active':''}">
+      <div class="form-group" style="margin-bottom:14px">
+        <label>SEARCH QUERY</label>
+        <input type="text" id="kv-sem-query"
+               placeholder="e.g. error handling in distributed systems" />
+      </div>
+      <div class="form-row" style="margin-bottom:14px;align-items:flex-end">
+        <div class="form-group" style="max-width:120px">
+          <label>TOP-K</label>
+          <input type="number" id="kv-sem-topk" value="10" min="1" max="100" />
+        </div>
+        <div class="form-group" style="max-width:80px">
+          <label>PAGE</label>
+          <input type="number" id="kv-sem-page" value="1" min="1" />
+        </div>
+        <div class="form-group" style="max-width:100px">
+          <label>PAGE SIZE</label>
+          <input type="number" id="kv-sem-page-size" value="20" min="1" max="500" />
+        </div>
+        <button class="btn btn-accent" onclick="doKvSemanticSearch()">Search</button>
+      </div>
+      <div id="kv-sem-result"></div>
+    </div>
+  `;
+}
+
+function switchKvQuerySubTab(t) {
+  state.querySubTab = t;
+  renderQueryTab();
+}
+
+async function doKvRangeScan() {
+  const start = document.getElementById('kv-range-start').value.trim();
+  const end   = document.getElementById('kv-range-end').value.trim() || undefined;
+  const limit = parseInt(document.getElementById('kv-range-limit').value) || 20;
+  const ns    = state.selectedStore?.namespace;
+  const el    = document.getElementById('kv-range-result');
+  if (!start || !ns) { toast('Start key is required', 'error'); return; }
+  el.innerHTML = '<div class="spinner"></div>';
+  try {
+    const data = await Api.kvRangeScan(ns, start, end, currentScanCursor('kvRange'), limit);
+    el.innerHTML = renderKvScanResults(data, 'kvRange');
+  } catch (e) {
+    el.innerHTML = `<div class="alert alert-error">${esc(e.message)}</div>`;
+  }
+}
+
+async function doKvPrefixScan() {
+  const prefix = document.getElementById('kv-prefix-input').value.trim();
+  const limit  = parseInt(document.getElementById('kv-prefix-limit').value) || 20;
+  const ns     = state.selectedStore?.namespace;
+  const el     = document.getElementById('kv-prefix-result');
+  if (!prefix || !ns) { toast('Prefix is required', 'error'); return; }
+  el.innerHTML = '<div class="spinner"></div>';
+  try {
+    const data = await Api.kvPrefixScan(ns, prefix, currentScanCursor('kvPrefix'), limit);
+    el.innerHTML = renderKvScanResults(data, 'kvPrefix');
+  } catch (e) {
+    el.innerHTML = `<div class="alert alert-error">${esc(e.message)}</div>`;
+  }
+}
+
+function renderKvScanResults(data, optsOrScanId) {
+  const isCursorMode = typeof optsOrScanId === 'string';
+  const isPaginated  = data && !Array.isArray(data) && 'results' in data;
+  const results  = isPaginated ? data.results : (Array.isArray(data) ? data : []);
+  const pageInfo = (!isCursorMode && isPaginated) ? data : null;
+  const nextCursor = isCursorMode ? (data?.next_cursor ?? null) : null;
+
+  if (!results?.length) return '<div class="alert alert-info">No results</div>';
+
+  state._docResults = results;
+
+  const countLabel = (isCursorMode || !pageInfo)
+    ? `${results.length} result${results.length === 1 ? '' : 's'}`
+    : `${fmt(pageInfo.total)} result${pageInfo.total === 1 ? '' : 's'}`;
+  const header = `<div class="results-header"><span class="result-count">${countLabel}</span></div>`;
+  const nav = isCursorMode
+    ? renderCursorNav(optsOrScanId, nextCursor, results.length)
+    : renderPageNav(pageInfo, optsOrScanId);
+
+  const rows = results.map((r, i) => {
+    return `
+      <tr>
+        ${cellVal(r.key)}
+        ${cellVal(r.value)}
+        <td style="white-space:nowrap">
+          <button class="btn btn-xs btn-ghost"
+                  onclick="showKvScanResultPayload(${i})">View</button>
+        </td>
+      </tr>`;
+  }).join('');
+
+  return header + nav + `<div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>Key</th><th>Value</th><th></th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table></div>`;
+}
+
+function showKvScanResultPayload(idx) {
+  const r = state._docResults?.[idx];
+  if (!r) return;
+  openModal(`
+    <div class="modal-title">Entry — ${esc(String(r.key))}</div>
+    <div class="json-view" style="max-height:60vh;overflow:auto;padding:12px">${prettyJson({ key: r.key, value: r.value })}</div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal()">Close</button>
+    </div>
+  `);
+}
+
+async function doKvSemanticSearch() {
+  const q        = document.getElementById('kv-sem-query').value.trim();
+  const topK     = parseInt(document.getElementById('kv-sem-topk').value)      || 10;
+  const pageNo   = parseInt(document.getElementById('kv-sem-page').value)      || 1;
+  const pageSize = parseInt(document.getElementById('kv-sem-page-size').value) || 20;
+  const ns       = state.selectedStore?.namespace;
+  const el       = document.getElementById('kv-sem-result');
+  if (!q || !ns) return;
+  el.innerHTML = '<div class="spinner"></div>';
+  try {
+    const data = await Api.kvSemanticSearch(ns, q, topK, pageNo, pageSize);
+    el.innerHTML = renderKvSemanticResults(data, { pageInputId: 'kv-sem-page', actionFn: 'doKvSemanticSearch', pageSize });
+  } catch (e) {
+    el.innerHTML = `<div class="alert alert-error">${esc(e.message)}</div>`;
+  }
+}
+
+function renderKvSemanticResults(data, opts) {
+  const isPaginated = data && !Array.isArray(data) && 'results' in data;
+  const results  = isPaginated ? data.results : data;
+  const pageInfo = isPaginated ? data : null;
+
+  if (!results?.length) return '<div class="alert alert-info">No results</div>';
+
+  state._semanticResults = results;
+
+  const countLabel = pageInfo
+    ? `${fmt(pageInfo.total)} result${pageInfo.total === 1 ? '' : 's'}`
+    : `${results.length} result${results.length === 1 ? '' : 's'}`;
+  const header = `<div class="results-header"><span class="result-count">${countLabel}</span></div>`;
+  const nav = renderPageNav(pageInfo, opts);
+
+  const rows = results.map((r, i) => `
+    <tr>
+      ${cellVal(r.key)}
+      <td style="white-space:nowrap">${r.dot_product.toFixed(4)}</td>
+      ${cellVal(r.value)}
+      <td style="white-space:nowrap">
+        <button class="btn btn-xs btn-ghost"
+                onclick="showKvSemanticResultPayload(${i})">View</button>
+      </td>
+    </tr>`).join('');
+
+  return header + nav + `<div class="tbl-wrap"><table class="tbl">
+    <thead><tr>
+      <th>Key</th><th>Dot Product</th><th>Value</th><th></th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table></div>`;
+}
+
+function showKvSemanticResultPayload(idx) {
+  const r = state._semanticResults?.[idx];
+  if (!r) return;
+  const payload = {
+    key:         r.key,
+    dot_product: r.dot_product,
+    error_bound: r.error_bound,
+    value:       r.value ?? null,
+  };
+  openModal(`
+    <div class="modal-title">Full Payload — ${esc(String(r.key))}</div>
+    <div class="json-view" style="max-height:60vh;overflow:auto;padding:12px">${prettyJson(payload)}</div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal()">Close</button>
+    </div>
+  `);
+}
+
+async function doPredicateQuery() {
+  const pred     = document.getElementById('q-pred-input').value.trim();
+  const pageNo   = parseInt(document.getElementById('q-pred-page').value)      || 1;
+  const pageSize = parseInt(document.getElementById('q-pred-page-size').value) || 20;
+  const ns       = state.selectedStore?.namespace;
+  const el       = document.getElementById('q-pred-result');
+  if (!pred || !ns) return;
+  el.innerHTML = '<div class="spinner"></div>';
+  try {
+    const data   = await Api.query(ns, pred, pageNo, pageSize);
+    el.innerHTML = renderDocResults(data, { pageInputId: 'q-pred-page', actionFn: 'doPredicateQuery', pageSize });
+  } catch (e) {
+    el.innerHTML = `<div class="alert alert-error">${esc(e.message)}</div>`;
+  }
+}
+
+async function doQueryRangeScan() {
+  const start = document.getElementById('q-range-start').value.trim();
+  const end   = document.getElementById('q-range-end').value.trim() || undefined;
+  const limit = parseInt(document.getElementById('q-range-limit').value) || 20;
+  const ns    = state.selectedStore?.namespace;
+  const el    = document.getElementById('q-range-result');
+  if (!start || !ns) { toast('Start key is required', 'error'); return; }
+  el.innerHTML = '<div class="spinner"></div>';
+  try {
+    const data   = await Api.rangeScan(ns, start, end, currentScanCursor('docQueryRange'), limit);
+    el.innerHTML = renderDocResults(data, 'docQueryRange');
+  } catch (e) {
+    el.innerHTML = `<div class="alert alert-error">${esc(e.message)}</div>`;
+  }
+}
+
+async function doPrefixScan() {
+  const prefix = document.getElementById('q-prefix-input').value.trim();
+  const limit  = parseInt(document.getElementById('q-prefix-limit').value) || 20;
+  const ns     = state.selectedStore?.namespace;
+  const el     = document.getElementById('q-prefix-result');
+  if (!prefix || !ns) { toast('Prefix is required', 'error'); return; }
+  el.innerHTML = '<div class="spinner"></div>';
+  try {
+    const data   = await Api.prefixScan(ns, prefix, currentScanCursor('docPrefix'), limit);
+    el.innerHTML = renderDocResults(data, 'docPrefix');
+  } catch (e) {
+    el.innerHTML = `<div class="alert alert-error">${esc(e.message)}</div>`;
+  }
+}
+
+async function doSemanticSearch() {
+  const q        = document.getElementById('q-sem-query').value.trim();
+  const pred     = document.getElementById('q-sem-pred').value.trim() || undefined;
+  const topK     = parseInt(document.getElementById('q-sem-topk').value)      || 10;
+  const pageNo   = parseInt(document.getElementById('q-sem-page').value)      || 1;
+  const pageSize = parseInt(document.getElementById('q-sem-page-size').value) || 20;
+  const ns       = state.selectedStore?.namespace;
+  const el       = document.getElementById('q-sem-result');
+  if (!q || !ns) return;
+  el.innerHTML = '<div class="spinner"></div>';
+  try {
+    const data = pred
+      ? await Api.semanticSearchFiltered(ns, q, pred, topK, pageNo, pageSize)
+      : await Api.semanticSearch(ns, q, topK, pageNo, pageSize);
+    el.innerHTML = renderSemanticResults(data, { pageInputId: 'q-sem-page', actionFn: 'doSemanticSearch', pageSize });
+  } catch (e) {
+    el.innerHTML = `<div class="alert alert-error">${esc(e.message)}</div>`;
+  }
+}
+
+// ── Result rendering ──────────────────────────────────────────────────────────
+function cellVal(rawVal) {
+  if (rawVal == null) return `<td class="cell-clip"><span class="text-muted">—</span></td>`;
+  const str = typeof rawVal === 'object' ? JSON.stringify(rawVal, null, 2) : String(rawVal);
+  return `<td class="cell-clip" title="${esc(str)}" onclick="showCellPopup(this)">${esc(str)}</td>`;
+}
+
+function showCellPopup(td) {
+  const val = esc(td.getAttribute('title') ?? '');
+  openModal(`
+    <div class="modal-title">Cell Value</div>
+    <div class="json-view" style="max-height:60vh;overflow:auto;padding:12px;white-space:pre-wrap;word-break:break-all">${val}</div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal()">Close</button>
+    </div>
+  `);
+}
+
+function setPageAndRun(inputId, page, fnName) {
+  const input = document.getElementById(inputId);
+  if (input) input.value = Math.max(1, page);
+  if (typeof window[fnName] === 'function') window[fnName]();
+}
+
+function renderPageNav(pageInfo, opts) {
+  if (!pageInfo || !opts?.pageInputId || !opts?.actionFn) return '';
+  const p = pageInfo.page_no;
+  const totalPages = opts.pageSize > 0 ? Math.ceil(pageInfo.total / opts.pageSize) : null;
+  const isFirst = p <= 1;
+  const isLast  = totalPages != null ? p >= totalPages : false;
+  const label = totalPages
+    ? `Page ${p} of ${totalPages} &nbsp;·&nbsp; ${fmt(pageInfo.total)} total`
+    : `Page ${p} &nbsp;·&nbsp; ${fmt(pageInfo.total)} total`;
+  return `
+    <div class="pagination-nav">
+      <button class="pagination-btn" ${isFirst ? 'disabled' : ''}
+              onclick="setPageAndRun('${opts.pageInputId}', ${p - 1}, '${opts.actionFn}')">← Prev</button>
+      <span class="page-label">${label}</span>
+      <button class="pagination-btn" ${isLast ? 'disabled' : ''}
+              onclick="setPageAndRun('${opts.pageInputId}', ${p + 1}, '${opts.actionFn}')">Next →</button>
+    </div>`;
+}
+
+function renderCursorNav(scanId, nextCursor, count) {
+  state._nextCursors[scanId] = nextCursor;
+  const isFirst = isScanFirstPage(scanId);
+  const hasNext = nextCursor != null;
+  const label   = `Page ${getScanPageNum(scanId)} &nbsp;·&nbsp; ${count} shown`;
+  return `
+    <div class="pagination-nav">
+      <button class="pagination-btn" ${isFirst ? 'disabled' : ''}
+              onclick="scanPrev('${scanId}')">← Prev</button>
+      <span class="page-label">${label}</span>
+      <button class="pagination-btn" ${!hasNext ? 'disabled' : ''}
+              onclick="scanNext('${scanId}')">Next →</button>
+    </div>`;
+}
+
+function renderDocResults(data, optsOrScanId) {
+  const isCursorMode = typeof optsOrScanId === 'string';
+  const isPaginated  = data && !Array.isArray(data) && 'results' in data;
+  const results  = isPaginated ? data.results : (Array.isArray(data) ? data : []);
+  const pageInfo = (!isCursorMode && isPaginated) ? data : null;
+  const nextCursor = isCursorMode ? (data?.next_cursor ?? null) : null;
+
+  if (!results?.length) return '<div class="alert alert-info">No results</div>';
+
+  // Persist so the popup callback can look up by row index
+  state._docResults = results;
+
+  const s           = state.selectedStore;
+  const indexFields = (s?.indices    ?? []).map(ix => ix.field);
+  const attrFields  = (s?.attributes ?? []).map(a  => a.name);
+  const allFields   = [...indexFields, ...attrFields];
+
+  const countLabel = (isCursorMode || !pageInfo)
+    ? `${results.length} result${results.length === 1 ? '' : 's'}`
+    : `${fmt(pageInfo.total)} result${pageInfo.total === 1 ? '' : 's'}`;
+  const header = `<div class="results-header">
+    <span class="result-count">${countLabel}</span></div>`;
+
+  const nav = isCursorMode
+    ? renderCursorNav(optsOrScanId, nextCursor, results.length)
+    : renderPageNav(pageInfo, optsOrScanId);
+
+  const fieldHeaders = allFields.map(f => `<th>${esc(f)}</th>`).join('');
+
+  const rows = results.map((r, i) => {
+    const doc = r.doc ?? {};
+    const fieldCells = allFields.map(f => cellVal(doc[f] ?? null)).join('');
+    return `
+      <tr>
+        ${cellVal(r.id)}
+        ${fieldCells}
+        <td style="white-space:nowrap">
+          <button class="btn btn-xs btn-ghost"
+                  onclick="showDocResultPayload(${i})">View JSON</button>
+        </td>
+      </tr>`;
+  }).join('');
+
+  return header + nav + `<div class="tbl-wrap"><table class="tbl">
+    <thead><tr>
+      <th style="min-width:100px">Document ID</th>
+      ${fieldHeaders}
+      <th></th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table></div>`;
+}
+
+function showDocResultPayload(idx) {
+  const r = state._docResults?.[idx];
+  if (!r) return;
+  openModal(`
+    <div class="modal-title">Document — ${esc(String(r.id))}</div>
+    <div class="json-view" style="max-height:60vh;overflow:auto;padding:12px">${prettyJson(r.doc)}</div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal()">Close</button>
+    </div>
+  `);
+}
+
+function renderSemanticResults(data, opts) {
+  const isPaginated = data && !Array.isArray(data) && 'results' in data;
+  const results  = isPaginated ? data.results : data;
+  const pageInfo = isPaginated ? data : null;
+
+  if (!results?.length) return '<div class="alert alert-info">No results</div>';
+
+  // Persist results so the popup callback can access them by index
+  state._semanticResults = results;
+
+  const s           = state.selectedStore;
+  const indexFields = (s?.indices    ?? []).map(ix => ix.field);
+  const attrFields  = (s?.attributes ?? []).map(a  => a.name);
+  const allFields   = [...indexFields, ...attrFields];
+
+  const countLabel = pageInfo
+    ? `${fmt(pageInfo.total)} result${pageInfo.total === 1 ? '' : 's'}`
+    : `${results.length} result${results.length===1?'':'s'}`;
+  const header = `<div class="results-header">
+    <span class="result-count">${countLabel}</span></div>`;
+
+  const nav = renderPageNav(pageInfo, opts);
+
+  const fieldHeaders = allFields.map(f => `<th>${esc(f)}</th>`).join('');
+
+  const rows = results.map((r, i) => {
+    let docObj = {};
+    if (r.document) {
+      if (typeof r.document === 'string') {
+        try { docObj = JSON.parse(r.document); } catch { /* leave empty */ }
+      } else {
+        docObj = r.document;
+      }
+    }
+    const fieldCells = allFields.map(f => cellVal(docObj[f] ?? null)).join('');
+    return `
+      <tr>
+        ${cellVal(r.id)}
+        <td style="white-space:nowrap">${r.dot_product.toFixed(4)}</td>
+        ${fieldCells}
+        <td style="white-space:nowrap">
+          <button class="btn btn-xs btn-ghost"
+                  onclick="showSemanticResultPayload(${i})">View JSON</button>
+        </td>
+      </tr>`;
+  }).join('');
+
+  return header + nav + `<div class="tbl-wrap"><table class="tbl">
+    <thead><tr>
+      <th style="min-width:100px">Document ID</th><th>Dot Product</th>
+      ${fieldHeaders}
+      <th></th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table></div>`;
+}
+
+function showSemanticResultPayload(idx) {
+  const r = state._semanticResults?.[idx];
+  if (!r) return;
+
+  let docObj = r.document;
+  if (typeof docObj === 'string') {
+    try { docObj = JSON.parse(docObj); } catch { /* keep as string */ }
+  }
+
+  const payload = {
+    id:          r.id,
+    dot_product: r.dot_product,
+    error_bound: r.error_bound,
+    document:    docObj ?? null,
+  };
+
+  openModal(`
+    <div class="modal-title">Full Payload — ${esc(String(r.id))}</div>
+    <div class="json-view" style="max-height:60vh;overflow:auto;padding:12px">${prettyJson(payload)}</div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal()">Close</button>
+    </div>
+  `);
+}
+
+// ── Admin tab ─────────────────────────────────────────────────────────────────
+async function renderAdminTab() {
+  const el = document.getElementById('tab-admin');
+  el.innerHTML = `
+    <div class="sub-tab-nav admin-inner-nav">
+      <button class="sub-tab-btn ${state.adminTab === 'storage' ? 'active' : ''}"
+              data-admin-tab="storage" onclick="switchAdminTab('storage')">Storage</button>
+      <button class="sub-tab-btn ${state.adminTab === 'ops' ? 'active' : ''}"
+              data-admin-tab="ops" onclick="switchAdminTab('ops')">Ops Metrics</button>
+      <button class="sub-tab-btn ${state.adminTab === 'index' ? 'active' : ''}"
+              data-admin-tab="index" onclick="switchAdminTab('index')">Index Management</button>
+    </div>
+    <div id="admin-storage-panel" class="sub-panel ${state.adminTab === 'storage' ? 'active' : ''}">
+      <div class="spinner"></div>
+    </div>
+    <div id="admin-ops-panel" class="sub-panel ${state.adminTab === 'ops' ? 'active' : ''}">
+      <div class="spinner"></div>
+    </div>
+    <div id="admin-index-panel" class="sub-panel ${state.adminTab === 'index' ? 'active' : ''}">
+      <div class="spinner"></div>
+    </div>
+  `;
+  if (state.adminTab === 'storage')   await loadAdminStoragePanel();
+  else if (state.adminTab === 'ops')  await loadAdminOpsPanel();
+  else                                await loadAdminIndexPanel();
+}
+
+function switchAdminTab(tab) {
+  state.adminTab = tab;
+  document.querySelectorAll('[data-admin-tab]').forEach(b => {
+    b.classList.toggle('active', b.dataset.adminTab === tab);
+  });
+  const storagePanel = document.getElementById('admin-storage-panel');
+  const opsPanel     = document.getElementById('admin-ops-panel');
+  const indexPanel   = document.getElementById('admin-index-panel');
+  if (storagePanel) storagePanel.classList.toggle('active', tab === 'storage');
+  if (opsPanel)     opsPanel.classList.toggle('active', tab === 'ops');
+  if (indexPanel)   indexPanel.classList.toggle('active', tab === 'index');
+  if (tab === 'storage')  loadAdminStoragePanel();
+  else if (tab === 'ops') loadAdminOpsPanel();
+  else                    loadAdminIndexPanel();
+}
+
+// ── Admin storage panel ───────────────────────────────────────────────────────
+async function loadAdminStoragePanel() {
+  const panel = document.getElementById('admin-storage-panel');
+  if (!panel) return;
+  panel.innerHTML = `
+    <div class="section">
+      <div class="section-header"><span class="section-title">ACTIONS</span></div>
+      <div class="admin-actions">
+        <button class="btn btn-ghost" onclick="adminTriggerGc()">⚡ Trigger GC</button>
+        <button class="btn btn-ghost" onclick="adminTriggerWalGc()">⚡ Trigger WAL GC</button>
+        <button class="btn btn-ghost" onclick="adminCompact()">⚡ Compact LSM</button>
+        <button class="btn btn-ghost" onclick="adminIndexCheckpoint()">⚡ Index Checkpoint</button>
+        <button class="btn btn-secondary" onclick="adminRefresh()">↻ Refresh Stats</button>
+        <button class="btn btn-ghost" onclick="adminImportSchema()">⬆ Import Schema</button>
+        <button class="btn btn-danger" onclick="adminClearQueryCache()">🗑 Clear Query Cache</button>
+      </div>
+      <input type="file" id="admin-import-file" accept=".json,application/json" style="display:none"
+             onchange="adminImportSchemaFile(this)">
+      <div id="admin-action-result"></div>
+    </div>
+    <div id="admin-storage-stats"><div class="spinner"></div></div>
+  `;
+  await loadStorageStats();
+}
+
+// ── Admin ops-metrics panel ─────────────────────────────────────────────────────
+async function loadAdminOpsPanel() {
+  const panel = document.getElementById('admin-ops-panel');
+  if (!panel) return;
+  panel.innerHTML = `
+    <div class="section">
+      <div class="section-header"><span class="section-title">ACTIONS</span></div>
+      <div class="admin-actions">
+        <button class="btn btn-secondary" onclick="loadOpsMetrics()">↻ Refresh Metrics</button>
+      </div>
+      <div class="text-muted" style="font-size:12px;margin-top:6px">
+        Engine-wide counters, cumulative since startup. Sample twice to compute rates.
+      </div>
+    </div>
+    <div id="admin-ops-metrics"><div class="spinner"></div></div>
+  `;
+  await loadOpsMetrics();
+}
+
+async function loadOpsMetrics() {
+  const area = document.getElementById('admin-ops-metrics');
+  if (!area) return;
+  area.innerHTML = '<div class="spinner"></div>';
+  try {
+    const m = await Api.opsMetrics();
+    area.innerHTML = renderOpsMetricsHtml(m);
+  } catch (e) {
+    area.innerHTML = `<div class="alert alert-error">Failed to load ops metrics: ${esc(e.message)}</div>`;
+  }
+}
+
+function renderOpsMetricsHtml(m) {
+  const r = m.reads ?? {}, l = m.lsm_lookups ?? {}, w = m.writes ?? {},
+        c = m.compaction ?? {}, g = m.gc ?? {};
+
+  const ratioPct = (x) => `${((x ?? 0) * 100).toFixed(1)}%`;
+  const ratioCls = (x, warnBelow) => (x ?? 0) >= warnBelow ? 'good' : (x ?? 0) >= warnBelow * 0.6 ? 'warn' : 'bad';
+  const row = (k, v, cls) => `<div class="stat-row"><span class="stat-key">${k}</span>
+    <span class="stat-val ${cls ?? ''}">${v}</span></div>`;
+  const bar = (ratio, label) => `
+    <div style="margin:6px 0 10px">
+      <div class="progress-wrap" style="height:10px">
+        <div class="progress-bar" style="width:${Math.min((ratio ?? 0) * 100, 100)}%;
+             background:${(ratio ?? 0) >= 0.8 ? 'var(--success)' : (ratio ?? 0) >= 0.5 ? 'var(--warning)' : 'var(--error)'}">
+        </div>
+      </div>
+      <div class="progress-label">${label}</div>
+    </div>`;
+
+  const apFailCls = (w.apply_failures ?? 0) > 0 ? 'bad' : 'good';
+
+  return `
+    <div class="admin-grid">
+      <div class="admin-card">
+        <div class="admin-card-title">READS</div>
+        ${bar(r.read_hit_ratio, `${ratioPct(r.read_hit_ratio)} hit ratio`)}
+        ${row('Reads', fmt(r.reads))}
+        ${row('Hits', fmt(r.read_hits), 'good')}
+        ${row('Misses', fmt(r.read_misses), (r.read_misses ?? 0) > 0 ? 'warn' : '')}
+        ${row('Hit Ratio', ratioPct(r.read_hit_ratio), ratioCls(r.read_hit_ratio, 0.8))}
+        ${row('Scans', fmt(r.scans))}
+        ${row('Scan Rows', fmt(r.scan_rows))}
+      </div>
+
+      <div class="admin-card">
+        <div class="admin-card-title">LSM LOOKUPS</div>
+        ${bar(l.fast_path_hit_ratio, `${ratioPct(l.fast_path_hit_ratio)} fast-path`)}
+        ${row('Lookups', fmt(l.lookups))}
+        ${row('Fast-path Hits', fmt(l.fast_path_hits), 'good')}
+        ${row('Fast-path Ratio', ratioPct(l.fast_path_hit_ratio), ratioCls(l.fast_path_hit_ratio, 0.5))}
+        ${row('L0 Probes', fmt(l.l0_probes))}
+        ${row('L1 Probes', fmt(l.l1_probes))}
+        ${row('Bloom Rejects', fmt(l.bloom_rejects))}
+      </div>
+
+      <div class="admin-card">
+        <div class="admin-card-title">WRITES</div>
+        ${row('Puts', fmt(w.puts))}
+        ${row('Deletes', fmt(w.deletes))}
+        ${row('No-WAL Puts', fmt(w.no_wal_puts))}
+        ${row('WAL Appended', fmtBytes(w.wal_bytes_appended))}
+        ${row('WAL Fsyncs', fmt(w.wal_fsyncs))}
+        ${row('Apply Failures', fmt(w.apply_failures), apFailCls)}
+      </div>
+
+      <div class="admin-card">
+        <div class="admin-card-title">COMPACTION</div>
+        ${row('Memtable Flushes', fmt(c.memtable_flushes))}
+        ${row('L0→L1 Compactions', fmt(c.l0_l1_compactions))}
+        ${row('Bytes Merged', fmtBytes(c.compaction_bytes_merged))}
+        ${row('Duration', fmtMillis(c.compaction_duration_ms))}
+      </div>
+
+      <div class="admin-card">
+        <div class="admin-card-title">GARBAGE COLLECTION</div>
+        ${row('VLog GC Runs', fmt(g.vlog_gc_runs))}
+        ${row('VLog GC Duration', fmtMillis(g.vlog_gc_duration_ms))}
+        ${row('WAL GC Runs', fmt(g.wal_gc_runs))}
+        ${row('WAL Segments Deleted', fmt(g.wal_segments_deleted))}
+      </div>
+
+      <div class="admin-card">
+        <div class="admin-card-title">UPTIME</div>
+        ${row('Since Startup', fmtUptime(m.uptime_s))}
+      </div>
+    </div>
+  `;
+}
+
+function fmtMillis(ms) {
+  if (ms == null) return '—';
+  if (ms < 1000)        return `${fmt(ms)} ms`;
+  if (ms < 60000)       return `${(ms / 1000).toFixed(2)} s`;
+  return `${Math.floor(ms / 60000)}m ${Math.round((ms % 60000) / 1000)}s`;
+}
+
+async function loadStorageStats() {
+  const area = document.getElementById('admin-storage-stats');
+  if (!area) return;
+  try {
+    const [h, s, w, sys, lsmArr, vlogArr, wasteRes] = await Promise.all([
+      Api.health(), Api.stats(), Api.wal(), Api.systemStores(), Api.lsm(),
+      Api.valueLog().catch(() => null),
+      Api.indexWaste().catch(() => null),
+    ]);
+    state.adminStats = s; state.adminWal = w;
+    state.adminLsm  = Object.fromEntries((lsmArr  ?? []).map(x => [x.namespace, x]));
+    state.adminVlog = Object.fromEntries((vlogArr ?? []).map(x => [x.namespace, x]));
+
+    const rowCountResults = await Promise.allSettled(
+      state.stores.map(ds => Api.storeRowCount(ds.namespace))
+    );
+    state.adminRowCounts = Object.fromEntries(
+      state.stores.map((ds, i) => [
+        ds.namespace,
+        rowCountResults[i].status === 'fulfilled' ? rowCountResults[i].value?.count : null,
+      ])
+    );
+
+    const wasteClass = s.waste_ratio_pct > 40 ? 'bad' : s.waste_ratio_pct > 20 ? 'warn' : 'good';
+    const pendClass  = w.pending_entries > 1000 ? 'warn' : 'good';
+
+    area.innerHTML = `
+      <div class="admin-grid">
+        <div class="admin-card">
+          <div class="admin-card-title">SERVER</div>
+          <div class="stat-row"><span class="stat-key">Status</span>
+            <span class="stat-val good">${esc(h.status)}</span></div>
+          <div class="stat-row"><span class="stat-key">Uptime</span>
+            <span class="stat-val">${fmtUptime(h.uptime_s)}</span></div>
+          <div class="stat-row"><span class="stat-key">Base URL</span>
+            <span class="stat-val" style="font-size:12px">${esc(state.baseUrl)}</span></div>
+        </div>
+
+        <div class="admin-card">
+          <div class="admin-card-title">STORAGE STATS</div>
+          <div class="stat-row"><span class="stat-key">Live Data</span>
+            <span class="stat-val">${fmtBytes(s.live_bytes)}</span></div>
+          <div class="stat-row"><span class="stat-key">Garbage</span>
+            <span class="stat-val ${wasteClass}">${fmtBytes(s.garbage_bytes)}</span></div>
+          <div class="stat-row"><span class="stat-key">Waste Ratio</span>
+            <span class="stat-val ${wasteClass}">${s.waste_ratio_pct.toFixed(1)}%</span></div>
+          <div class="stat-row"><span class="stat-key">Free Space</span>
+            <span class="stat-val">${s.free_space_ratio_pct.toFixed(1)}%</span></div>
+          <div class="stat-row"><span class="stat-key">GC Runs</span>
+            <span class="stat-val">${fmt(s.total_gc_runs)}</span></div>
+          <div class="stat-row"><span class="stat-key">Bytes Reclaimed</span>
+            <span class="stat-val">${fmtBytes(s.total_bytes_reclaimed)}</span></div>
+        </div>
+
+        <div class="admin-card">
+          <div class="admin-card-title">WAL</div>
+          <div class="stat-row"><span class="stat-key">Total Entries</span>
+            <span class="stat-val">${fmt(w.total_entries)}</span></div>
+          <div class="stat-row"><span class="stat-key">Persisted</span>
+            <span class="stat-val good">${fmt(w.persisted_entries)}</span></div>
+          <div class="stat-row"><span class="stat-key">Pending</span>
+            <span class="stat-val ${pendClass}">${fmt(w.pending_entries)}</span></div>
+          <div class="stat-row"><span class="stat-key">GC Runs</span>
+            <span class="stat-val">${fmt(w.total_gc_runs)}</span></div>
+          <div class="stat-row"><span class="stat-key">Bytes Reclaimed</span>
+            <span class="stat-val">${fmtBytes(w.total_bytes_reclaimed)}</span></div>
+          ${w.live_segments != null ? `
+          <div class="stat-row"><span class="stat-key">Live Segments</span>
+            <span class="stat-val">${fmt(w.live_segments)}${w.base_segment_id != null ? ` <span class="text-muted" style="font-size:11px">from #${fmt(w.base_segment_id)}</span>` : ''}</span></div>` : ''}
+          ${w.last_sequence != null ? `
+          <div class="stat-row"><span class="stat-key">Last Sequence</span>
+            <span class="stat-val">${fmt(w.last_sequence)}</span></div>` : ''}
+          <div class="stat-row"><span class="stat-key">Head → Tail</span>
+            <span class="stat-val" style="font-size:11px">${fmt(w.head)} → ${fmt(w.tail)}</span></div>
+        </div>
+
+        <div class="admin-card">
+          <div class="admin-card-title">WASTE RATIO</div>
+          <div style="margin-bottom:8px">
+            <div class="progress-wrap" style="height:12px">
+              <div class="progress-bar" style="width:${Math.min(s.waste_ratio_pct,100)}%;
+                   background:${s.waste_ratio_pct>40?'var(--error)':s.waste_ratio_pct>20?'var(--warning)':'var(--success)'}">
+              </div>
+            </div>
+            <div class="progress-label">${s.waste_ratio_pct.toFixed(1)}% garbage</div>
+          </div>
+          <div class="admin-card-title" style="margin-top:12px">
+            DOC STORES (${state.stores.length})
+          </div>
+          ${state.stores.map(ds => `
+            <div class="stat-row">
+              <span class="stat-key">${esc(ds.namespace)}</span>
+              ${keyTypeBadge(ds.key_type)}
+            </div>`).join('')}
+          ${state.kvStores.length ? `
+            <div class="admin-card-title" style="margin-top:12px">
+              KV STORES (${state.kvStores.length})
+            </div>
+            ${state.kvStores.map(kv => `
+              <div class="stat-row">
+                <span class="stat-key">${esc(kv.namespace)}</span>
+                <span class="badge badge-kv">KV</span>
+                ${kvValueTypeBadge(kv.value_type)}
+              </div>`).join('')}` : ''}
+        </div>
+      </div>
+
+      ${renderSystemStoresSection(sys)}
+      ${renderIndexWasteSection(wasteRes)}
+      ${renderDocStoresSection(state.stores, state.adminLsm, state.adminRowCounts)}
+      ${renderKvStoresSection(state.kvStores, state.adminLsm)}
+    `;
+  } catch (e) {
+    area.innerHTML = `<div class="alert alert-error">Failed to load stats: ${esc(e.message)}</div>`;
+  }
+}
+
+function renderSystemStoresSection(sys) {
+  const kvStores  = sys?.kv_stores  ?? [];
+  const docStores = sys?.doc_stores ?? [];
+
+  const kvRows = kvStores.map(kv => `
+    <div class="sys-store-row" id="sys-kv-${esc(kv.name)}">
+      <div class="sys-store-header">
+        <div class="sys-store-identity">
+          <span class="sys-store-name">${esc(kv.name)}</span>
+          <span class="badge badge-attr">KV</span>
+          ${kv.ttl_enabled
+            ? `<span class="badge badge-indexed">TTL ${fmtDuration(kv.ttl_secs)}</span>${kv.ttl_max_deletes_per_run != null ? `<span class="badge badge-attr">max ${fmt(kv.ttl_max_deletes_per_run)}/run</span>` : ''}`
+            : ''}
+          <span class="sys-store-purpose">${esc(kv.purpose)}</span>
+        </div>
+        <div class="sys-store-meta">
+          <span class="stat-key">NS ID</span>
+          <span class="stat-val" style="font-size:11px">#${kv.ns_id}</span>
+          <span class="stat-key" style="margin-left:12px">LSM Entries</span>
+          <span class="stat-val">${fmt(kv.lsm_entry_count)}</span>
+          <button class="btn btn-sm btn-ghost sys-monitor-btn"
+                  onclick="toggleSystemStoreMeta('${esc(kv.name)}')">Monitor ▾</button>
+        </div>
+      </div>
+      <div class="sys-store-detail" id="sys-detail-${esc(kv.name)}" style="display:none"></div>
+    </div>
+  `).join('');
+
+  const docRows = docStores.length === 0 ? '' : docStores.map(ds => `
+    <div class="sys-store-row">
+      <div class="sys-store-header">
+        <div class="sys-store-identity">
+          <span class="sys-store-name">${esc(ds.namespace)}</span>
+          <span class="badge badge-uuid">Doc</span>
+          ${ds.semantic_search_enabled
+            ? '<span class="badge badge-indexed">✨ Semantic ON</span>'
+            : ''}
+        </div>
+        <div class="sys-store-meta">
+          <span class="stat-key">NS ID</span>
+          <span class="stat-val" style="font-size:11px">#${ds.ns_id}</span>
+        </div>
+      </div>
+    </div>
+  `).join('');
+
+  const totalArtifacts = kvStores.length + docStores.length;
+
+  return `
+    <div class="section">
+      <div class="section-header">
+        <span class="section-title">SYSTEM NAMESPACE (${totalArtifacts} artifact${totalArtifacts !== 1 ? 's' : ''})</span>
+      </div>
+      <div class="sys-stores-list">
+        ${totalArtifacts === 0
+          ? '<div class="text-muted" style="padding:12px 0">No system stores found</div>'
+          : kvRows + docRows}
+      </div>
+    </div>
+  `;
+}
+
+function renderDocStoresSection(stores, lsmMap, rowCountMap) {
+  if (!stores.length) return '';
+
+  const rows = stores.map(store => {
+    const lsm = lsmMap?.[store.namespace];
+    const entryCount = lsm ? fmt(lsm.total_entries) : '—';
+    const diskSize = lsm ? fmtBytes(lsm.total_size_bytes) : '—';
+    const rowCount = rowCountMap?.[store.namespace];
+    const rowCountDisplay = rowCount != null ? fmt(rowCount) : '—';
+    const nsEscaped = esc(store.namespace);
+    return `
+      <div class="sys-store-row" id="doc-store-${nsEscaped}">
+        <div class="sys-store-header">
+          <div class="sys-store-identity">
+            <span class="sys-store-name">${nsEscaped}</span>
+            ${keyTypeBadge(store.key_type)}
+            ${lsmCompactionBadge(lsm)}
+          </div>
+          <div class="sys-store-meta">
+            <span class="stat-key">Rows</span>
+            <span class="stat-val">${rowCountDisplay}</span>
+            <span class="stat-key" style="margin-left:12px">LSM Entries</span>
+            <span class="stat-val">${entryCount}</span>
+            <span class="stat-key" style="margin-left:12px">On-disk</span>
+            <span class="stat-val">${diskSize}</span>
+            <button class="btn btn-sm btn-ghost"
+                    onclick="adminExportSchema('${nsEscaped}')">⬇ Export</button>
+            <button class="btn btn-sm btn-ghost sys-monitor-btn"
+                    onclick="toggleDocStoreLsm('${nsEscaped}')">Monitor ▾</button>
+          </div>
+        </div>
+        <div class="sys-store-detail" id="doc-lsm-${nsEscaped}" style="display:none"></div>
+      </div>
+    `;
+  }).join('');
+
+  return `
+    <div class="section">
+      <div class="section-header">
+        <span class="section-title">DOC STORE NAMESPACES (${stores.length})</span>
+      </div>
+      <div class="sys-stores-list">
+        ${rows}
+      </div>
+    </div>
+  `;
+}
+
+function renderKvStoresSection(kvStores, lsmMap) {
+  if (!kvStores.length) return '';
+
+  const rows = kvStores.map(store => {
+    const lsm = lsmMap?.[store.namespace];
+    const entryCount = lsm ? fmt(lsm.total_entries) : '—';
+    const diskSize = lsm ? fmtBytes(lsm.total_size_bytes) : '—';
+    return `
+      <div class="sys-store-row" id="kv-store-${esc(store.namespace)}">
+        <div class="sys-store-header">
+          <div class="sys-store-identity">
+            <span class="sys-store-name">${esc(store.namespace)}</span>
+            <span class="badge badge-kv">KV</span>
+            ${keyTypeBadge(store.key_type)}
+            ${kvValueTypeBadge(store.value_type)}
+            ${store.semantic_search_enabled
+              ? '<span class="badge badge-indexed">✨ Semantic ON</span>'
+              : ''}
+            ${lsmCompactionBadge(lsm)}
+          </div>
+          <div class="sys-store-meta">
+            ${store.ns_id != null
+              ? `<span class="stat-key">NS ID</span>
+                 <span class="stat-val" style="font-size:11px">#${store.ns_id}</span>` : ''}
+            <span class="stat-key" style="margin-left:12px">LSM Entries</span>
+            <span class="stat-val">${entryCount}</span>
+            <span class="stat-key" style="margin-left:12px">On-disk</span>
+            <span class="stat-val">${diskSize}</span>
+            <button class="btn btn-sm btn-ghost sys-monitor-btn"
+                    onclick="toggleKvStoreDetail('${esc(store.namespace)}')">Monitor ▾</button>
+          </div>
+        </div>
+        <div class="sys-store-detail" id="kv-lsm-${esc(store.namespace)}" style="display:none"></div>
+      </div>
+    `;
+  }).join('');
+
+  return `
+    <div class="section">
+      <div class="section-header">
+        <span class="section-title">KV STORE NAMESPACES (${kvStores.length})</span>
+      </div>
+      <div class="sys-stores-list">${rows}</div>
+    </div>
+  `;
+}
+
+// ── Field-index waste ───────────────────────────────────────────────────────────
+// Per-field reclaimable dead space in the field-index bitmap/keymap stores.
+// Use it to decide whether to force an Index Checkpoint.
+function renderIndexWasteSection(waste) {
+  if (!waste) return '';
+  const namespaces = (waste.namespaces ?? []).filter(n => (n.fields ?? []).length);
+  const threshold  = waste.threshold ?? 0;
+  const thresholdPct = (threshold * 100).toFixed(0);
+
+  const overCount = namespaces.reduce(
+    (acc, n) => acc + n.fields.filter(f => f.over_threshold).length, 0);
+
+  const wasteCell = (ratio) => {
+    if (ratio == null) return '<span class="stat-val text-muted">—</span>';
+    const pct = ratio * 100;
+    const cls = ratio >= threshold ? 'bad' : pct >= threshold * 50 ? 'warn' : 'good';
+    return `<span class="stat-val ${cls}">${pct.toFixed(1)}%</span>`;
+  };
+
+  const nsBlocks = namespaces.map(n => {
+    const fieldRows = n.fields.map(f => `
+      <div class="stat-row index-waste-row${f.over_threshold ? ' over-threshold' : ''}">
+        <span class="stat-key">
+          ${esc(f.field_name)}
+          <span class="badge badge-attr">${esc(f.field_type)}</span>
+          ${f.over_threshold ? '<span class="badge badge-error">over threshold</span>' : ''}
+        </span>
+        <span class="sys-store-meta">
+          <span class="stat-key">bitmap</span> ${wasteCell(f.bitmap_waste_ratio)}
+          <span class="stat-key" style="margin-left:12px">keymap</span> ${wasteCell(f.keymap_waste_ratio)}
+          ${f.distinct_count != null
+            ? `<span class="stat-key" style="margin-left:12px">distinct</span>
+               <span class="stat-val">${fmt(f.distinct_count)}</span>` : ''}
+        </span>
+      </div>`).join('');
+    return `
+      <div class="sys-store-row">
+        <div class="sys-store-header">
+          <div class="sys-store-identity">
+            <span class="sys-store-name">${esc(n.namespace)}</span>
+            <span class="stat-key">NS ID</span>
+            <span class="stat-val" style="font-size:11px">#${n.ns_id}</span>
+          </div>
+        </div>
+        <div style="padding:4px 0 8px">${fieldRows}</div>
+      </div>`;
+  }).join('');
+
+  return `
+    <div class="section">
+      <div class="section-header">
+        <span class="section-title">FIELD INDEX WASTE</span>
+        <span class="text-muted" style="font-size:12px">
+          fleet-wide ratios · compaction threshold ${thresholdPct}%${overCount
+            ? ` · <span class="stat-val bad">${overCount} field${overCount !== 1 ? 's' : ''} over threshold</span> — run Index Checkpoint`
+            : ' · all fields healthy'} · per-field byte detail in Index Management → Blob Stats
+        </span>
+      </div>
+      <div class="sys-stores-list">
+        ${namespaces.length
+          ? nsBlocks
+          : '<div class="text-muted" style="padding:12px 0">No indexed fields found</div>'}
+      </div>
+    </div>
+  `;
+}
+
+async function toggleKvStoreDetail(ns) {
+  const detail = document.getElementById(`kv-lsm-${ns}`);
+  const btn    = detail?.previousElementSibling?.querySelector('.sys-monitor-btn');
+  if (!detail) return;
+
+  if (detail.style.display !== 'none') {
+    detail.style.display = 'none';
+    if (btn) btn.textContent = 'Monitor ▾';
+    return;
+  }
+
+  detail.style.display = 'block';
+  if (btn) btn.textContent = 'Monitor ▴';
+  detail.innerHTML = '<div class="spinner" style="margin:12px 0"></div>';
+
+  try {
+    const m = await Api.kvStoreKvMeta(ns);
+    graftStorageMeta(m);
+    detail.innerHTML = renderSystemStoreMeta(m);
+  } catch (e) {
+    detail.innerHTML = `<div class="alert alert-error" style="margin-top:8px">${esc(e.message)}</div>`;
+  }
+}
+
+async function toggleDocStoreLsm(ns) {
+  const detail = document.getElementById(`doc-lsm-${ns}`);
+  const btn    = detail?.previousElementSibling?.querySelector('.sys-monitor-btn');
+  if (!detail) return;
+
+  if (detail.style.display !== 'none') {
+    detail.style.display = 'none';
+    if (btn) btn.textContent = 'Monitor ▾';
+    return;
+  }
+
+  detail.style.display = 'block';
+  if (btn) btn.textContent = 'Monitor ▴';
+  detail.innerHTML = '<div class="spinner" style="margin:12px 0"></div>';
+
+  try {
+    const m = await Api.storeKvMeta(ns);
+    graftStorageMeta(m);
+    detail.innerHTML = renderDocStoreKvMeta(m);
+  } catch (e) {
+    detail.innerHTML = `<div class="alert alert-error" style="margin-top:8px">${esc(e.message)}</div>`;
+  }
+}
+
+async function toggleSystemStoreMeta(ns) {
+  const detail = document.getElementById(`sys-detail-${ns}`);
+  const btn    = detail?.previousElementSibling?.querySelector('.sys-monitor-btn');
+  if (!detail) return;
+
+  if (detail.style.display !== 'none') {
+    detail.style.display = 'none';
+    if (btn) btn.textContent = 'Monitor ▾';
+    return;
+  }
+
+  detail.style.display = 'block';
+  if (btn) btn.textContent = 'Monitor ▴';
+  detail.innerHTML = '<div class="spinner" style="margin:12px 0"></div>';
+
+  try {
+    const m = await Api.systemStoreMeta(ns);
+    graftStorageMeta(m);
+    detail.innerHTML = renderSystemStoreMeta(m);
+  } catch (e) {
+    if (e.message.includes('404') || e.message.toLowerCase().includes('not been opened')) {
+      detail.innerHTML = `
+        <div class="alert alert-info" style="margin-top:8px">
+          This store has not been opened yet — it is created on first use
+          (e.g. after the first semantic-search query).
+        </div>`;
+    } else {
+      detail.innerHTML = `<div class="alert alert-error" style="margin-top:8px">${esc(e.message)}</div>`;
+    }
+  }
+}
+
+// The per-store kv-meta endpoints omit data that only the engine-wide listings
+// carry: the live in-memory LSM block (/admin/storage/lsm) and value-log physical
+// st_blocks bytes (/admin/storage/value-log). Graft those onto a kv-meta payload
+// from the snapshots cached in state during loadStorageStats so the Monitor card
+// shows the full picture. No-op when a snapshot is missing.
+function graftVlogPhysical(vlog) {
+  if (!vlog) return;
+  const src = state.adminVlog?.[vlog.namespace];
+  if (!src) return;
+  if (src.total_physical_bytes != null) vlog.total_physical_bytes = src.total_physical_bytes;
+  const byBucket = Object.fromEntries((src.shards ?? []).map(s => [s.bucket, s]));
+  for (const sh of vlog.shards ?? []) {
+    const ss = byBucket[sh.bucket];
+    if (ss) { sh.physical_bytes = ss.physical_bytes; sh.logical_bytes = ss.logical_bytes; }
+  }
+}
+
+function graftLsmInMemory(lsm) {
+  if (lsm) lsm.in_memory = state.adminLsm?.[lsm.namespace]?.in_memory ?? null;
+}
+
+function graftStorageMeta(m) {
+  if (!m) return;
+  graftLsmInMemory(m.lsm);
+  graftVlogPhysical(m.value_log);
+  for (const a of m.associated_stores ?? []) {
+    graftLsmInMemory(a.lsm);
+    graftVlogPhysical(a.value_log);
+  }
+}
+
+// Inline LSM in-memory badge for compact store-row headers (active compaction).
+function lsmCompactionBadge(lsm) {
+  return lsm?.in_memory?.compaction_in_progress
+    ? '<span class="badge badge-indexed">⚙ compacting</span>' : '';
+}
+
+function renderLsmCard(lsm) {
+  if (!lsm) return `
+    <div class="admin-card" style="flex:1">
+      <div class="admin-card-title">LSM</div>
+      <div class="text-muted">No SST files written yet</div>
+    </div>`;
+
+  const im = lsm.in_memory;
+  const inMemoryHtml = im ? `
+    <div class="admin-card-title" style="margin-top:10px;margin-bottom:4px">
+      IN-MEMORY ${im.compaction_in_progress ? '<span class="badge badge-indexed">⚙ compacting</span>' : ''}
+    </div>
+    <div class="stat-row"><span class="stat-key">Memtable Entries</span>
+      <span class="stat-val">${fmt(im.memtable_entries)}</span></div>
+    <div class="stat-row"><span class="stat-key">Sealed Entries</span>
+      <span class="stat-val">${fmt(im.read_only_entries)}</span></div>
+    <div class="stat-row"><span class="stat-key">Sealed Memtables</span>
+      <span class="stat-val ${im.read_only_count > 0 ? 'warn' : ''}">${fmt(im.read_only_count)}</span></div>
+  ` : '';
+
+  return `
+    <div class="admin-card" style="flex:1">
+      <div class="admin-card-title">LSM</div>
+      <div class="stat-row"><span class="stat-key">Total Entries</span>
+        <span class="stat-val">${fmt(lsm.total_entries)}</span></div>
+      <div class="stat-row"><span class="stat-key">On-disk Size</span>
+        <span class="stat-val">${fmtBytes(lsm.total_size_bytes)}</span></div>
+      <div class="stat-row"><span class="stat-key">Levels</span>
+        <span class="stat-val">${lsm.level_count}</span></div>
+      <div class="stat-row"><span class="stat-key">Manifest Version</span>
+        <span class="stat-val">${lsm.manifest_version}</span></div>
+      <div class="stat-row"><span class="stat-key">Created</span>
+        <span class="stat-val" style="font-size:11px">${new Date(lsm.created_at_ms).toLocaleString()}</span></div>
+      ${inMemoryHtml}
+      ${lsm.levels.map(lvl => `
+        <div style="margin-top:8px">
+          <div class="admin-card-title" style="margin-bottom:4px">LEVEL ${lvl.level}</div>
+          <div class="stat-row"><span class="stat-key">Buckets</span>
+            <span class="stat-val">${lvl.bucket_count}</span></div>
+          <div class="stat-row"><span class="stat-key">Entries</span>
+            <span class="stat-val">${fmt(lvl.total_entries)}</span></div>
+        </div>
+      `).join('')}
+    </div>`;
+}
+
+function renderVlogCard(vlog) {
+  if (!vlog) return `
+    <div class="admin-card" style="flex:1">
+      <div class="admin-card-title">VALUE LOG</div>
+      <div class="text-muted">No data written yet</div>
+    </div>`;
+
+  const wc = vlog.waste_ratio_pct > 40 ? 'bad' : vlog.waste_ratio_pct > 20 ? 'warn' : 'good';
+  return `
+    <div class="admin-card" style="flex:1">
+      <div class="admin-card-title">VALUE LOG</div>
+      <div class="stat-row"><span class="stat-key">Live Data</span>
+        <span class="stat-val">${fmtBytes(vlog.total_live_bytes)}</span></div>
+      <div class="stat-row"><span class="stat-key">Garbage</span>
+        <span class="stat-val ${wc}">${fmtBytes(vlog.total_garbage_bytes)}</span></div>
+      <div class="stat-row"><span class="stat-key">Waste Ratio</span>
+        <span class="stat-val ${wc}">${vlog.waste_ratio_pct.toFixed(1)}%</span></div>
+      ${vlog.total_physical_bytes != null ? `
+      <div class="stat-row"><span class="stat-key" title="Blocks actually allocated on disk (st_blocks); sparse GC holes excluded">On-disk (physical)</span>
+        <span class="stat-val">${fmtBytes(vlog.total_physical_bytes)}</span></div>` : ''}
+      <div style="margin:8px 0 4px">
+        <div class="progress-wrap">
+          <div class="progress-bar" style="width:${Math.min(vlog.waste_ratio_pct,100)}%;
+               background:${vlog.waste_ratio_pct>40?'var(--error)':vlog.waste_ratio_pct>20?'var(--warning)':'var(--success)'}">
+          </div>
+        </div>
+      </div>
+      ${vlog.shards.length > 1 ? `
+        <div class="admin-card-title" style="margin-top:10px;margin-bottom:4px">SHARDS (${vlog.shards.length})</div>
+        ${vlog.shards.map(sh => {
+          const sc = sh.waste_ratio_pct > 40 ? 'bad' : sh.waste_ratio_pct > 20 ? 'warn' : 'good';
+          const phys = sh.physical_bytes != null
+            ? `<span class="stat-val text-muted" style="margin-left:8px;font-size:11px"
+                     title="Physical st_blocks${sh.logical_bytes != null ? ` of ${fmtBytes(sh.logical_bytes)} logical` : ''}">${fmtBytes(sh.physical_bytes)} on disk</span>`
+            : '';
+          return `
+          <div class="stat-row">
+            <span class="stat-key">Shard ${sh.bucket}</span>
+            <span class="stat-val">${fmtBytes(sh.live_bytes)} live</span>
+            <span class="stat-val ${sc}" style="margin-left:8px">${sh.waste_ratio_pct.toFixed(1)}% waste</span>
+            ${phys}
+          </div>`;
+        }).join('')}
+      ` : ''}
+      ${vlog.namespace ? `
+        <div style="margin-top:8px">
+          <button class="btn btn-sm btn-ghost" id="vlog-pages-btn-${esc(vlog.namespace)}"
+                  onclick="toggleVlogPages('${esc(vlog.namespace)}')"
+                  title="Per-page garbage breakdown (scans every page; on-demand)">Pages ▾</button>
+          <div id="vlog-pages-${esc(vlog.namespace)}" style="display:none;margin-top:6px"></div>
+        </div>` : ''}
+    </div>`;
+}
+
+// On-demand deep dive: GET /admin/storage/value-log/{ns}/pages. Expensive
+// (O(pages × records)), so only fetched when the user expands it. Lists the
+// highest-garbage pages per shard to show where reclaimable waste sits.
+async function toggleVlogPages(ns) {
+  const box = document.getElementById(`vlog-pages-${ns}`);
+  const btn = document.getElementById(`vlog-pages-btn-${ns}`);
+  if (!box) return;
+  if (box.style.display !== 'none') {
+    box.style.display = 'none';
+    if (btn) btn.textContent = 'Pages ▾';
+    return;
+  }
+  box.style.display = 'block';
+  if (btn) btn.textContent = 'Pages ▴';
+  box.innerHTML = '<div class="spinner" style="margin:8px 0"></div>';
+  try {
+    const data = await Api.valueLogPages(ns);
+    box.innerHTML = renderVlogPagesHtml(data);
+  } catch (e) {
+    box.innerHTML = `<div class="alert alert-error" style="margin-top:6px">${esc(e.message)}</div>`;
+  }
+}
+
+function renderVlogPagesHtml(data) {
+  const shards = data?.shards ?? [];
+  if (!shards.length) return '<div class="text-muted" style="padding:6px 0">No pages</div>';
+  const TOP = 8;
+  return shards.map(sh => {
+    const pages = [...(sh.pages ?? [])].sort((a, b) => b.garbage_bytes - a.garbage_bytes);
+    const shown = pages.slice(0, TOP);
+    const rows = shown.map(p => {
+      const gc = p.garbage_ratio_pct > 40 ? 'bad' : p.garbage_ratio_pct > 20 ? 'warn' : 'good';
+      return `
+        <div class="stat-row">
+          <span class="stat-key" style="font-family:monospace;font-size:11px">@${fmt(p.page_offset)}</span>
+          <span class="stat-val">${fmtBytes(p.garbage_bytes)} garbage</span>
+          <span class="stat-val ${gc}" style="margin-left:8px">${p.garbage_ratio_pct.toFixed(1)}%</span>
+          <span class="stat-val text-muted" style="margin-left:8px;font-size:11px">${fmt(p.garbage_records)}/${fmt(p.total_records)} recs</span>
+        </div>`;
+    }).join('');
+    const more = pages.length > TOP
+      ? `<div class="text-muted" style="font-size:11px;padding-top:2px">+${pages.length - TOP} more page(s)</div>`
+      : '';
+    return `
+      <div style="margin-top:4px">
+        <div class="admin-card-title" style="margin-bottom:4px">SHARD ${sh.bucket} — ${sh.page_count} page(s)</div>
+        ${rows || '<div class="text-muted" style="font-size:11px">No garbage pages</div>'}
+        ${more}
+      </div>`;
+  }).join('');
+}
+
+function renderTtlCard(m) {
+  return `
+    <div class="admin-card" style="flex:1">
+      <div class="admin-card-title">TTL CONFIGURATION</div>
+      <div class="stat-row"><span class="stat-key">TTL Period</span>
+        <span class="stat-val">${fmtDuration(m.ttl_secs)}</span></div>
+      ${m.ttl_max_deletes_per_run != null
+        ? `<div class="stat-row"><span class="stat-key">Max Deletes / Run</span>
+           <span class="stat-val">${fmt(m.ttl_max_deletes_per_run)}</span></div>`
+        : ''}
+    </div>`;
+}
+
+function renderSystemStoreMeta(m) {
+  return `
+    <div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:10px;padding-top:10px;
+                border-top:1px solid var(--border)">
+      ${m.ttl_enabled ? renderTtlCard(m) : ''}
+      ${renderLsmCard(m.lsm)}
+      ${renderVlogCard(m.value_log)}
+    </div>`;
+}
+
+function renderDocStoreKvMeta(m) {
+  const companionHtml = (m.associated_stores ?? []).length === 0 ? '' : `
+    <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border)">
+      <div class="admin-card-title" style="margin-bottom:10px">
+        COMPANION STORES (${m.associated_stores.length})
+      </div>
+      ${m.associated_stores.map(s => `
+        <div style="margin-bottom:14px">
+          <div style="display:flex;align-items:baseline;gap:8px;margin-bottom:6px">
+            <span class="sys-store-name">${esc(s.name)}</span>
+            <span class="text-muted" style="font-size:11px">${esc(s.purpose)}</span>
+          </div>
+          <div style="display:flex;gap:12px;flex-wrap:wrap">
+            ${renderLsmCard(s.lsm)}
+            ${renderVlogCard(s.value_log)}
+          </div>
+        </div>
+      `).join('')}
+    </div>`;
+
+  return `
+    <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
+      <div style="display:flex;gap:12px;flex-wrap:wrap">
+        ${renderLsmCard(m.lsm)}
+        ${renderVlogCard(m.value_log)}
+      </div>
+      ${companionHtml}
+    </div>`;
+}
+
+function fmtDuration(secs) {
+  if (!secs) return '';
+  if (secs < 3600) return `${secs}s`;
+  if (secs < 86400) return `${(secs / 3600).toFixed(0)}h`;
+  return `${(secs / 86400).toFixed(0)}d`;
+}
+
+async function adminRefresh() {
+  await loadStorageStats();
+  toast('Stats refreshed');
+}
+
+async function adminTriggerGc() {
+  const el = document.getElementById('admin-action-result');
+  if (!el) return;
+  el.innerHTML = '<div class="spinner"></div>';
+  try {
+    const r = await Api.triggerGc();
+    el.innerHTML = `<div class="alert alert-success">
+      GC complete — ${r.namespaces_collected} namespace(s) collected.
+      ${r.results.map(x => `<br>${esc(x.namespace)}: ${fmtBytes(x.bytes_reclaimed)} reclaimed`
+        + `${x.gc_duration_ms != null ? ` in ${fmtMillis(x.gc_duration_ms)}` : ''}`
+        + `${x.bytes_live != null ? ` · ${fmtBytes(x.bytes_live)} live` : ''}`).join('')}
+    </div>`;
+    toast('GC complete');
+    loadStorageStats();
+  } catch (e) {
+    el.innerHTML = `<div class="alert alert-error">${esc(e.message)}</div>`;
+  }
+}
+
+async function adminTriggerWalGc() {
+  const el = document.getElementById('admin-action-result');
+  if (!el) return;
+  el.innerHTML = '<div class="spinner"></div>';
+  try {
+    const r = await Api.triggerWalGc();
+    el.innerHTML = `<div class="alert alert-success">
+      WAL GC complete — total: ${fmt(r.total_entries)}, persisted: ${fmt(r.persisted_entries)}
+    </div>`;
+    toast('WAL GC complete');
+    loadStorageStats();
+  } catch (e) {
+    el.innerHTML = `<div class="alert alert-error">${esc(e.message)}</div>`;
+  }
+}
+
+async function adminCompact() {
+  const el = document.getElementById('admin-action-result');
+  if (!el) return;
+  el.innerHTML = '<div class="spinner"></div>';
+  try {
+    await Api.compact();
+    el.innerHTML = '<div class="alert alert-success">LSM compaction complete</div>';
+    toast('Compaction complete');
+  } catch (e) {
+    el.innerHTML = `<div class="alert alert-error">${esc(e.message)}</div>`;
+  }
+}
+
+async function adminIndexCheckpoint() {
+  const el = document.getElementById('admin-action-result');
+  if (!el) return;
+  el.innerHTML = '<div class="spinner"></div>';
+  try {
+    const r = await Api.indexCheckpoint();
+    el.innerHTML = `<div class="alert alert-success">
+      Index checkpoint complete — ${fmt(r.fields_checkpointed)} field index(es) checkpointed.
+    </div>`;
+    toast('Index checkpoint complete');
+    loadStorageStats();
+  } catch (e) {
+    el.innerHTML = `<div class="alert alert-error">${esc(e.message)}</div>`;
+  }
+}
+
+async function adminClearQueryCache() {
+  const el = document.getElementById('admin-action-result');
+  if (!el) return;
+  el.innerHTML = '<div class="spinner"></div>';
+  try {
+    const result = await Api.clearQueryEmbeddingCache();
+    const cleared = result?.cleared ?? 0;
+    el.innerHTML = `<div class="alert alert-success">Query embedding cache cleared — ${fmt(cleared)} entr${cleared === 1 ? 'y' : 'ies'} removed</div>`;
+    toast(`Query cache cleared (${fmt(cleared)} entries)`);
+  } catch (e) {
+    el.innerHTML = `<div class="alert alert-error">${esc(e.message)}</div>`;
+    toast(`Clear cache failed: ${e.message}`, 'error');
+  }
+}
+
+async function adminExportSchema(ns) {
+  try {
+    const blob = await Api.exportSchema(ns);
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `${ns}-schema.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(a.href);
+    toast(`Schema for '${ns}' downloaded`);
+  } catch (e) {
+    toast(`Export failed: ${e.message}`, 'error');
+  }
+}
+
+function adminImportSchema() {
+  const input = document.getElementById('admin-import-file');
+  if (input) { input.value = ''; input.click(); }
+}
+
+async function adminImportSchemaFile(input) {
+  const file = input.files[0];
+  if (!file) return;
+  const el = document.getElementById('admin-action-result');
+  if (el) el.innerHTML = '<div class="spinner"></div>';
+  try {
+    const text = await file.text();
+    let schema;
+    try { schema = JSON.parse(text); } catch { throw new Error('Invalid JSON file'); }
+    const isKv = schema.value_type != null;
+    if (isKv) {
+      await Api.importKvStoreSchema(schema);
+    } else {
+      await Api.importStoreSchema(schema);
+    }
+    const storeKind = isKv ? 'KV store' : 'store';
+    if (el) el.innerHTML = `<div class="alert alert-success">Schema imported — ${storeKind} '${esc(schema.namespace ?? file.name)}' created</div>`;
+    toast(`Schema imported from ${file.name}`);
+    await loadStores();
+  } catch (e) {
+    if (el) el.innerHTML = `<div class="alert alert-error">${esc(e.message)}</div>`;
+    toast(`Import failed: ${e.message}`, 'error');
+  }
+}
+
+async function adminExportKvSchema(ns) {
+  try {
+    const blob = await Api.exportKvSchema(ns);
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `${ns}-kv-schema.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(a.href);
+    toast(`KV schema for '${ns}' downloaded`);
+  } catch (e) {
+    toast(`Export failed: ${e.message}`, 'error');
+  }
+}
+
+// ── Admin index panel ─────────────────────────────────────────────────────────
+
+const vqState = {
+  retriedPage:     1,
+  retriedPageSize: 20,
+  nsPage:          1,
+  nsPageSize:      20,
+  selectedNs:      '',
+  nsMode:          'all',  // 'all' | 'retried'
+  maxRetries:      0,
+};
+
+async function loadAdminIndexPanel() {
+  const panel = document.getElementById('admin-index-panel');
+  if (!panel) return;
+  panel.innerHTML = `
+    <div class="admin-actions">
+      <button class="btn btn-secondary" onclick="adminIndexRefresh()">↻ Refresh</button>
+      <button class="btn btn-ghost" onclick="adminVectorReconcile(this)"
+              title="Scan all vector-indexed namespaces and re-enqueue any documents missing a vector entry">⚡ Reconcile Vector Index</button>
+    </div>
+    <div id="admin-index-action-result"></div>
+    <div id="admin-index-stats"><div class="spinner"></div></div>
+    <div id="admin-index-queue-browser" style="margin-top:4px">
+      ${renderVqBrowserHtml()}
+    </div>
+  `;
+  await adminIndexRefresh();
+}
+
+async function adminIndexRefresh() {
+  const area = document.getElementById('admin-index-stats');
+  if (!area) return;
+  area.innerHTML = '<div class="spinner"></div>';
+  try {
+    const [progress, summary, corruption] = await Promise.all([
+      Api.indicesProgress(),
+      Api.vectorQueueSummary(),
+      Api.vectorCorruptionMetrics().catch(() => null),
+    ]);
+    vqState.maxRetries = summary?.max_retries_configured ?? 0;
+    area.innerHTML = renderIndexStatsHtml(progress, summary, corruption);
+    refreshVqNsSelect(summary?.by_namespace ?? []);
+  } catch (e) {
+    area.innerHTML = `<div class="alert alert-error">Failed to load index data: ${esc(e.message)}</div>`;
+  }
+}
+
+function renderIndexStatsHtml(progress, summary, corruption) {
+  return `
+    ${renderAttributeBuildsSection(progress?.attribute_builds ?? [])}
+    ${renderVectorProgressSection(progress?.vector_progress ?? [])}
+    ${renderVectorQueueSummarySection(summary)}
+    ${renderVectorCorruptionSection(corruption)}
+    ${renderNamespaceControlsSection(summary?.by_namespace ?? [])}
+  `;
+}
+
+function renderAttributeBuildsSection(builds) {
+  const rows = builds.map(b => {
+    const field  = b.id?.field ?? '?';
+    const ns     = b.id?.namespace ?? '?';
+    const status = (b.status ?? 'Unknown').toLowerCase();
+    const pct    = b.total > 0 ? (b.indexed / b.total * 100) : 0;
+    const statusHtml = status === 'running'
+      ? `<div style="display:flex;align-items:center;gap:8px">
+           <div class="progress-wrap" style="width:100px;display:inline-block">
+             <div class="progress-bar" style="width:${pct.toFixed(1)}%"></div>
+           </div>
+           <span style="font-size:11px;color:var(--text-2)">${pct.toFixed(1)}%</span>
+         </div>`
+      : status === 'complete'
+        ? '<span class="badge badge-indexed">✓ Complete</span>'
+        : `<span class="badge badge-error">${esc(b.status ?? 'Unknown')}</span>`;
+
+    return `
+      <tr>
+        <td class="text-mono">${esc(ns)}</td>
+        <td class="text-mono">${esc(field)}</td>
+        <td>${statusHtml}</td>
+        <td style="text-align:right">${fmt(b.indexed)} / ${fmt(b.total)}</td>
+        <td style="text-align:right">${b.failed > 0 ? `<span class="stat-val bad">${fmt(b.failed)}</span>` : '<span class="text-muted">0</span>'}</td>
+        <td class="text-muted" style="font-size:11px;max-width:180px;overflow:hidden;text-overflow:ellipsis">${b.last_error ? esc(b.last_error) : '—'}</td>
+      </tr>`;
+  }).join('');
+
+  return `
+    <div class="section">
+      <div class="section-header">
+        <span class="section-title">ACTIVE INDEX BUILDS (${builds.length})</span>
+      </div>
+      ${builds.length === 0
+        ? '<div class="text-muted" style="padding:8px 0">No active index builds</div>'
+        : `<div class="tbl-wrap"><table class="tbl">
+            <thead><tr>
+              <th>Namespace</th><th>Field</th><th>Progress</th>
+              <th style="text-align:right">Indexed / Total</th>
+              <th style="text-align:right">Failed</th><th>Last Error</th>
+            </tr></thead>
+            <tbody>${rows}</tbody>
+          </table></div>`}
+    </div>
+  `;
+}
+
+function renderVectorProgressSection(vectorProgress) {
+  if (vectorProgress.length === 0) return '';
+
+  const rows = vectorProgress.map(p => {
+    const pct   = Math.min(p.progress_pct ?? 0, 100);
+    const color = pct >= 90 ? 'var(--success)' : pct >= 50 ? 'var(--warning)' : 'var(--error)';
+    const exhaustedNote = p.exhausted > 0
+      ? ` / <span style="color:var(--error)">${fmt(p.exhausted)} exhausted</span>`
+      : '';
+    return `
+      <div class="vq-progress-row">
+        <div class="vq-progress-ns">
+          <span>${esc(p.namespace)}</span>
+          <span style="color:var(--text-2)">
+            ${pct.toFixed(1)}% &mdash; ${fmt(p.indexed_approx)} indexed / ${fmt(p.pending)} pending${exhaustedNote}
+          </span>
+        </div>
+        <div class="progress-wrap">
+          <div class="progress-bar" style="width:${pct}%;background:${color}"></div>
+        </div>
+      </div>`;
+  }).join('');
+
+  return `
+    <div class="section">
+      <div class="section-header">
+        <span class="section-title">VECTOR INDEXING PROGRESS</span>
+      </div>
+      <div style="padding:4px 0">${rows}</div>
+    </div>
+  `;
+}
+
+function renderVectorQueueSummarySection(summary) {
+  const totalPending    = summary?.total_pending    ?? 0;
+  const totalActionable = summary?.total_actionable ?? 0;
+  const totalRetrying   = summary?.total_retrying   ?? 0;
+  const totalExhausted  = summary?.total_exhausted  ?? 0;
+  const maxRetries      = summary?.max_retries_configured ?? '—';
+
+  const exhaustedClass = totalExhausted > 0 ? 'bad'  : 'good';
+  const pendingClass   = totalPending   > 0 ? 'warn' : 'good';
+  const retryingClass  = totalRetrying  > 0 ? 'warn' : '';
+
+  return `
+    <div class="section">
+      <div class="section-header">
+        <span class="section-title">VECTOR QUEUE TOTALS</span>
+      </div>
+      <div class="admin-grid" style="max-width:480px">
+        <div class="admin-card">
+          <div class="stat-row"><span class="stat-key">Max Retries</span>
+            <span class="stat-val">${maxRetries}</span></div>
+          <div class="stat-row"><span class="stat-key">Total Pending</span>
+            <span class="stat-val ${pendingClass}">${fmt(totalPending)}</span></div>
+          <div class="stat-row"><span class="stat-key">Actionable</span>
+            <span class="stat-val">${fmt(totalActionable)}</span></div>
+          <div class="stat-row"><span class="stat-key">Retrying</span>
+            <span class="stat-val ${retryingClass}">${fmt(totalRetrying)}</span></div>
+          <div class="stat-row"><span class="stat-key">Exhausted</span>
+            <span class="stat-val ${exhaustedClass}">${fmt(totalExhausted)}</span></div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+// ── Vector index corruption metrics ──────────────────────────────────────────
+// Process-wide, monotonic since startup. A non-zero/rising value means stored
+// vectors are corrupt and are being skipped at query time — reindex to repair.
+function renderVectorCorruptionSection(metrics) {
+  if (!metrics) return '';
+  const total  = metrics.total_corrupt_skipped  ?? 0;
+  const sparse = metrics.sparse_corrupt_skipped ?? 0;
+  const dense  = metrics.dense_corrupt_skipped  ?? 0;
+  const totalClass = total > 0 ? 'bad' : 'good';
+
+  return `
+    <div class="section">
+      <div class="section-header">
+        <span class="section-title">VECTOR INDEX CORRUPTION</span>
+        <span class="text-muted" style="font-size:12px">
+          entries skipped on read since startup${total > 0
+            ? ' · <span class="stat-val bad">corrupt vectors present</span> — reindex affected namespaces'
+            : ' · no corruption detected'}
+        </span>
+      </div>
+      <div class="admin-grid" style="max-width:480px">
+        <div class="admin-card">
+          <div class="stat-row"><span class="stat-key">Total Skipped</span>
+            <span class="stat-val ${totalClass}">${fmt(total)}</span></div>
+          <div class="stat-row"><span class="stat-key">Sparse (Pass-1)</span>
+            <span class="stat-val ${sparse > 0 ? 'warn' : ''}">${fmt(sparse)}</span></div>
+          <div class="stat-row"><span class="stat-key">Dense (Pass-2)</span>
+            <span class="stat-val ${dense > 0 ? 'warn' : ''}">${fmt(dense)}</span></div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderNamespaceControlsSection(byNs) {
+  const byNsMap = Object.fromEntries(byNs.map(x => [x.namespace, x]));
+
+  const relevantStores = [
+    ...state.stores.map(s => ({ ...s, storeType: 'doc' })),
+    ...state.kvStores.map(s => ({ ...s, storeType: 'kv' })),
+  ].filter(s => {
+    const hasIndices = s.storeType === 'doc' && (s.indices?.length ?? 0) > 0;
+    return hasIndices || s.semantic_search_enabled;
+  });
+
+  if (relevantStores.length === 0) return `
+    <div class="section">
+      <div class="section-header"><span class="section-title">NAMESPACE OPERATIONS</span></div>
+      <div class="text-muted" style="padding:8px 0">No stores with field indices or semantic search</div>
+    </div>
+  `;
+
+  // Emit one row per index type so buttons align with the index they operate on.
+  const rows = relevantStores.flatMap(s => {
+    const ns         = s.namespace;
+    const qStats     = byNsMap[ns];
+    const hasIndices = s.storeType === 'doc' && (s.indices?.length ?? 0) > 0;
+    const hasVector  = !!s.semantic_search_enabled;
+    const pending    = qStats?.pending   ?? 0;
+    const exhausted  = qStats?.exhausted ?? 0;
+    const result     = [];
+
+    if (hasIndices) {
+      const indicesHtml = s.indices.map(ix =>
+        `<span class="badge badge-attr" style="margin-right:2px">${esc(ix.field)} <span style="opacity:.6">${esc(ix.index_type)}</span></span>`
+      ).join('');
+      result.push(`
+        <tr>
+          <td class="text-mono">${esc(ns)}</td>
+          <td><span class="badge badge-indexed">Attribute</span></td>
+          <td>${indicesHtml}</td>
+          <td class="gap-8" style="white-space:nowrap">
+            <button class="btn btn-xs btn-ghost" onclick="toggleFieldBlobStats('${esc(ns)}',this)"
+                    title="On-disk blob growth/waste per field (complements fleet-wide Field Index Waste)">Blob Stats ▾</button>
+            <button class="btn btn-xs btn-ghost" onclick="showReindexDocFieldModal('${esc(ns)}')"
+                    title="Reindex one field of a single document (synchronous)">Reindex Doc…</button>
+            <button class="btn btn-xs btn-ghost" onclick="adminAttrReindexAll('${esc(ns)}',this)"
+                    title="Drop and rebuild all field indices (async 202)">Reindex All</button>
+            <button class="btn btn-xs btn-danger" onclick="adminAttrDropAll('${esc(ns)}',this)"
+                    title="Drop all field indices without rebuilding (async 202)">Drop All</button>
+          </td>
+        </tr>
+        <tr id="blob-row-${esc(ns)}" style="display:none">
+          <td colspan="4" id="blob-cell-${esc(ns)}" style="padding:0"></td>
+        </tr>`);
+    }
+
+    if (hasVector) {
+      const queueDepthHtml = pending === 0 && exhausted === 0
+        ? '<span class="text-muted">idle</span>'
+        : [
+            pending   > 0 ? `<span class="stat-val warn" style="font-size:11px">${fmt(pending)} pending</span>`     : '',
+            exhausted > 0 ? `<span class="stat-val bad"  style="font-size:11px">${fmt(exhausted)} exhausted</span>` : '',
+          ].filter(Boolean).join(' ');
+      result.push(`
+        <tr>
+          <td class="text-mono">${esc(ns)}</td>
+          <td><span class="badge badge-vec_f32">Vector Semantic</span></td>
+          <td>${queueDepthHtml}</td>
+          <td class="gap-8" style="white-space:nowrap">
+            <button class="btn btn-xs btn-ghost" onclick="showReindexDocVectorModal('${esc(ns)}')"
+                    title="Re-enqueue a single document for embedding">Reindex Doc…</button>
+            <button class="btn btn-xs btn-ghost" onclick="adminVectorReindexAll('${esc(ns)}',this)"
+                    title="Re-enqueue all documents for embedding (async 202)">Reindex All</button>
+            ${exhausted > 0 ? `
+              <button class="btn btn-xs btn-accent" onclick="adminVectorReindexFailed('${esc(ns)}',this)"
+                      title="Reset exhausted entries so they can be retried">Retry Failed (${exhausted})</button>
+            ` : ''}
+            <button class="btn btn-xs btn-danger" onclick="adminVectorDropAll('${esc(ns)}',this)"
+                    title="Disable semantic search and clear all vector data (async 202)">Drop All</button>
+          </td>
+        </tr>`);
+    }
+
+    return result;
+  });
+
+  return `
+    <div class="section">
+      <div class="section-header">
+        <span class="section-title">NAMESPACE OPERATIONS (${relevantStores.length})</span>
+      </div>
+      <div class="tbl-wrap">
+        <table class="tbl">
+          <thead><tr>
+            <th>Namespace</th><th>Index Type</th><th>Details</th><th>Operations</th>
+          </tr></thead>
+          <tbody>${rows.join('')}</tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+function renderVqBrowserHtml() {
+  const allNs = [...new Set([
+    ...state.stores.map(s => s.namespace),
+    ...state.kvStores.filter(s => s.semantic_search_enabled).map(s => s.namespace),
+  ])].sort();
+
+  const nsOptions = allNs.map(ns =>
+    `<option value="${esc(ns)}">${esc(ns)}</option>`
+  ).join('');
+
+  return `
+    <div class="section">
+      <div class="section-header">
+        <span class="section-title">QUEUE BROWSER</span>
+      </div>
+      <div class="vq-browser-bar">
+        <button class="btn btn-ghost" onclick="vqLoadRetried(1)">All Retried Entries</button>
+        <span style="color:var(--text-3);font-size:12px">or browse by namespace:</span>
+        <select id="vq-ns-select">
+          <option value="">— select namespace —</option>
+          ${nsOptions}
+        </select>
+        <select id="vq-ns-mode">
+          <option value="all">All entries</option>
+          <option value="retried">Retried only</option>
+        </select>
+        <button class="btn btn-ghost" onclick="vqBrowseNs(1)">Browse</button>
+      </div>
+      <div id="vq-browser-result"></div>
+    </div>
+  `;
+}
+
+function refreshVqNsSelect(byNs = []) {
+  const sel = document.getElementById('vq-ns-select');
+  if (!sel) return;
+  const queueNsSet = new Set(byNs.map(n => n.namespace));
+  const allNs = [...new Set([
+    ...byNs.map(n => n.namespace),
+    ...state.stores.map(s => s.namespace),
+    ...state.kvStores.filter(s => s.semantic_search_enabled).map(s => s.namespace),
+  ])].sort();
+  const prevVal = sel.value;
+  sel.innerHTML = `<option value="">— select namespace —</option>` +
+    allNs.map(ns =>
+      `<option value="${esc(ns)}" ${ns === prevVal ? 'selected' : ''}>
+        ${esc(ns)}${queueNsSet.has(ns) ? '' : ' (no pending)'}
+      </option>`
+    ).join('');
+}
+
+// ── Global vector reconcile ───────────────────────────────────────────────────
+
+async function adminVectorReconcile(btn) {
+  const el = document.getElementById('admin-index-action-result');
+  btn.disabled = true;
+  if (el) el.innerHTML = '<div class="spinner"></div>';
+  try {
+    const result = await Api.vectorReconcile();
+    const n = result?.reenqueued ?? 0;
+    const msg = n === 0
+      ? 'Vector index reconcile complete — all documents are already indexed'
+      : `Vector index reconcile complete — ${fmt(n)} document${n === 1 ? '' : 's'} re-enqueued for embedding`;
+    if (el) el.innerHTML = `<div class="alert alert-success">${msg}</div>`;
+    toast(`Reconcile complete (${fmt(n)} re-enqueued)`);
+    await adminIndexRefresh();
+  } catch (e) {
+    if (el) el.innerHTML = `<div class="alert alert-error">${esc(e.message)}</div>`;
+    toast(`Reconcile failed: ${e.message}`, 'error');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// ── Namespace index operations (async 202) ────────────────────────────────────
+
+async function adminAttrReindexAll(ns, btn) {
+  if (!confirm(`Drop and rebuild all field indices for "${ns}"?\n\nThis runs in the background — monitor progress in Active Index Builds.`)) return;
+  btn.disabled = true;
+  try {
+    await Api.attributeReindexAll(ns);
+    toast(`Attribute reindex started for "${ns}"`);
+    adminIndexRefresh();
+  } catch (e) {
+    toast('Failed: ' + e.message, 'error');
+    btn.disabled = false;
+  }
+}
+
+async function adminAttrDropAll(ns, btn) {
+  if (!confirm(`Drop all field indices for "${ns}"?\n\nThis cannot be undone.`)) return;
+  btn.disabled = true;
+  try {
+    await Api.attributeDropAll(ns);
+    toast(`All field indices dropped for "${ns}"`);
+    await loadStores();
+    adminIndexRefresh();
+  } catch (e) {
+    toast('Failed: ' + e.message, 'error');
+    btn.disabled = false;
+  }
+}
+
+async function adminVectorReindexAll(ns, btn) {
+  if (!confirm(`Re-enqueue all documents in "${ns}" for embedding?\n\nThis runs in the background.`)) return;
+  btn.disabled = true;
+  try {
+    await Api.vectorReindexAll(ns);
+    toast(`Vector reindex started for "${ns}"`);
+    adminIndexRefresh();
+  } catch (e) {
+    toast('Failed: ' + e.message, 'error');
+    btn.disabled = false;
+  }
+}
+
+async function adminVectorReindexFailed(ns, btn) {
+  if (!confirm(`Reset retry counter for exhausted queue entries in "${ns}"?`)) return;
+  btn.disabled = true;
+  try {
+    const r = await Api.vectorReindexFailed(ns);
+    toast(`${r?.retried ?? 0} entries reset in "${ns}"`);
+    adminIndexRefresh();
+  } catch (e) {
+    toast('Failed: ' + e.message, 'error');
+    btn.disabled = false;
+  }
+}
+
+async function adminVectorDropAll(ns, btn) {
+  if (!confirm(`Disable semantic search and drop all vector index data for "${ns}"?\n\nThis cannot be undone.`)) return;
+  btn.disabled = true;
+  try {
+    await Api.vectorDropAll(ns);
+    toast(`Vector index dropped for "${ns}"`);
+    await loadStores();
+    adminIndexRefresh();
+  } catch (e) {
+    toast('Failed: ' + e.message, 'error');
+    btn.disabled = false;
+  }
+}
+
+// ── Single-document reindex (synchronous) ─────────────────────────────────────
+
+function showReindexDocFieldModal(ns) {
+  const store   = state.stores.find(s => s.namespace === ns);
+  const indices = store?.indices ?? [];
+  if (!indices.length) { toast(`"${ns}" has no indexed fields`, 'error'); return; }
+  const fieldOpts = indices.map(ix =>
+    `<option value="${esc(ix.field)}">${esc(ix.field)} (${esc(ix.index_type)})</option>`
+  ).join('');
+  openModal(`
+    <div class="modal-title">Reindex Field — ${esc(ns)}</div>
+    <div class="modal-section">
+      <p class="text-muted" style="margin-bottom:12px">
+        Re-derive one field's value for a single document from its current stored
+        bytes and rewrite just that index entry. The document is not rewritten and
+        no other field or vector index is touched.
+      </p>
+      <div class="form-group" style="margin-bottom:14px">
+        <label>FIELD</label>
+        <select id="rd-field" style="max-width:280px">${fieldOpts}</select>
+      </div>
+      <div class="form-group">
+        <label>DOCUMENT ID</label>
+        <input type="text" id="rd-doc" placeholder="document id" style="max-width:280px" />
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-accent" onclick="submitReindexDocField('${esc(ns)}')">Reindex Field</button>
+    </div>
+  `);
+  setTimeout(() => document.getElementById('rd-doc')?.focus(), 50);
+}
+
+async function submitReindexDocField(ns) {
+  const field = document.getElementById('rd-field')?.value;
+  const docId = document.getElementById('rd-doc')?.value.trim();
+  if (!field) { toast('No indexed field selected', 'error'); return; }
+  if (!docId) { toast('Document id is required', 'error'); return; }
+  try {
+    await Api.attributeReindexDoc(ns, field, docId);
+    closeModal();
+    toast(`Field '${field}' reindexed for doc ${docId}`);
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+function showReindexDocVectorModal(ns) {
+  openModal(`
+    <div class="modal-title">Reindex Vector — ${esc(ns)}</div>
+    <div class="modal-section">
+      <p class="text-muted" style="margin-bottom:12px">
+        Re-enqueue a single document for embedding. The worker picks it up on its
+        next pass — monitor progress in Vector Queue Totals / Queue Browser.
+      </p>
+      <div class="form-group">
+        <label>DOCUMENT ID</label>
+        <input type="text" id="rvd-doc" placeholder="document id" style="max-width:280px" />
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-accent" onclick="submitReindexDocVector('${esc(ns)}')">Re-enqueue</button>
+    </div>
+  `);
+  setTimeout(() => document.getElementById('rvd-doc')?.focus(), 50);
+}
+
+async function submitReindexDocVector(ns) {
+  const docId = document.getElementById('rvd-doc')?.value.trim();
+  if (!docId) { toast('Document id is required', 'error'); return; }
+  try {
+    const r = await Api.vectorReindexDoc(ns, docId);
+    closeModal();
+    if (r?.status === 'skipped_empty_text') {
+      toast(`Doc ${docId} skipped — no embeddable text`);
+    } else {
+      toast(`Doc ${docId} re-enqueued for embedding`);
+    }
+    adminIndexRefresh();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+// ── Per-field blob stats (drill-down of fleet-wide Field Index Waste) ─────────
+
+async function toggleFieldBlobStats(ns, btn) {
+  const row  = document.getElementById(`blob-row-${ns}`);
+  const cell = document.getElementById(`blob-cell-${ns}`);
+  if (!row || !cell) return;
+
+  if (row.style.display !== 'none') {
+    row.style.display = 'none';
+    btn.textContent = 'Blob Stats ▾';
+    return;
+  }
+  row.style.display = '';
+  btn.textContent = 'Blob Stats ▴';
+  cell.innerHTML = '<div class="spinner" style="margin:12px"></div>';
+
+  const store  = state.stores.find(s => s.namespace === ns);
+  const fields = (store?.indices ?? []).map(ix => ix.field);
+  if (!fields.length) {
+    cell.innerHTML = '<div class="text-muted" style="padding:8px 12px">No indexed fields</div>';
+    return;
+  }
+  try {
+    const results = await Promise.all(fields.map(f =>
+      Api.fieldBlobStats(ns, f)
+        .then(data => ({ field: f, data }))
+        .catch(e => ({ field: f, error: e.message }))
+    ));
+    cell.innerHTML = renderBlobStatsDetail(results);
+  } catch (e) {
+    cell.innerHTML = `<div class="alert alert-error" style="margin:8px">${esc(e.message)}</div>`;
+  }
+}
+
+function renderBlobStatsDetail(results) {
+  const wasteCell = (ratio, threshold) => {
+    if (ratio == null) return '<span class="text-muted">—</span>';
+    const pct = ratio * 100;
+    const cls = ratio >= threshold ? 'bad' : pct >= threshold * 50 ? 'warn' : 'good';
+    return `<span class="stat-val ${cls}">${pct.toFixed(1)}%</span>`;
+  };
+
+  const rows = results.map(r => {
+    if (r.error) {
+      return `<tr>
+        <td class="text-mono">${esc(r.field)}</td>
+        <td colspan="3" class="text-muted" style="font-size:11px">${esc(r.error)}</td>
+      </tr>`;
+    }
+    const d  = r.data;
+    const th = d.waste_threshold ?? 0;
+    return `<tr>
+      <td class="text-mono">${esc(r.field)}
+        ${d.over_threshold ? '<span class="badge badge-error">over threshold</span>' : ''}</td>
+      <td style="text-align:right">${fmt(d.distinct_values)}</td>
+      <td style="text-align:right">
+        ${fmtBytes(d.bitmap_live_bytes)} / ${fmtBytes(d.bitmap_logical_bytes)}
+        &nbsp;${wasteCell(d.bitmap_waste_ratio, th)}</td>
+      <td style="text-align:right">
+        ${fmtBytes(d.keymap_live_bytes)} / ${fmtBytes(d.keymap_logical_bytes)}
+        &nbsp;${wasteCell(d.keymap_waste_ratio, th)}</td>
+    </tr>`;
+  }).join('');
+
+  const threshold = results.find(r => r.data)?.data?.waste_threshold;
+  const thPct = threshold != null ? ` · compaction threshold ${(threshold * 100).toFixed(0)}%` : '';
+
+  return `
+    <div style="padding:8px 12px;background:var(--bg-2);border-top:1px solid var(--border)">
+      <div class="text-muted" style="font-size:11px;margin-bottom:6px">
+        On-disk blob growth — <strong>live / logical</strong> bytes and waste ratio per field.
+        Complements the fleet-wide <strong>Field Index Waste</strong> overview in the Storage tab;
+        a large high-waste bitmap is the signal to run an Index Checkpoint${thPct}.
+      </div>
+      <table class="tbl" style="width:100%">
+        <thead><tr>
+          <th>Field</th>
+          <th style="text-align:right">Distinct</th>
+          <th style="text-align:right">Bitmap live / logical</th>
+          <th style="text-align:right">Keymap live / logical</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+  `;
+}
+
+async function vqLoadRetried(page) {
+  vqState.retriedPage = page;
+  const result = document.getElementById('vq-browser-result');
+  if (!result) return;
+  result.innerHTML = '<div class="spinner" style="margin:12px 0"></div>';
+  try {
+    const data = await Api.vectorQueueRetried(page, vqState.retriedPageSize);
+    result.innerHTML = renderVqTable(data, page, vqState.retriedPageSize, null, null, vqState.maxRetries);
+  } catch (e) {
+    result.innerHTML = `<div class="alert alert-error">${esc(e.message)}</div>`;
+  }
+}
+
+async function vqBrowseNs(page) {
+  const nsSelect   = document.getElementById('vq-ns-select');
+  const modeSelect = document.getElementById('vq-ns-mode');
+  const ns   = nsSelect?.value;
+  const mode = modeSelect?.value ?? 'all';
+  if (!ns) { toast('Select a namespace first', 'error'); return; }
+
+  vqState.selectedNs = ns;
+  vqState.nsMode     = mode;
+  vqState.nsPage     = page;
+
+  const result = document.getElementById('vq-browser-result');
+  if (!result) return;
+  result.innerHTML = '<div class="spinner" style="margin:12px 0"></div>';
+
+  try {
+    const data = mode === 'retried'
+      ? await Api.vectorQueueRetriedByNamespace(ns, page, vqState.nsPageSize)
+      : await Api.vectorQueueByNamespace(ns, page, vqState.nsPageSize);
+    result.innerHTML = renderVqTable(data, page, vqState.nsPageSize, ns, mode, vqState.maxRetries);
+  } catch (e) {
+    result.innerHTML = `<div class="alert alert-error">${esc(e.message)}</div>`;
+  }
+}
+
+function renderVqTable(data, page, pageSize, ns, mode, maxRetries) {
+  const entries    = data?.entries ?? [];
+  const total      = data?.total   ?? 0;
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const isNsMode   = !!ns;
+
+  const subtitle = isNsMode
+    ? `Namespace <strong style="color:var(--text)">${esc(ns)}</strong> &mdash; ${mode === 'retried' ? 'Retried entries' : 'All entries'} (${fmt(total)} total)`
+    : `All retried entries across namespaces (${fmt(total)} total)`;
+
+  const header = `<div style="margin-bottom:8px;font-size:12px;color:var(--text-2)">${subtitle}</div>`;
+
+  if (entries.length === 0) {
+    return header + '<div class="text-muted" style="padding:8px 0">No entries found</div>';
+  }
+
+  const rows = entries.map(e => {
+    const docId      = esc(e.doc_id_str ?? e.doc_id_hex);
+    const isExhausted = maxRetries > 0 && e.retry_count >= maxRetries;
+    const retryClass  = isExhausted ? 'bad' : e.retry_count > 0 ? 'warn' : '';
+    return `
+      <tr>
+        <td style="font-family:monospace;font-size:11px">${esc(e.namespace)}</td>
+        <td style="font-family:monospace;font-size:11px;color:var(--text-2)">${docId}</td>
+        <td style="text-align:center">
+          <span class="stat-val ${retryClass}" style="font-size:12px">${e.retry_count}</span>
+        </td>
+        <td class="vq-preview">${esc(e.text_preview)}</td>
+        <td style="white-space:nowrap">
+          ${isExhausted ? `<button class="btn btn-xs btn-accent" style="margin-right:4px"
+                  title="Reset this entry so it will be re-indexed"
+                  onclick="vqRetryEntry('${esc(e.namespace)}','${esc(e.doc_id_hex)}',this)">Re-index</button>` : ''}
+          <button class="btn btn-xs btn-danger"
+                  onclick="vqDeleteEntry('${esc(e.namespace)}','${esc(e.doc_id_hex)}',this)">
+            Remove
+          </button>
+        </td>
+      </tr>`;
+  }).join('');
+
+  const prevHandler = isNsMode ? `vqBrowseNs(${page - 1})` : `vqLoadRetried(${page - 1})`;
+  const nextHandler = isNsMode ? `vqBrowseNs(${page + 1})` : `vqLoadRetried(${page + 1})`;
+
+  const pagination = totalPages > 1 ? `
+    <div class="vq-pagination">
+      <button class="pagination-btn" ${page <= 1 ? 'disabled' : ''} onclick="${prevHandler}">← Prev</button>
+      <span>Page ${page} of ${totalPages}</span>
+      <button class="pagination-btn" ${page >= totalPages ? 'disabled' : ''} onclick="${nextHandler}">Next →</button>
+    </div>` : '';
+
+  return `
+    ${header}
+    <div style="overflow-x:auto">
+      <table class="vq-table">
+        <thead><tr>
+          <th>Namespace</th>
+          <th>Doc ID</th>
+          <th style="text-align:center">Retries</th>
+          <th>Text Preview</th>
+          <th></th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+    ${pagination}`;
+}
+
+async function vqDeleteEntry(ns, idHex, btn) {
+  if (!confirm(`Remove queue entry for doc "${idHex}" in namespace "${ns}"?`)) return;
+  btn.disabled = true;
+  try {
+    await Api.vectorQueueDeleteEntry(ns, idHex);
+    btn.closest('tr').remove();
+    toast('Queue entry removed');
+  } catch (e) {
+    toast('Failed to remove entry: ' + e.message, 'error');
+    btn.disabled = false;
+  }
+}
+
+async function vqRetryEntry(ns, idHex, btn) {
+  btn.disabled = true;
+  btn.textContent = '…';
+  try {
+    await Api.vectorQueueRetryEntry(ns, idHex);
+    btn.textContent = 'Re-queued';
+    btn.classList.replace('btn-accent', 'btn-ghost');
+    toast('Entry re-queued for indexing');
+  } catch (e) {
+    toast('Failed to re-index entry: ' + e.message, 'error');
+    btn.disabled = false;
+    btn.textContent = 'Re-index';
+  }
+}
+
+
+// ── Bootstrap ─────────────────────────────────────────────────────────────────
+async function init() {
+  const saved = localStorage.getItem('minnal_base_url');
+  // When served over HTTP (e.g. via Docker/nginx), default to the same origin so
+  // nginx can proxy API calls — no manual configuration needed.
+  // When opened as a file:// URL fall back to the direct API address.
+  const defaultUrl = window.location.protocol !== 'file:'
+    ? window.location.origin
+    : 'http://localhost:8080';
+
+  const url = saved ?? defaultUrl;
+  state.baseUrl = url;
+  document.getElementById('base-url-input').value = url;
+  Api.setBaseUrl(url);
+  await connect();
+}
+
+document.addEventListener('DOMContentLoaded', init);
+
+// ── Enter-key submit ──────────────────────────────────────────────────────────
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Enter') return;
+  const target = e.target;
+  if (target.tagName !== 'INPUT' || target.type === 'checkbox' || target.type === 'radio') return;
+
+  // Walk up through progressively wider containers, click the first primary button found.
+  for (const selector of ['.form-row', '.sub-panel', '#modal-content', '.topbar-url']) {
+    const container = target.closest(selector);
+    if (!container) continue;
+    const btn = container.querySelector('.btn-accent:not([disabled])');
+    if (btn) { btn.click(); e.preventDefault(); return; }
+  }
+});

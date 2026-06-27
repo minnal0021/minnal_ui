@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 210 42" role="img" aria-label="மின்னல்">
+  <defs>
+    <linearGradient id="bolt-grad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"   stop-color="#fde68a"/>
+      <stop offset="100%" stop-color="#f59e0b"/>
+    </linearGradient>
+    <filter id="bolt-glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="1.5" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <!-- Lightning bolt: top half sweeps right, bottom half sweeps left -->
+  <polygon
+    points="21,1 10,22 17,22 8,41 28,18 21,18 31,1"
+    fill="url(#bolt-grad)"
+    filter="url(#bolt-glow)"
+  />
+
+  <!-- மின்னல் — Tamil script for "minnal" (lightning) -->
+  <text
+    x="40" y="31"
+    font-family="'Noto Sans Tamil','Tamil Sangam MN','Latha','Vijaya','TSCu_Inaimathi',serif"
+    font-size="26"
+    font-weight="700"
+    fill="#e2e8f0"
+    letter-spacing="0.5"
+  >மின்னல்</text>
+</svg>
