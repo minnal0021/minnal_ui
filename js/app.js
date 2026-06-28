@@ -2157,7 +2157,8 @@ function renderOpsMetricsHtml(m) {
         <div class="admin-card-title" title="Write path throughput and durability cost. In-memory, reset on restart.">WRITES</div>
         ${row('Puts', fmt(w.puts), '', 'WAL-backed upserts applied.')}
         ${row('Deletes', fmt(w.deletes), '', 'WAL-backed deletes applied.')}
-        ${row('No-WAL Puts', fmt(w.no_wal_puts), '', 'Upserts written bypassing the WAL (skip_wal path, e.g. vector payloads).')}
+        ${row('No-WAL Puts', fmt(w.no_wal_puts), '', 'Upserts written bypassing the WAL (skip_wal path — e.g. vector payloads, query-embedding cache).')}
+        ${row('No-WAL Deletes', fmt(w.no_wal_deletes), '', 'Deletes written bypassing the WAL (skip_wal path — e.g. query-embedding cache populate/clear).')}
         ${row('WAL Appended', fmtBytes(w.wal_bytes_appended), '', 'Total bytes appended to the WAL.')}
         ${row('WAL Fsyncs', fmt(w.wal_fsyncs), '', 'WAL fsyncs — one per WAL-backed write. The durability cost of writes.')}
         ${row('Apply Failures', fmt(w.apply_failures), apFailCls, 'In-memory applies that failed after retry. Data is still durable in the WAL.')}
