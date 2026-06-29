@@ -27,6 +27,8 @@ const state = {
   adminVlog:      null,
   adminTab:       'storage', // 'storage' | 'ops' | 'index'
   adminRowCounts: {}, // { [namespace]: number }
+  opsByNamespace: [],   // NamespaceOpsMetrics[] cached from the by-namespace endpoint
+  opsSelectedNs:  null, // namespace selected in the per-namespace ops panel
 
   // Progress polling: { 'ns::field': intervalId }
   progressPolls: {},
@@ -2088,29 +2090,101 @@ async function loadAdminOpsPanel() {
         <button class="btn btn-secondary" onclick="loadOpsMetrics()">↻ Refresh Metrics</button>
       </div>
       <div class="text-muted" style="font-size:12px;margin-top:6px">
-        Engine-wide counters, cumulative since startup. In-memory only — reset to zero on
-        restart (some are repopulated by recovery work on the way up). Sample twice to
-        compute rates. Hover any label for what it measures.
+        Counters are cumulative since startup, in-memory only — reset to zero on restart
+        (some are repopulated by recovery work on the way up). Sample twice to compute
+        rates. Hover any label for what it measures.
       </div>
     </div>
+
+    <div class="section-header" style="margin-top:4px">
+      <span class="section-title">ENGINE-WIDE</span>
+    </div>
+    <div class="text-muted" style="font-size:12px;margin-bottom:8px">
+      Sum of every namespace plus engine-global WAL-GC and retired-namespace totals.
+    </div>
     <div id="admin-ops-metrics"><div class="spinner"></div></div>
+
+    <div class="section-header" style="margin-top:18px">
+      <span class="section-title">PER-NAMESPACE</span>
+      <select id="ops-ns-select" style="max-width:320px"
+              onchange="onOpsNsChange()"></select>
+    </div>
+    <div class="text-muted" style="font-size:12px;margin-bottom:8px">
+      Counters for the selected namespace. WAL-GC is engine-global (not attributable to a
+      namespace) and is shown in the engine-wide panel above.
+    </div>
+    <div id="admin-ops-metrics-ns"><div class="spinner"></div></div>
   `;
   await loadOpsMetrics();
 }
 
 async function loadOpsMetrics() {
-  const area = document.getElementById('admin-ops-metrics');
-  if (!area) return;
-  area.innerHTML = '<div class="spinner"></div>';
-  try {
-    const m = await Api.opsMetrics();
-    area.innerHTML = renderOpsMetricsHtml(m);
-  } catch (e) {
-    area.innerHTML = `<div class="alert alert-error">Failed to load ops metrics: ${esc(e.message)}</div>`;
+  const engineArea = document.getElementById('admin-ops-metrics');
+  const nsArea     = document.getElementById('admin-ops-metrics-ns');
+  if (engineArea) engineArea.innerHTML = '<div class="spinner"></div>';
+  if (nsArea)     nsArea.innerHTML     = '<div class="spinner"></div>';
+
+  const [engineRes, nsRes] = await Promise.allSettled([
+    Api.opsMetrics(),
+    Api.opsMetricsByNamespace(),
+  ]);
+
+  if (engineArea) {
+    engineArea.innerHTML = engineRes.status === 'fulfilled'
+      ? renderOpsMetricsHtml(engineRes.value)
+      : `<div class="alert alert-error">Failed to load engine ops metrics: ${esc(engineRes.reason?.message)}</div>`;
+  }
+
+  if (nsRes.status === 'fulfilled') {
+    state.opsByNamespace = nsRes.value ?? [];
+    renderOpsNsSelect();
+  } else if (nsArea) {
+    state.opsByNamespace = [];
+    nsArea.innerHTML = `<div class="alert alert-error">Failed to load per-namespace ops metrics: ${esc(nsRes.reason?.message)}</div>`;
   }
 }
 
-function renderOpsMetricsHtml(m) {
+// Populate the namespace dropdown from the cached by-namespace data, preserving
+// the current selection where possible, then render the selected namespace.
+function renderOpsNsSelect() {
+  const sel = document.getElementById('ops-ns-select');
+  if (!sel) return;
+  const names = state.opsByNamespace.map(e => e.namespace).sort((a, b) => a.localeCompare(b));
+  if (!names.length) {
+    sel.innerHTML = '';
+    const nsArea = document.getElementById('admin-ops-metrics-ns');
+    if (nsArea) nsArea.innerHTML = '<div class="text-muted" style="font-size:13px">No namespaces yet.</div>';
+    return;
+  }
+  if (!names.includes(state.opsSelectedNs)) {
+    // Prefer one of the user's own stores; fall back to the first namespace.
+    const userNs = [...state.stores, ...state.kvStores].map(s => s.namespace);
+    state.opsSelectedNs = names.find(n => userNs.includes(n)) ?? names[0];
+  }
+  sel.innerHTML = names.map(n =>
+    `<option value="${esc(n)}" ${n === state.opsSelectedNs ? 'selected' : ''}>${esc(n)}</option>`
+  ).join('');
+  renderOpsNsMetrics();
+}
+
+function onOpsNsChange() {
+  const sel = document.getElementById('ops-ns-select');
+  if (!sel) return;
+  state.opsSelectedNs = sel.value;
+  renderOpsNsMetrics();
+}
+
+function renderOpsNsMetrics() {
+  const nsArea = document.getElementById('admin-ops-metrics-ns');
+  if (!nsArea) return;
+  const entry = state.opsByNamespace.find(e => e.namespace === state.opsSelectedNs);
+  nsArea.innerHTML = entry
+    ? renderOpsMetricsHtml(entry, { perNamespace: true })
+    : '<div class="text-muted" style="font-size:13px">Select a namespace.</div>';
+}
+
+function renderOpsMetricsHtml(m, opts = {}) {
+  const perNs = opts.perNamespace === true;
   const r = m.reads ?? {}, l = m.lsm_lookups ?? {}, w = m.writes ?? {},
         c = m.compaction ?? {}, g = m.gc ?? {};
 
@@ -2177,14 +2251,16 @@ function renderOpsMetricsHtml(m) {
         <div class="admin-card-title" title="Value-log and WAL space reclamation. In-memory, reset on restart.">GARBAGE COLLECTION</div>
         ${row('VLog GC Runs', fmt(g.vlog_gc_runs), '', 'Value-log GC passes run.')}
         ${row('VLog GC Duration', fmtMillis(g.vlog_gc_duration_ms), '', 'Cumulative value-log GC time.')}
-        ${row('WAL GC Runs', fmt(g.wal_gc_runs), '', 'WAL GC passes run.')}
-        ${row('WAL Segments Deleted', fmt(g.wal_segments_deleted), '', 'WAL segments reclaimed by GC.')}
+        ${perNs
+          ? `<div class="stat-row text-muted" style="font-size:12px"><span>WAL GC is engine-global — see the engine-wide panel.</span></div>`
+          : `${row('WAL GC Runs', fmt(g.wal_gc_runs), '', 'WAL GC passes run.')}
+        ${row('WAL Segments Deleted', fmt(g.wal_segments_deleted), '', 'WAL segments reclaimed by GC.')}`}
       </div>
 
-      <div class="admin-card">
+      ${perNs ? '' : `<div class="admin-card">
         <div class="admin-card-title">UPTIME</div>
         ${row('Since Startup', fmtUptime(m.uptime_s), '', 'Seconds since the server process started.')}
-      </div>
+      </div>`}
     </div>
   `;
 }
