@@ -2096,24 +2096,30 @@ async function loadAdminOpsPanel() {
       </div>
     </div>
 
-    <div class="section-header" style="margin-top:4px">
-      <span class="section-title">ENGINE-WIDE</span>
-    </div>
-    <div class="text-muted" style="font-size:12px;margin-bottom:8px">
-      Sum of every namespace plus engine-global WAL-GC and retired-namespace totals.
-    </div>
-    <div id="admin-ops-metrics"><div class="spinner"></div></div>
+    <div class="ops-metrics-cols">
+      <div class="ops-metrics-col">
+        <div class="section-header" style="margin-top:4px">
+          <span class="section-title">ENGINE-WIDE</span>
+        </div>
+        <div class="text-muted" style="font-size:12px;margin-bottom:8px">
+          Sum of every namespace plus engine-global WAL-GC and retired-namespace totals.
+        </div>
+        <div id="admin-ops-metrics"><div class="spinner"></div></div>
+      </div>
 
-    <div class="section-header" style="margin-top:18px">
-      <span class="section-title">PER-NAMESPACE</span>
-      <select id="ops-ns-select" style="max-width:320px"
-              onchange="onOpsNsChange()"></select>
+      <div class="ops-metrics-col">
+        <div class="section-header" style="margin-top:4px">
+          <span class="section-title">PER-NAMESPACE</span>
+          <select id="ops-ns-select" style="max-width:320px"
+                  onchange="onOpsNsChange()"></select>
+        </div>
+        <div class="text-muted" style="font-size:12px;margin-bottom:8px">
+          Counters for the selected namespace. WAL-GC is engine-global (not attributable to a
+          namespace) and is shown in the engine-wide panel beside this one.
+        </div>
+        <div id="admin-ops-metrics-ns"><div class="spinner"></div></div>
+      </div>
     </div>
-    <div class="text-muted" style="font-size:12px;margin-bottom:8px">
-      Counters for the selected namespace. WAL-GC is engine-global (not attributable to a
-      namespace) and is shown in the engine-wide panel above.
-    </div>
-    <div id="admin-ops-metrics-ns"><div class="spinner"></div></div>
   `;
   await loadOpsMetrics();
 }
@@ -2146,10 +2152,16 @@ async function loadOpsMetrics() {
 
 // Populate the namespace dropdown from the cached by-namespace data, preserving
 // the current selection where possible, then render the selected namespace.
+// Only user-facing namespaces (the user's own doc/kv stores) are listed —
+// internal/engine namespaces are filtered out.
 function renderOpsNsSelect() {
   const sel = document.getElementById('ops-ns-select');
   if (!sel) return;
-  const names = state.opsByNamespace.map(e => e.namespace).sort((a, b) => a.localeCompare(b));
+  const userNs = new Set([...state.stores, ...state.kvStores].map(s => s.namespace));
+  const names = state.opsByNamespace
+    .map(e => e.namespace)
+    .filter(n => userNs.has(n))
+    .sort((a, b) => a.localeCompare(b));
   if (!names.length) {
     sel.innerHTML = '';
     const nsArea = document.getElementById('admin-ops-metrics-ns');
@@ -2157,9 +2169,7 @@ function renderOpsNsSelect() {
     return;
   }
   if (!names.includes(state.opsSelectedNs)) {
-    // Prefer one of the user's own stores; fall back to the first namespace.
-    const userNs = [...state.stores, ...state.kvStores].map(s => s.namespace);
-    state.opsSelectedNs = names.find(n => userNs.includes(n)) ?? names[0];
+    state.opsSelectedNs = names[0];
   }
   sel.innerHTML = names.map(n =>
     `<option value="${esc(n)}" ${n === state.opsSelectedNs ? 'selected' : ''}>${esc(n)}</option>`
