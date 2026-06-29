@@ -146,14 +146,18 @@ async function connect() {
 
 // ── Stores ─────────────────────────────────────────────────────────────────────
 async function loadStores() {
-  const [docResult, kvResult] = await Promise.allSettled([
-    Api.listStores(),
-    Api.listKvStores(),
-  ]);
-  state.stores   = docResult.status === 'fulfilled' ? (docResult.value  ?? []) : [];
-  state.kvStores = kvResult.status  === 'fulfilled' ? (kvResult.value   ?? []) : [];
-  if (docResult.status === 'rejected') toast('Failed to load doc stores: ' + docResult.reason?.message, 'error');
-  if (kvResult.status  === 'rejected') toast('Failed to load KV stores: '  + kvResult.reason?.message,  'error');
+  // A single /stores list returns both kinds; each entry carries a `store_type`
+  // ("doc"/"kv"). Partition locally (falling back to the value_type heuristic for
+  // any entry that predates the discriminant).
+  let all = [];
+  try {
+    all = (await Api.listStores()) ?? [];
+  } catch (e) {
+    toast('Failed to load stores: ' + e?.message, 'error');
+  }
+  const isKv = s => s.store_type === 'kv' || (s.store_type == null && s.value_type != null);
+  state.stores   = all.filter(s => !isKv(s));
+  state.kvStores = all.filter(isKv);
 
   renderSidebar();
 
@@ -690,10 +694,10 @@ async function submitCreateStore() {
       toast('Semantic search requires value_type = str', 'error');
       btn.disabled = false; btn.textContent = 'Create Store'; return;
     }
-    const payload = { namespace: ns, key_type: keyType, value_type: valueType };
+    const payload = { namespace: ns, store_type: 'kv', key_type: keyType, value_type: valueType };
     if (semantic) payload.semantic_search_enabled = true;
     try {
-      await Api.createKvStore(payload);
+      await Api.createStore(payload);
       closeModal();
       toast(`KV store '${ns}' created`);
       await loadStores();
@@ -742,7 +746,7 @@ async function submitCreateStore() {
     btn.disabled = false; btn.textContent = 'Create Store'; return;
   }
 
-  const payload = { namespace: ns, key_type: keyType, indices, attributes };
+  const payload = { namespace: ns, store_type: 'doc', key_type: keyType, indices, attributes };
   if (semanticEnabled) {
     payload.semantic_search_enabled = true;
     payload.embedding_fields = embeddingFields;
@@ -782,11 +786,8 @@ function confirmDeleteStore(ns) {
 
 async function doDeleteStore(ns) {
   try {
-    if (isKvStore()) {
-      await Api.deleteKvStore(ns);
-    } else {
-      await Api.deleteStore(ns);
-    }
+    // DELETE /stores/{ns} resolves the kind from the stored schema.
+    await Api.deleteStore(ns);
     closeModal();
     toast(`Store '${ns}' deleted`);
     if (state.selectedStore?.namespace === ns) {
@@ -2550,7 +2551,7 @@ async function toggleKvStoreDetail(ns) {
   detail.innerHTML = '<div class="spinner" style="margin:12px 0"></div>';
 
   try {
-    const m = await Api.kvStoreKvMeta(ns);
+    const m = await Api.storeKvMeta(ns);
     graftStorageMeta(m);
     detail.innerHTML = renderSystemStoreMeta(m);
   } catch (e) {
@@ -2981,12 +2982,9 @@ async function adminImportSchemaFile(input) {
     const text = await file.text();
     let schema;
     try { schema = JSON.parse(text); } catch { throw new Error('Invalid JSON file'); }
-    const isKv = schema.value_type != null;
-    if (isKv) {
-      await Api.importKvStoreSchema(schema);
-    } else {
-      await Api.importStoreSchema(schema);
-    }
+    // The unified import endpoint dispatches on the schema's `store_type`.
+    const isKv = schema.store_type === 'kv' || (schema.store_type == null && schema.value_type != null);
+    await Api.importStoreSchema(schema);
     const storeKind = isKv ? 'KV store' : 'store';
     if (el) el.innerHTML = `<div class="alert alert-success">Schema imported — ${storeKind} '${esc(schema.namespace ?? file.name)}' created</div>`;
     toast(`Schema imported from ${file.name}`);
@@ -2999,7 +2997,8 @@ async function adminImportSchemaFile(input) {
 
 async function adminExportKvSchema(ns) {
   try {
-    const blob = await Api.exportKvSchema(ns);
+    // Unified export resolves the kind from the stored schema.
+    const blob = await Api.exportSchema(ns);
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
     a.download = `${ns}-kv-schema.json`;

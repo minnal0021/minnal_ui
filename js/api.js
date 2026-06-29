@@ -40,15 +40,13 @@ const Api = (() => {
   }
 
   // ── Store lifecycle ────────────────────────────────────────────────
+  // Doc and KV stores share a single /stores path. `listStores` returns both
+  // kinds; each entry carries a `store_type` ("doc"/"kv") to tell them apart.
+  // `createStore` dispatches on the payload's mandatory `store_type`.
   const listStores   = ()         => req('GET',    '/stores');
   const createStore  = (schema)   => req('POST',   '/stores', schema);
   const deleteStore  = (ns)       => req('DELETE', `/stores/${ns}`);
   const amendSchema  = (ns, op)   => req('PATCH',  `/stores/${ns}/schema`, op);
-
-  // ── KV store lifecycle ─────────────────────────────────────────────
-  const listKvStores  = ()       => req('GET',    '/kv-stores');
-  const createKvStore = (schema) => req('POST',   '/kv-stores', schema);
-  const deleteKvStore = (ns)     => req('DELETE', `/kv-stores/${ns}`);
 
   // ── Index management (per-store) ───────────────────────────────────
   const addIndex  = (ns, spec)  => req('POST',   `/stores/${ns}/indices`, spec);
@@ -82,28 +80,29 @@ const Api = (() => {
     });
 
   // ── KV CRUD ───────────────────────────────────────────────────────
-  const getKv    = (ns, key)        => req('GET',    `/kv-stores/${ns}/kv/${encodeURIComponent(key)}`);
-  const putKv    = (ns, key, value) => req('PUT',    `/kv-stores/${ns}/kv/${encodeURIComponent(key)}`, value);
-  const deleteKv = (ns, key)        => req('DELETE', `/kv-stores/${ns}/kv/${encodeURIComponent(key)}`);
+  // KV data plane lives under the shared /stores/{ns}/kv prefix.
+  const getKv    = (ns, key)        => req('GET',    `/stores/${ns}/kv/${encodeURIComponent(key)}`);
+  const putKv    = (ns, key, value) => req('PUT',    `/stores/${ns}/kv/${encodeURIComponent(key)}`, value);
+  const deleteKv = (ns, key)        => req('DELETE', `/stores/${ns}/kv/${encodeURIComponent(key)}`);
 
   const kvRangeScan = (ns, start, end, cursor, limit) => {
     const p = new URLSearchParams({ start });
     if (end)    p.set('end',    end);
     if (cursor) p.set('cursor', cursor);
     if (limit)  p.set('limit',  limit);
-    return req('GET', `/kv-stores/${ns}/kv?${p}`);
+    return req('GET', `/stores/${ns}/kv?${p}`);
   };
 
   const kvPrefixScan = (ns, prefix, cursor, limit) => {
     const p = new URLSearchParams({ prefix });
     if (cursor) p.set('cursor', cursor);
     if (limit)  p.set('limit',  limit);
-    return req('GET', `/kv-stores/${ns}/kv/prefix?${p}`);
+    return req('GET', `/stores/${ns}/kv/prefix?${p}`);
   };
 
   // ── KV semantic search ─────────────────────────────────────────────
   const kvSemanticSearch = (ns, query, topK, pageNo, pageSize) =>
-    req('POST', `/kv-stores/${ns}/semantic-search`, {
+    req('POST', `/stores/${ns}/kv/semantic-search`, {
       query,
       ...(topK     ? { top_k:     topK     } : {}),
       ...(pageNo   ? { page_no:   pageNo   } : {}),
@@ -129,23 +128,13 @@ const Api = (() => {
     });
 
   // ── Admin Stores ───────────────────────────────────────────────────
+  // Import/export are unified across kinds: the import endpoint dispatches on the
+  // schema's `store_type`, and export resolves the kind from the stored schema.
   const storeRowCount    = (ns)    => req('GET',  `/admin/stores/${encodeURIComponent(ns)}/row-count`);
   const importStoreSchema = (body) => req('POST', '/admin/stores/import', body);
-  const importKvStoreSchema = (body) => req('POST', '/admin/kv-stores/import', body);
 
   async function exportSchema(ns) {
     const url = `${baseUrl}/admin/stores/${encodeURIComponent(ns)}/schema/export`;
-    let resp;
-    try { resp = await fetch(url); } catch (e) { throw new Error(`Network error: ${e.message}`); }
-    if (!resp.ok) {
-      let data; try { data = await resp.json(); } catch { data = null; }
-      throw new Error(data?.error ?? `HTTP ${resp.status} ${resp.statusText}`);
-    }
-    return resp.blob();
-  }
-
-  async function exportKvSchema(ns) {
-    const url = `${baseUrl}/admin/kv-stores/${encodeURIComponent(ns)}/schema/export`;
     let resp;
     try { resp = await fetch(url); } catch (e) { throw new Error(`Network error: ${e.message}`); }
     if (!resp.ok) {
@@ -165,11 +154,11 @@ const Api = (() => {
   const valueLog     = ()  => req('GET',  '/admin/storage/value-log');
   const valueLogPages = (ns) => req('GET', `/admin/storage/value-log/${encodeURIComponent(ns)}/pages`);
   const namespaces   = ()  => req('GET',  '/admin/storage/namespaces');
-  const kvNamespaces = ()  => req('GET',  '/admin/storage/kv-namespaces');
+  const physicalNamespaces = ()  => req('GET',  '/admin/storage/namespaces/physical');
   const systemStores    = ()   => req('GET',  '/admin/storage/system/stores');
   const systemStoreMeta = (ns) => req('GET',  `/admin/storage/system/stores/${encodeURIComponent(ns)}/meta`);
+  // Unified across kinds; the KV response still carries key_type/value_type.
   const storeKvMeta     = (ns) => req('GET',  `/admin/storage/stores/${encodeURIComponent(ns)}/kv-meta`);
-  const kvStoreKvMeta   = (ns) => req('GET',  `/admin/storage/kv-stores/${encodeURIComponent(ns)}/kv-meta`);
   const triggerGc    = ()  => req('POST', '/admin/storage/gc');
   const triggerWalGc = ()  => req('POST', '/admin/storage/gc/wal');
   const compact      = ()  => req('POST', '/admin/storage/compact');
@@ -237,25 +226,23 @@ const Api = (() => {
 
   return {
     setBaseUrl,
-    // doc stores
+    // stores (doc + KV, dispatched on store_type)
     listStores, createStore, deleteStore, amendSchema,
-    // admin store ops
-    storeRowCount, importStoreSchema, exportSchema, importKvStoreSchema, exportKvSchema,
+    // admin store ops (unified across kinds)
+    storeRowCount, importStoreSchema, exportSchema,
     // indices (per-store)
     addIndex, dropIndex,
     // docs
     getDoc, putDoc, deleteDoc, rangeScan, prefixScan, query,
     // doc semantic
     semanticSearch, semanticSearchFiltered,
-    // kv stores
-    listKvStores, createKvStore, deleteKvStore,
     // kv crud
     getKv, putKv, deleteKv, kvRangeScan, kvPrefixScan,
     // kv semantic
     kvSemanticSearch,
     // admin storage
-    health, stats, opsMetrics, indexWaste, wal, lsm, valueLog, valueLogPages, namespaces, kvNamespaces,
-    systemStores, systemStoreMeta, storeKvMeta, kvStoreKvMeta,
+    health, stats, opsMetrics, indexWaste, wal, lsm, valueLog, valueLogPages, namespaces, physicalNamespaces,
+    systemStores, systemStoreMeta, storeKvMeta,
     triggerGc, triggerWalGc, compact, indexCheckpoint,
     // admin indices — cache / reconcile
     clearQueryEmbeddingCache, vectorReconcile,
