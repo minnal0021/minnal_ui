@@ -3965,3 +3965,14 @@ document.addEventListener('keydown', (e) => {
     if (btn) { btn.click(); e.preventDefault(); return; }
   }
 });
+
+// ── Esc-key dismiss ───────────────────────────────────────────────────────────
+// Any pop-up (incl. query-result payload views) shares the #modal overlay, so a
+// single handler dismisses whichever one is open.
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  if (document.getElementById('modal')?.classList.contains('open')) {
+    closeModal();
+    e.preventDefault();
+  }
+});
