@@ -223,6 +223,21 @@ select { cursor: pointer; }
 
 /* ── Sections ─────────────────────────────────────────────────────────── */
 .section       { margin-bottom: 28px; }
+
+/* Frame grouping related sections (e.g. all vector-index controls) together. */
+.index-frame {
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius);
+  background: var(--bg-1);
+  padding: 18px 18px 6px;
+  margin-bottom: 28px;
+}
+.index-frame-title {
+  font-size: 12px; font-weight: 700; letter-spacing: 1px;
+  color: var(--accent); text-transform: uppercase; margin-bottom: 16px;
+}
+.index-frame > .section:last-child { margin-bottom: 0; }
+#admin-index-queue-browser .section { margin-bottom: 0; }
 .section-header {
   display: flex; align-items: center; justify-content: space-between;
   margin-bottom: 12px; padding-bottom: 8px;
@@ -245,6 +260,14 @@ select { cursor: pointer; }
   background: var(--bg-2);
 }
 .tbl td { padding: 10px 12px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+
+/* Index Operations: fix the namespace column and shrink the operations
+   column to its buttons (width:1% + nowrap), letting the middle (details)
+   column absorb the remaining width so every row's columns line up. */
+.ns-ops-col-ns      { width: 200px; }
+.ns-ops-col-actions { width: 1%; }
+.ns-ops-actions     { white-space: nowrap; }
+.tbl tfoot td { border-top: 2px solid var(--border); background: var(--bg-2); }
 .tbl tr:last-child td { border-bottom: none; }
 .tbl tr:hover td { background: var(--bg-hover); }
 .tbl-wrap {
@@ -311,6 +334,31 @@ select { cursor: pointer; }
 .sub-panel { display: none; }
 .sub-panel.active { display: block; }
 
+/* Ops-metrics engine-wide / per-namespace panels shown side by side. */
+.ops-metrics-cols {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 20px;
+  align-items: start;
+}
+.ops-metrics-col {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-1);
+  padding: 16px 18px;
+}
+/* First header in each panel hugs the top edge; the dropdown sets the row
+   height, so the engine-wide title matches the per-namespace one. */
+.ops-metrics-col > .section-header:first-child {
+  margin-top: 0 !important;
+  min-height: 38px;
+}
+.ops-metrics-col .admin-grid:last-child { margin-bottom: 0; }
+@media (max-width: 960px) {
+  .ops-metrics-cols { grid-template-columns: 1fr; }
+}
+
 /* ── Modal ────────────────────────────────────────────────────────────── */
 .modal-overlay {
   display: none; position: fixed; inset: 0; z-index: 100;
@@ -374,6 +422,13 @@ select { cursor: pointer; }
   font-size: 11px; font-weight: 700; letter-spacing: .5px; color: var(--text-3);
 }
 .add-field-row { margin-top: 6px; }
+/* Vector-index field list — a single name input plus a remove button per row. */
+.vec-field-row {
+  display: grid; grid-template-columns: 1fr 28px; gap: 8px; align-items: center;
+  padding: 8px 10px;
+  background: var(--bg-3); border: 1px solid var(--border); border-radius: var(--radius);
+}
+.vec-field-row input[type="text"] { padding: 5px 8px; font-size: 13px; }
 
 /* ── Admin inner tabs ────────────────────────────────────────────────────── */
 .admin-inner-nav {
@@ -393,6 +448,10 @@ select { cursor: pointer; }
             padding: 5px 0; border-bottom: 1px solid var(--border); }
 .stat-row:last-child { border-bottom: none; }
 .stat-key { color: var(--text-2); font-size: 12px; }
+/* Labels carrying an explanatory tooltip get a help cursor + dotted underline. */
+.stat-key[title], .admin-card-title[title] { cursor: help; }
+.stat-key[title] { border-bottom: 1px dotted var(--border-light); }
+.tbl th[title] { cursor: help; text-decoration: underline dotted var(--text-3); text-underline-offset: 3px; }
 .stat-val { font-weight: 600; font-family: monospace; color: var(--text); }
 .stat-val.good { color: var(--success); }
 .stat-val.warn { color: var(--warning); }

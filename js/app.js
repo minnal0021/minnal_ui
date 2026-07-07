@@ -27,6 +27,8 @@ const state = {
   adminVlog:      null,
   adminTab:       'storage', // 'storage' | 'ops' | 'index'
   adminRowCounts: {}, // { [namespace]: number }
+  opsByNamespace: [],   // NamespaceOpsMetrics[] cached from the by-namespace endpoint
+  opsSelectedNs:  null, // namespace selected in the per-namespace ops panel
 
   // Progress polling: { 'ns::field': intervalId }
   progressPolls: {},
@@ -146,14 +148,18 @@ async function connect() {
 
 // ── Stores ─────────────────────────────────────────────────────────────────────
 async function loadStores() {
-  const [docResult, kvResult] = await Promise.allSettled([
-    Api.listStores(),
-    Api.listKvStores(),
-  ]);
-  state.stores   = docResult.status === 'fulfilled' ? (docResult.value  ?? []) : [];
-  state.kvStores = kvResult.status  === 'fulfilled' ? (kvResult.value   ?? []) : [];
-  if (docResult.status === 'rejected') toast('Failed to load doc stores: ' + docResult.reason?.message, 'error');
-  if (kvResult.status  === 'rejected') toast('Failed to load KV stores: '  + kvResult.reason?.message,  'error');
+  // A single /stores list returns both kinds; each entry carries a `store_type`
+  // ("doc"/"kv"). Partition locally (falling back to the value_type heuristic for
+  // any entry that predates the discriminant).
+  let all = [];
+  try {
+    all = (await Api.listStores()) ?? [];
+  } catch (e) {
+    toast('Failed to load stores: ' + e?.message, 'error');
+  }
+  const isKv = s => s.store_type === 'kv' || (s.store_type == null && s.value_type != null);
+  state.stores   = all.filter(s => !isKv(s));
+  state.kvStores = all.filter(isKv);
 
   renderSidebar();
 
@@ -339,6 +345,7 @@ function renderSchemaTab() {
       <div class="section-header">
         <span class="section-title">ATTRIBUTES</span>
         <button class="btn btn-sm btn-accent"
+                ${s.semantic_search_enabled ? 'disabled title="A vector index already exists — drop it before adding a new one"' : ''}
                 onclick="showAddAttributeModal('${esc(s.namespace)}')">+ Add Vector Index</button>
       </div>
       <div class="tbl-wrap">
@@ -689,10 +696,10 @@ async function submitCreateStore() {
       toast('Semantic search requires value_type = str', 'error');
       btn.disabled = false; btn.textContent = 'Create Store'; return;
     }
-    const payload = { namespace: ns, key_type: keyType, value_type: valueType };
+    const payload = { namespace: ns, store_type: 'kv', key_type: keyType, value_type: valueType };
     if (semantic) payload.semantic_search_enabled = true;
     try {
-      await Api.createKvStore(payload);
+      await Api.createStore(payload);
       closeModal();
       toast(`KV store '${ns}' created`);
       await loadStores();
@@ -741,7 +748,7 @@ async function submitCreateStore() {
     btn.disabled = false; btn.textContent = 'Create Store'; return;
   }
 
-  const payload = { namespace: ns, key_type: keyType, indices, attributes };
+  const payload = { namespace: ns, store_type: 'doc', key_type: keyType, indices, attributes };
   if (semanticEnabled) {
     payload.semantic_search_enabled = true;
     payload.embedding_fields = embeddingFields;
@@ -781,11 +788,8 @@ function confirmDeleteStore(ns) {
 
 async function doDeleteStore(ns) {
   try {
-    if (isKvStore()) {
-      await Api.deleteKvStore(ns);
-    } else {
-      await Api.deleteStore(ns);
-    }
+    // DELETE /stores/{ns} resolves the kind from the stored schema.
+    await Api.deleteStore(ns);
     closeModal();
     toast(`Store '${ns}' deleted`);
     if (state.selectedStore?.namespace === ns) {
@@ -874,24 +878,33 @@ function showAddAttributeModal(ns) {
   openModal(`
     <div class="modal-title">Add Vector Index — ${esc(ns)}</div>
     <div class="modal-section">
-      <div class="form-group" style="margin-bottom:14px">
-        <label>FIELD NAME</label>
-        <input type="text" id="attr-name" placeholder="e.g. description" style="max-width:280px" />
-      </div>
-      <div class="form-group">
-        <label>DESCRIPTION <span class="text-muted">(optional)</span></label>
-        <input type="text" id="attr-desc" placeholder="short description" />
-      </div>
-      <p class="text-muted" style="margin-top:10px">
-        Adds a <strong>str</strong> attribute and registers it as an embedding field for
-        semantic search. Semantic search will be enabled on this store if not already active.
+      <div class="modal-section-title">EMBEDDING FIELDS</div>
+      <p class="text-muted" style="margin:0 0 12px">
+        Each name declares a new <strong>str</strong> attribute that feeds the namespace's
+        single vector index. The text of all listed fields is embedded together for
+        semantic search. To change the field set later, drop the vector index and add it again.
       </p>
+      <div id="vec-fields" class="field-builder"></div>
+      <div class="add-field-row">
+        <button class="btn btn-sm btn-ghost" onclick="addVectorIndexField()">+ Add Field</button>
+      </div>
     </div>
     <div class="modal-actions">
       <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
-      <button class="btn btn-accent" onclick="submitAddAttribute('${esc(ns)}')">Add Vector Index</button>
+      <button class="btn btn-accent" onclick="submitAddVectorIndex('${esc(ns)}')">Create Vector Index</button>
     </div>
   `);
+  addVectorIndexField();
+}
+
+function addVectorIndexField() {
+  const row = document.createElement('div');
+  row.className = 'vec-field-row';
+  row.innerHTML = `
+    <input type="text" class="vec-field-input" placeholder="e.g. description" />
+    <button class="field-remove-btn" onclick="this.closest('.vec-field-row').remove()" title="Remove">✕</button>
+  `;
+  document.getElementById('vec-fields').appendChild(row);
 }
 
 function showEditAttributeModal(ns, name, type, desc) {
@@ -923,15 +936,16 @@ function showEditAttributeModal(ns, name, type, desc) {
   `);
 }
 
-async function submitAddAttribute(ns) {
-  const name = document.getElementById('attr-name').value.trim();
-  const desc = document.getElementById('attr-desc').value.trim();
-  if (!name) { toast('Field name is required', 'error'); return; }
-  const op = { op: 'add_embedding_attribute', name };
-  if (desc) op.description = desc;
+async function submitAddVectorIndex(ns) {
+  const fields = [...document.querySelectorAll('#vec-fields .vec-field-input')]
+    .map(i => i.value.trim())
+    .filter(Boolean);
+  if (fields.length === 0) { toast('At least one field is required', 'error'); return; }
+  if (new Set(fields).size !== fields.length) { toast('Duplicate field names', 'error'); return; }
   try {
-    await Api.amendSchema(ns, op);
-    closeModal(); toast(`Vector index field '${name}' added`);
+    await Api.amendSchema(ns, { op: 'enable_vector_index', fields });
+    closeModal();
+    toast(`Vector index created over ${fields.length} field${fields.length !== 1 ? 's' : ''}`);
     await loadStores(); renderSchemaTab();
   } catch (e) { toast(e.message, 'error'); }
 }
@@ -2040,18 +2054,24 @@ async function loadAdminStoragePanel() {
   if (!panel) return;
   panel.innerHTML = `
     <div class="section">
+      <div class="section-header"><span class="section-title">SCHEMA MANAGEMENT</span></div>
+      <div class="admin-actions">
+        <button class="btn btn-ghost" onclick="adminImportSchema()">⬆ Import Schema</button>
+      </div>
+      <input type="file" id="admin-import-file" accept=".json,application/json" style="display:none"
+             onchange="adminImportSchemaFile(this)">
+    </div>
+    <div class="section">
       <div class="section-header"><span class="section-title">ACTIONS</span></div>
       <div class="admin-actions">
         <button class="btn btn-ghost" onclick="adminTriggerGc()">⚡ Trigger GC</button>
         <button class="btn btn-ghost" onclick="adminTriggerWalGc()">⚡ Trigger WAL GC</button>
         <button class="btn btn-ghost" onclick="adminCompact()">⚡ Compact LSM</button>
-        <button class="btn btn-ghost" onclick="adminIndexCheckpoint()">⚡ Index Checkpoint</button>
-        <button class="btn btn-secondary" onclick="adminRefresh()">↻ Refresh Stats</button>
-        <button class="btn btn-ghost" onclick="adminImportSchema()">⬆ Import Schema</button>
+        <button class="btn btn-ghost" onclick="adminIndexCheckpoint(this)"
+                title="Flush and compact field indices in the background — only one run at a time">⚡ Index Checkpoint</button>
         <button class="btn btn-danger" onclick="adminClearQueryCache()">🗑 Clear Query Cache</button>
+        <button class="btn btn-secondary" style="margin-left:auto" onclick="adminRefresh()">↻ Refresh Stats</button>
       </div>
-      <input type="file" id="admin-import-file" accept=".json,application/json" style="display:none"
-             onchange="adminImportSchemaFile(this)">
       <div id="admin-action-result"></div>
     </div>
     <div id="admin-storage-stats"><div class="spinner"></div></div>
@@ -2070,33 +2090,117 @@ async function loadAdminOpsPanel() {
         <button class="btn btn-secondary" onclick="loadOpsMetrics()">↻ Refresh Metrics</button>
       </div>
       <div class="text-muted" style="font-size:12px;margin-top:6px">
-        Engine-wide counters, cumulative since startup. Sample twice to compute rates.
+        Counters are cumulative since startup, in-memory only — reset to zero on restart
+        (some are repopulated by recovery work on the way up). Sample twice to compute
+        rates. Hover any label for what it measures.
       </div>
     </div>
-    <div id="admin-ops-metrics"><div class="spinner"></div></div>
+
+    <div class="ops-metrics-cols">
+      <div class="ops-metrics-col">
+        <div class="section-header" style="margin-top:4px">
+          <span class="section-title">ENGINE-WIDE</span>
+        </div>
+        <div class="text-muted" style="font-size:12px;margin-bottom:8px">
+          Sum of every namespace plus engine-global WAL-GC and retired-namespace totals.
+        </div>
+        <div id="admin-ops-metrics"><div class="spinner"></div></div>
+      </div>
+
+      <div class="ops-metrics-col">
+        <div class="section-header" style="margin-top:4px">
+          <span class="section-title">PER-NAMESPACE</span>
+          <select id="ops-ns-select" style="max-width:320px"
+                  onchange="onOpsNsChange()"></select>
+        </div>
+        <div class="text-muted" style="font-size:12px;margin-bottom:8px">
+          Counters for the selected namespace. WAL-GC is engine-global (not attributable to a
+          namespace) and is shown in the engine-wide panel beside this one.
+        </div>
+        <div id="admin-ops-metrics-ns"><div class="spinner"></div></div>
+      </div>
+    </div>
   `;
   await loadOpsMetrics();
 }
 
 async function loadOpsMetrics() {
-  const area = document.getElementById('admin-ops-metrics');
-  if (!area) return;
-  area.innerHTML = '<div class="spinner"></div>';
-  try {
-    const m = await Api.opsMetrics();
-    area.innerHTML = renderOpsMetricsHtml(m);
-  } catch (e) {
-    area.innerHTML = `<div class="alert alert-error">Failed to load ops metrics: ${esc(e.message)}</div>`;
+  const engineArea = document.getElementById('admin-ops-metrics');
+  const nsArea     = document.getElementById('admin-ops-metrics-ns');
+  if (engineArea) engineArea.innerHTML = '<div class="spinner"></div>';
+  if (nsArea)     nsArea.innerHTML     = '<div class="spinner"></div>';
+
+  const [engineRes, nsRes] = await Promise.allSettled([
+    Api.opsMetrics(),
+    Api.opsMetricsByNamespace(),
+  ]);
+
+  if (engineArea) {
+    engineArea.innerHTML = engineRes.status === 'fulfilled'
+      ? renderOpsMetricsHtml(engineRes.value)
+      : `<div class="alert alert-error">Failed to load engine ops metrics: ${esc(engineRes.reason?.message)}</div>`;
+  }
+
+  if (nsRes.status === 'fulfilled') {
+    state.opsByNamespace = nsRes.value ?? [];
+    renderOpsNsSelect();
+  } else if (nsArea) {
+    state.opsByNamespace = [];
+    nsArea.innerHTML = `<div class="alert alert-error">Failed to load per-namespace ops metrics: ${esc(nsRes.reason?.message)}</div>`;
   }
 }
 
-function renderOpsMetricsHtml(m) {
+// Populate the namespace dropdown from the cached by-namespace data, preserving
+// the current selection where possible, then render the selected namespace.
+// Only user-facing namespaces (the user's own doc/kv stores) are listed —
+// internal/engine namespaces are filtered out.
+function renderOpsNsSelect() {
+  const sel = document.getElementById('ops-ns-select');
+  if (!sel) return;
+  const userNs = new Set([...state.stores, ...state.kvStores].map(s => s.namespace));
+  const names = state.opsByNamespace
+    .map(e => e.namespace)
+    .filter(n => userNs.has(n))
+    .sort((a, b) => a.localeCompare(b));
+  if (!names.length) {
+    sel.innerHTML = '';
+    const nsArea = document.getElementById('admin-ops-metrics-ns');
+    if (nsArea) nsArea.innerHTML = '<div class="text-muted" style="font-size:13px">No namespaces yet.</div>';
+    return;
+  }
+  if (!names.includes(state.opsSelectedNs)) {
+    state.opsSelectedNs = names[0];
+  }
+  sel.innerHTML = names.map(n =>
+    `<option value="${esc(n)}" ${n === state.opsSelectedNs ? 'selected' : ''}>${esc(n)}</option>`
+  ).join('');
+  renderOpsNsMetrics();
+}
+
+function onOpsNsChange() {
+  const sel = document.getElementById('ops-ns-select');
+  if (!sel) return;
+  state.opsSelectedNs = sel.value;
+  renderOpsNsMetrics();
+}
+
+function renderOpsNsMetrics() {
+  const nsArea = document.getElementById('admin-ops-metrics-ns');
+  if (!nsArea) return;
+  const entry = state.opsByNamespace.find(e => e.namespace === state.opsSelectedNs);
+  nsArea.innerHTML = entry
+    ? renderOpsMetricsHtml(entry, { perNamespace: true })
+    : '<div class="text-muted" style="font-size:13px">Select a namespace.</div>';
+}
+
+function renderOpsMetricsHtml(m, opts = {}) {
+  const perNs = opts.perNamespace === true;
   const r = m.reads ?? {}, l = m.lsm_lookups ?? {}, w = m.writes ?? {},
         c = m.compaction ?? {}, g = m.gc ?? {};
 
   const ratioPct = (x) => `${((x ?? 0) * 100).toFixed(1)}%`;
   const ratioCls = (x, warnBelow) => (x ?? 0) >= warnBelow ? 'good' : (x ?? 0) >= warnBelow * 0.6 ? 'warn' : 'bad';
-  const row = (k, v, cls) => `<div class="stat-row"><span class="stat-key">${k}</span>
+  const row = (k, v, cls, tip) => `<div class="stat-row"><span class="stat-key"${tip ? ` title="${esc(tip)}"` : ''}>${k}</span>
     <span class="stat-val ${cls ?? ''}">${v}</span></div>`;
   const bar = (ratio, label) => `
     <div style="margin:6px 0 10px">
@@ -2113,57 +2217,60 @@ function renderOpsMetricsHtml(m) {
   return `
     <div class="admin-grid">
       <div class="admin-card">
-        <div class="admin-card-title">READS</div>
+        <div class="admin-card-title" title="User-facing read path. In-memory counters, reset to zero on restart.">READS</div>
         ${bar(r.read_hit_ratio, `${ratioPct(r.read_hit_ratio)} hit ratio`)}
-        ${row('Reads', fmt(r.reads))}
-        ${row('Hits', fmt(r.read_hits), 'good')}
-        ${row('Misses', fmt(r.read_misses), (r.read_misses ?? 0) > 0 ? 'warn' : '')}
-        ${row('Hit Ratio', ratioPct(r.read_hit_ratio), ratioCls(r.read_hit_ratio, 0.8))}
-        ${row('Scans', fmt(r.scans))}
-        ${row('Scan Rows', fmt(r.scan_rows))}
+        ${row('Reads', fmt(r.reads), '', 'User-facing point reads (GET by key) since startup.')}
+        ${row('Hits', fmt(r.read_hits), 'good', 'Reads that found a live value.')}
+        ${row('Misses', fmt(r.read_misses), (r.read_misses ?? 0) > 0 ? 'warn' : '', 'Reads that found nothing — absent or tombstoned key.')}
+        ${row('Hit Ratio', ratioPct(r.read_hit_ratio), ratioCls(r.read_hit_ratio, 0.8), 'Hits / Reads.')}
+        ${row('Scans', fmt(r.scans), '', 'Multi-key scans (range / prefix) executed.')}
+        ${row('Scan Rows', fmt(r.scan_rows), '', 'Total rows returned across all scans.')}
       </div>
 
       <div class="admin-card">
-        <div class="admin-card-title">LSM LOOKUPS</div>
+        <div class="admin-card-title" title="Internal LSM-tree probes behind the read path. In-memory, reset on restart.">LSM LOOKUPS</div>
         ${bar(l.fast_path_hit_ratio, `${ratioPct(l.fast_path_hit_ratio)} fast-path`)}
-        ${row('Lookups', fmt(l.lookups))}
-        ${row('Fast-path Hits', fmt(l.fast_path_hits), 'good')}
-        ${row('Fast-path Ratio', ratioPct(l.fast_path_hit_ratio), ratioCls(l.fast_path_hit_ratio, 0.5))}
-        ${row('L0 Probes', fmt(l.l0_probes))}
-        ${row('L1 Probes', fmt(l.l1_probes))}
-        ${row('Bloom Rejects', fmt(l.bloom_rejects))}
+        ${row('Lookups', fmt(l.lookups), '', 'LSM point lookups. ≥ Reads — also counts GC-validation reads and WAL-replay probes (so it jumps after a restart).')}
+        ${row('Fast-path Hits', fmt(l.fast_path_hits), 'good', 'Lookups served by the active memtable without scanning lower layers.')}
+        ${row('Fast-path Ratio', ratioPct(l.fast_path_hit_ratio), ratioCls(l.fast_path_hit_ratio, 0.5), 'Fast-path Hits / Lookups.')}
+        ${row('L0 Probes', fmt(l.l0_probes), '', 'Lookups that scanned at least one L0 SSTable.')}
+        ${row('L1 Probes', fmt(l.l1_probes), '', 'Lookups that scanned the L1 SSTable (not rejected by the bloom filter).')}
+        ${row('Bloom Rejects', fmt(l.bloom_rejects), '', 'L1 lookups short-circuited by the bloom filter ("definitely absent") — work avoided.')}
       </div>
 
       <div class="admin-card">
-        <div class="admin-card-title">WRITES</div>
-        ${row('Puts', fmt(w.puts))}
-        ${row('Deletes', fmt(w.deletes))}
-        ${row('No-WAL Puts', fmt(w.no_wal_puts))}
-        ${row('WAL Appended', fmtBytes(w.wal_bytes_appended))}
-        ${row('WAL Fsyncs', fmt(w.wal_fsyncs))}
-        ${row('Apply Failures', fmt(w.apply_failures), apFailCls)}
+        <div class="admin-card-title" title="Write path throughput and durability cost. In-memory, reset on restart.">WRITES</div>
+        ${row('Puts', fmt(w.puts), '', 'WAL-backed upserts applied.')}
+        ${row('Deletes', fmt(w.deletes), '', 'WAL-backed deletes applied.')}
+        ${row('No-WAL Puts', fmt(w.no_wal_puts), '', 'Upserts written bypassing the WAL (skip_wal path — e.g. vector payloads, query-embedding cache).')}
+        ${row('No-WAL Deletes', fmt(w.no_wal_deletes), '', 'Deletes written bypassing the WAL (skip_wal path — e.g. query-embedding cache populate/clear).')}
+        ${row('WAL Appended', fmtBytes(w.wal_bytes_appended), '', 'Total bytes appended to the WAL.')}
+        ${row('WAL Fsyncs', fmt(w.wal_fsyncs), '', 'WAL fsyncs — one per WAL-backed write. The durability cost of writes.')}
+        ${row('Apply Failures', fmt(w.apply_failures), apFailCls, 'In-memory applies that failed after retry. Data is still durable in the WAL.')}
       </div>
 
       <div class="admin-card">
-        <div class="admin-card-title">COMPACTION</div>
-        ${row('Memtable Flushes', fmt(c.memtable_flushes))}
-        ${row('L0→L1 Compactions', fmt(c.l0_l1_compactions))}
-        ${row('Bytes Merged', fmtBytes(c.compaction_bytes_merged))}
-        ${row('Duration', fmtMillis(c.compaction_duration_ms))}
+        <div class="admin-card-title" title="LSM memtable flushes and level compactions. In-memory, reset on restart.">COMPACTION</div>
+        ${row('Memtable Flushes', fmt(c.memtable_flushes), '', 'Memtable → L0 SSTable flushes.')}
+        ${row('L0→L1 Compactions', fmt(c.l0_l1_compactions), '', 'L0 → L1 compactions run.')}
+        ${row('Bytes Merged', fmtBytes(c.compaction_bytes_merged), '', 'Total bytes merged during compactions.')}
+        ${row('Duration', fmtMillis(c.compaction_duration_ms), '', 'Cumulative time spent compacting.')}
       </div>
 
       <div class="admin-card">
-        <div class="admin-card-title">GARBAGE COLLECTION</div>
-        ${row('VLog GC Runs', fmt(g.vlog_gc_runs))}
-        ${row('VLog GC Duration', fmtMillis(g.vlog_gc_duration_ms))}
-        ${row('WAL GC Runs', fmt(g.wal_gc_runs))}
-        ${row('WAL Segments Deleted', fmt(g.wal_segments_deleted))}
+        <div class="admin-card-title" title="Value-log and WAL space reclamation. In-memory, reset on restart.">GARBAGE COLLECTION</div>
+        ${row('VLog GC Runs', fmt(g.vlog_gc_runs), '', 'Value-log GC passes run.')}
+        ${row('VLog GC Duration', fmtMillis(g.vlog_gc_duration_ms), '', 'Cumulative value-log GC time.')}
+        ${perNs
+          ? `<div class="stat-row text-muted" style="font-size:12px"><span>WAL GC is engine-global — see the engine-wide panel.</span></div>`
+          : `${row('WAL GC Runs', fmt(g.wal_gc_runs), '', 'WAL GC passes run.')}
+        ${row('WAL Segments Deleted', fmt(g.wal_segments_deleted), '', 'WAL segments reclaimed by GC.')}`}
       </div>
 
-      <div class="admin-card">
+      ${perNs ? '' : `<div class="admin-card">
         <div class="admin-card-title">UPTIME</div>
-        ${row('Since Startup', fmtUptime(m.uptime_s))}
-      </div>
+        ${row('Since Startup', fmtUptime(m.uptime_s), '', 'Seconds since the server process started.')}
+      </div>`}
     </div>
   `;
 }
@@ -2179,10 +2286,9 @@ async function loadStorageStats() {
   const area = document.getElementById('admin-storage-stats');
   if (!area) return;
   try {
-    const [h, s, w, sys, lsmArr, vlogArr, wasteRes] = await Promise.all([
+    const [h, s, w, sys, lsmArr, vlogArr] = await Promise.all([
       Api.health(), Api.stats(), Api.wal(), Api.systemStores(), Api.lsm(),
       Api.valueLog().catch(() => null),
-      Api.indexWaste().catch(() => null),
     ]);
     state.adminStats = s; state.adminWal = w;
     state.adminLsm  = Object.fromEntries((lsmArr  ?? []).map(x => [x.namespace, x]));
@@ -2214,40 +2320,40 @@ async function loadStorageStats() {
         </div>
 
         <div class="admin-card">
-          <div class="admin-card-title">STORAGE STATS</div>
-          <div class="stat-row"><span class="stat-key">Live Data</span>
+          <div class="admin-card-title" title="Engine-wide value-log aggregate, recomputed from on-disk state on every request — survives restart.">STORAGE STATS</div>
+          <div class="stat-row"><span class="stat-key" title="Live (non-garbage) bytes in the value log.">Live Data</span>
             <span class="stat-val">${fmtBytes(s.live_bytes)}</span></div>
-          <div class="stat-row"><span class="stat-key">Garbage</span>
+          <div class="stat-row"><span class="stat-key" title="Reclaimable dead bytes across the value log (superseded or deleted records awaiting GC).">Garbage</span>
             <span class="stat-val ${wasteClass}">${fmtBytes(s.garbage_bytes)}</span></div>
-          <div class="stat-row"><span class="stat-key">Waste Ratio</span>
+          <div class="stat-row"><span class="stat-key" title="Dead / total written. High = value-log GC is overdue.">Waste Ratio</span>
             <span class="stat-val ${wasteClass}">${s.waste_ratio_pct.toFixed(1)}%</span></div>
-          <div class="stat-row"><span class="stat-key">Free Space</span>
+          <div class="stat-row"><span class="stat-key" title="Free fraction of the allocated value-log region.">Free Space</span>
             <span class="stat-val">${s.free_space_ratio_pct.toFixed(1)}%</span></div>
-          <div class="stat-row"><span class="stat-key">GC Runs</span>
+          <div class="stat-row"><span class="stat-key" title="Value-log GC passes ever run (persisted in metadata).">GC Runs</span>
             <span class="stat-val">${fmt(s.total_gc_runs)}</span></div>
-          <div class="stat-row"><span class="stat-key">Bytes Reclaimed</span>
+          <div class="stat-row"><span class="stat-key" title="Bytes ever reclaimed by value-log GC (persisted).">Bytes Reclaimed</span>
             <span class="stat-val">${fmtBytes(s.total_bytes_reclaimed)}</span></div>
         </div>
 
         <div class="admin-card">
-          <div class="admin-card-title">WAL</div>
-          <div class="stat-row"><span class="stat-key">Total Entries</span>
+          <div class="admin-card-title" title="Write-ahead log metadata, read from on-disk state — survives restart.">WAL</div>
+          <div class="stat-row"><span class="stat-key" title="Entries currently tracked in the WAL.">Total Entries</span>
             <span class="stat-val">${fmt(w.total_entries)}</span></div>
-          <div class="stat-row"><span class="stat-key">Persisted</span>
+          <div class="stat-row"><span class="stat-key" title="Entries already applied and persisted to the LSM tree.">Persisted</span>
             <span class="stat-val good">${fmt(w.persisted_entries)}</span></div>
-          <div class="stat-row"><span class="stat-key">Pending</span>
+          <div class="stat-row"><span class="stat-key" title="Total − Persisted. Entries that would be replayed on the next open. A large backlog hints at flush lag.">Pending</span>
             <span class="stat-val ${pendClass}">${fmt(w.pending_entries)}</span></div>
-          <div class="stat-row"><span class="stat-key">GC Runs</span>
+          <div class="stat-row"><span class="stat-key" title="WAL GC passes ever run (persisted).">GC Runs</span>
             <span class="stat-val">${fmt(w.total_gc_runs)}</span></div>
-          <div class="stat-row"><span class="stat-key">Bytes Reclaimed</span>
+          <div class="stat-row"><span class="stat-key" title="Bytes ever reclaimed by WAL GC (persisted).">Bytes Reclaimed</span>
             <span class="stat-val">${fmtBytes(w.total_bytes_reclaimed)}</span></div>
           ${w.live_segments != null ? `
-          <div class="stat-row"><span class="stat-key">Live Segments</span>
+          <div class="stat-row"><span class="stat-key" title="Tracked WAL segments still carrying entries (lower segments have been trimmed).">Live Segments</span>
             <span class="stat-val">${fmt(w.live_segments)}${w.base_segment_id != null ? ` <span class="text-muted" style="font-size:11px">from #${fmt(w.base_segment_id)}</span>` : ''}</span></div>` : ''}
           ${w.last_sequence != null ? `
-          <div class="stat-row"><span class="stat-key">Last Sequence</span>
+          <div class="stat-row"><span class="stat-key" title="Highest write sequence number the WAL has observed.">Last Sequence</span>
             <span class="stat-val">${fmt(w.last_sequence)}</span></div>` : ''}
-          <div class="stat-row"><span class="stat-key">Head → Tail</span>
+          <div class="stat-row"><span class="stat-key" title="WAL byte offsets of the live window (start → end).">Head → Tail</span>
             <span class="stat-val" style="font-size:11px">${fmt(w.head)} → ${fmt(w.tail)}</span></div>
         </div>
 
@@ -2283,7 +2389,6 @@ async function loadStorageStats() {
       </div>
 
       ${renderSystemStoresSection(sys)}
-      ${renderIndexWasteSection(wasteRes)}
       ${renderDocStoresSection(state.stores, state.adminLsm, state.adminRowCounts)}
       ${renderKvStoresSection(state.kvStores, state.adminLsm)}
     `;
@@ -2477,10 +2582,10 @@ function renderIndexWasteSection(waste) {
           ${f.over_threshold ? '<span class="badge badge-error">over threshold</span>' : ''}
         </span>
         <span class="sys-store-meta">
-          <span class="stat-key">bitmap</span> ${wasteCell(f.bitmap_waste_ratio)}
-          <span class="stat-key" style="margin-left:12px">keymap</span> ${wasteCell(f.keymap_waste_ratio)}
+          <span class="stat-key" title="Reclaimable fraction of the bitmap blob store (one blob per distinct value, re-appended on every write). Grows with per-document churn.">bitmap</span> ${wasteCell(f.bitmap_waste_ratio)}
+          <span class="stat-key" style="margin-left:12px" title="Reclaimable fraction of the keymap blob store (slot → value). Grows under distinct-value churn.">keymap</span> ${wasteCell(f.keymap_waste_ratio)}
           ${f.distinct_count != null
-            ? `<span class="stat-key" style="margin-left:12px">distinct</span>
+            ? `<span class="stat-key" style="margin-left:12px" title="Distinct indexed values for this field.">distinct</span>
                <span class="stat-val">${fmt(f.distinct_count)}</span>` : ''}
         </span>
       </div>`).join('');
@@ -2532,7 +2637,7 @@ async function toggleKvStoreDetail(ns) {
   detail.innerHTML = '<div class="spinner" style="margin:12px 0"></div>';
 
   try {
-    const m = await Api.kvStoreKvMeta(ns);
+    const m = await Api.storeKvMeta(ns);
     graftStorageMeta(m);
     detail.innerHTML = renderSystemStoreMeta(m);
   } catch (e) {
@@ -2898,19 +3003,23 @@ async function adminCompact() {
   }
 }
 
-async function adminIndexCheckpoint() {
+async function adminIndexCheckpoint(btn) {
   const el = document.getElementById('admin-action-result');
   if (!el) return;
+  if (btn) btn.disabled = true;
   el.innerHTML = '<div class="spinner"></div>';
   try {
-    const r = await Api.indexCheckpoint();
-    el.innerHTML = `<div class="alert alert-success">
-      Index checkpoint complete — ${fmt(r.fields_checkpointed)} field index(es) checkpointed.
-    </div>`;
-    toast('Index checkpoint complete');
+    await Api.indexCheckpoint();
+    const msg = 'Index checkpoint started — the flush and compaction run in the background. '
+      + 'Check the server log file for progress and the checkpointed field count.';
+    el.innerHTML = `<div class="alert alert-success">${msg}</div>`;
+    toast('Index checkpoint started — see log for progress');
     loadStorageStats();
   } catch (e) {
     el.innerHTML = `<div class="alert alert-error">${esc(e.message)}</div>`;
+    toast(`Index checkpoint failed: ${e.message}`, 'error');
+  } finally {
+    if (btn) btn.disabled = false;
   }
 }
 
@@ -2959,12 +3068,9 @@ async function adminImportSchemaFile(input) {
     const text = await file.text();
     let schema;
     try { schema = JSON.parse(text); } catch { throw new Error('Invalid JSON file'); }
-    const isKv = schema.value_type != null;
-    if (isKv) {
-      await Api.importKvStoreSchema(schema);
-    } else {
-      await Api.importStoreSchema(schema);
-    }
+    // The unified import endpoint dispatches on the schema's `store_type`.
+    const isKv = schema.store_type === 'kv' || (schema.store_type == null && schema.value_type != null);
+    await Api.importStoreSchema(schema);
     const storeKind = isKv ? 'KV store' : 'store';
     if (el) el.innerHTML = `<div class="alert alert-success">Schema imported — ${storeKind} '${esc(schema.namespace ?? file.name)}' created</div>`;
     toast(`Schema imported from ${file.name}`);
@@ -2977,7 +3083,8 @@ async function adminImportSchemaFile(input) {
 
 async function adminExportKvSchema(ns) {
   try {
-    const blob = await Api.exportKvSchema(ns);
+    // Unified export resolves the kind from the stored schema.
+    const blob = await Api.exportSchema(ns);
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
     a.download = `${ns}-kv-schema.json`;
@@ -3013,40 +3120,51 @@ async function loadAdminIndexPanel() {
               title="Scan all vector-indexed namespaces and re-enqueue any documents missing a vector entry">⚡ Reconcile Vector Index</button>
     </div>
     <div id="admin-index-action-result"></div>
-    <div id="admin-index-stats"><div class="spinner"></div></div>
-    <div id="admin-index-queue-browser" style="margin-top:4px">
-      ${renderVqBrowserHtml()}
+    <div id="admin-index-builds"></div>
+    <div class="index-frame">
+      <div class="index-frame-title">VECTOR INDEX</div>
+      <div id="admin-index-vector-stats"><div class="spinner"></div></div>
+      <div id="admin-index-queue-browser">
+        ${renderVqBrowserHtml()}
+      </div>
     </div>
+    <div id="admin-index-waste"></div>
+    <div id="admin-index-operations"></div>
   `;
   await adminIndexRefresh();
 }
 
 async function adminIndexRefresh() {
-  const area = document.getElementById('admin-index-stats');
-  if (!area) return;
-  area.innerHTML = '<div class="spinner"></div>';
+  const builds  = document.getElementById('admin-index-builds');
+  const vstats  = document.getElementById('admin-index-vector-stats');
+  const waste   = document.getElementById('admin-index-waste');
+  const ops     = document.getElementById('admin-index-operations');
+  if (!vstats) return;
+  vstats.innerHTML = '<div class="spinner"></div>';
   try {
-    const [progress, summary, corruption] = await Promise.all([
+    const [progress, summary, corruption, wasteRes] = await Promise.all([
       Api.indicesProgress(),
       Api.vectorQueueSummary(),
       Api.vectorCorruptionMetrics().catch(() => null),
+      Api.indexWaste().catch(() => null),
     ]);
     vqState.maxRetries = summary?.max_retries_configured ?? 0;
-    area.innerHTML = renderIndexStatsHtml(progress, summary, corruption);
+    // Attribute (field) builds sit above the frame; vector stats fill the
+    // frame; field-index waste and index operations go below. The queue
+    // browser is a persistent child of the frame and is not re-rendered
+    // here so its results survive.
+    if (builds) builds.innerHTML = renderAttributeBuildsSection(progress?.attribute_builds ?? []);
+    vstats.innerHTML = `
+      ${renderVectorProgressSection(progress?.vector_progress ?? [])}
+      ${renderVectorQueueSummarySection(summary)}
+      ${renderVectorCorruptionSection(corruption)}
+    `;
+    if (waste) waste.innerHTML = renderIndexWasteSection(wasteRes);
+    if (ops) ops.innerHTML = renderNamespaceControlsSection(summary?.by_namespace ?? []);
     refreshVqNsSelect(summary?.by_namespace ?? []);
   } catch (e) {
-    area.innerHTML = `<div class="alert alert-error">Failed to load index data: ${esc(e.message)}</div>`;
+    vstats.innerHTML = `<div class="alert alert-error">Failed to load index data: ${esc(e.message)}</div>`;
   }
-}
-
-function renderIndexStatsHtml(progress, summary, corruption) {
-  return `
-    ${renderAttributeBuildsSection(progress?.attribute_builds ?? [])}
-    ${renderVectorProgressSection(progress?.vector_progress ?? [])}
-    ${renderVectorQueueSummarySection(summary)}
-    ${renderVectorCorruptionSection(corruption)}
-    ${renderNamespaceControlsSection(summary?.by_namespace ?? [])}
-  `;
 }
 
 function renderAttributeBuildsSection(builds) {
@@ -3147,15 +3265,15 @@ function renderVectorQueueSummarySection(summary) {
       </div>
       <div class="admin-grid" style="max-width:480px">
         <div class="admin-card">
-          <div class="stat-row"><span class="stat-key">Max Retries</span>
+          <div class="stat-row"><span class="stat-key" title="Max embedding attempts per queue entry before it becomes exhausted (vector_index.max_retries config).">Max Retries</span>
             <span class="stat-val">${maxRetries}</span></div>
-          <div class="stat-row"><span class="stat-key">Total Pending</span>
+          <div class="stat-row"><span class="stat-key" title="Documents enqueued and awaiting embedding across all namespaces (actionable + retrying + exhausted).">Total Pending</span>
             <span class="stat-val ${pendingClass}">${fmt(totalPending)}</span></div>
-          <div class="stat-row"><span class="stat-key">Actionable</span>
+          <div class="stat-row"><span class="stat-key" title="Entries the worker will process now — not yet failed, or past their retry back-off.">Actionable</span>
             <span class="stat-val">${fmt(totalActionable)}</span></div>
-          <div class="stat-row"><span class="stat-key">Retrying</span>
+          <div class="stat-row"><span class="stat-key" title="Entries that failed at least once but are still within the retry budget (waiting out back-off).">Retrying</span>
             <span class="stat-val ${retryingClass}">${fmt(totalRetrying)}</span></div>
-          <div class="stat-row"><span class="stat-key">Exhausted</span>
+          <div class="stat-row"><span class="stat-key" title="Entries that spent their retry budget — stuck until manually reset (Retry Failed) or removed.">Exhausted</span>
             <span class="stat-val ${exhaustedClass}">${fmt(totalExhausted)}</span></div>
         </div>
       </div>
@@ -3166,32 +3284,62 @@ function renderVectorQueueSummarySection(summary) {
 // ── Vector index corruption metrics ──────────────────────────────────────────
 // Process-wide, monotonic since startup. A non-zero/rising value means stored
 // vectors are corrupt and are being skipped at query time — reindex to repair.
+// Shape: { "<namespace>": { sparse, dense, total }, ... } (per-namespace snapshot).
 function renderVectorCorruptionSection(metrics) {
   if (!metrics) return '';
-  const total  = metrics.total_corrupt_skipped  ?? 0;
-  const sparse = metrics.sparse_corrupt_skipped ?? 0;
-  const dense  = metrics.dense_corrupt_skipped  ?? 0;
-  const totalClass = total > 0 ? 'bad' : 'good';
+
+  // Sort by total skipped (worst first), then namespace name.
+  const entries = Object.entries(metrics)
+    .map(([ns, m]) => ({
+      ns,
+      sparse: m?.sparse ?? 0,
+      dense:  m?.dense  ?? 0,
+      total:  m?.total  ?? 0,
+    }))
+    .sort((a, b) => b.total - a.total || a.ns.localeCompare(b.ns));
+
+  const grandTotal  = entries.reduce((n, e) => n + e.total,  0);
+  const grandSparse = entries.reduce((n, e) => n + e.sparse, 0);
+  const grandDense  = entries.reduce((n, e) => n + e.dense,  0);
+
+  const rows = entries.length
+    ? entries.map(e => `
+        <tr>
+          <td class="text-mono">${esc(e.ns)}</td>
+          <td><span class="stat-val ${e.sparse > 0 ? 'warn' : ''}">${fmt(e.sparse)}</span></td>
+          <td><span class="stat-val ${e.dense  > 0 ? 'warn' : ''}">${fmt(e.dense)}</span></td>
+          <td><span class="stat-val ${e.total  > 0 ? 'bad'  : 'good'}">${fmt(e.total)}</span></td>
+        </tr>`).join('')
+    : `<tr><td colspan="4" class="text-muted" style="padding:14px 12px">No namespaces with vector indices</td></tr>`;
 
   return `
     <div class="section">
       <div class="section-header">
-        <span class="section-title">VECTOR INDEX CORRUPTION</span>
+        <span class="section-title">VECTOR INDEX CORRUPTION METRICS</span>
         <span class="text-muted" style="font-size:12px">
-          entries skipped on read since startup${total > 0
+          entries skipped on read since startup${grandTotal > 0
             ? ' · <span class="stat-val bad">corrupt vectors present</span> — reindex affected namespaces'
             : ' · no corruption detected'}
         </span>
       </div>
-      <div class="admin-grid" style="max-width:480px">
-        <div class="admin-card">
-          <div class="stat-row"><span class="stat-key">Total Skipped</span>
-            <span class="stat-val ${totalClass}">${fmt(total)}</span></div>
-          <div class="stat-row"><span class="stat-key">Sparse (Pass-1)</span>
-            <span class="stat-val ${sparse > 0 ? 'warn' : ''}">${fmt(sparse)}</span></div>
-          <div class="stat-row"><span class="stat-key">Dense (Pass-2)</span>
-            <span class="stat-val ${dense > 0 ? 'warn' : ''}">${fmt(dense)}</span></div>
-        </div>
+      <div class="tbl-wrap">
+        <table class="tbl ns-ops-tbl">
+          <colgroup><col class="ns-ops-col-ns"><col><col><col></colgroup>
+          <thead><tr>
+            <th>Namespace</th>
+            <th title="Sparse-vector entries (search Pass 1) skipped because their stored bytes failed to deserialize.">Sparse (Pass-1)</th>
+            <th title="Dense-vector entries (search Pass 2) skipped because their stored bytes failed to deserialize.">Dense (Pass-2)</th>
+            <th title="Total entries skipped on read since startup (in-memory, resets on restart). Rising = stored vectors are corrupt and queries are silently degraded — run a validating Reconcile.">Total Skipped</th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+          ${entries.length > 1 ? `
+          <tfoot><tr>
+            <td class="text-mono"><strong>All namespaces</strong></td>
+            <td><span class="stat-val ${grandSparse > 0 ? 'warn' : ''}">${fmt(grandSparse)}</span></td>
+            <td><span class="stat-val ${grandDense  > 0 ? 'warn' : ''}">${fmt(grandDense)}</span></td>
+            <td><span class="stat-val ${grandTotal  > 0 ? 'bad'  : 'good'}">${fmt(grandTotal)}</span></td>
+          </tr></tfoot>` : ''}
+        </table>
       </div>
     </div>
   `;
@@ -3210,31 +3358,32 @@ function renderNamespaceControlsSection(byNs) {
 
   if (relevantStores.length === 0) return `
     <div class="section">
-      <div class="section-header"><span class="section-title">NAMESPACE OPERATIONS</span></div>
+      <div class="section-header"><span class="section-title">INDEX OPERATIONS</span></div>
       <div class="text-muted" style="padding:8px 0">No stores with field indices or semantic search</div>
     </div>
   `;
 
-  // Emit one row per index type so buttons align with the index they operate on.
-  const rows = relevantStores.flatMap(s => {
+  // Split by index type so each sub-tab holds a homogeneous, well-aligned table.
+  const fieldRows = [];
+  const vectorRows = [];
+
+  relevantStores.forEach(s => {
     const ns         = s.namespace;
     const qStats     = byNsMap[ns];
     const hasIndices = s.storeType === 'doc' && (s.indices?.length ?? 0) > 0;
     const hasVector  = !!s.semantic_search_enabled;
     const pending    = qStats?.pending   ?? 0;
     const exhausted  = qStats?.exhausted ?? 0;
-    const result     = [];
 
     if (hasIndices) {
       const indicesHtml = s.indices.map(ix =>
         `<span class="badge badge-attr" style="margin-right:2px">${esc(ix.field)} <span style="opacity:.6">${esc(ix.index_type)}</span></span>`
       ).join('');
-      result.push(`
+      fieldRows.push(`
         <tr>
           <td class="text-mono">${esc(ns)}</td>
-          <td><span class="badge badge-indexed">Attribute</span></td>
           <td>${indicesHtml}</td>
-          <td class="gap-8" style="white-space:nowrap">
+          <td class="ns-ops-actions gap-8">
             <button class="btn btn-xs btn-ghost" onclick="toggleFieldBlobStats('${esc(ns)}',this)"
                     title="On-disk blob growth/waste per field (complements fleet-wide Field Index Waste)">Blob Stats ▾</button>
             <button class="btn btn-xs btn-ghost" onclick="showReindexDocFieldModal('${esc(ns)}')"
@@ -3246,7 +3395,7 @@ function renderNamespaceControlsSection(byNs) {
           </td>
         </tr>
         <tr id="blob-row-${esc(ns)}" style="display:none">
-          <td colspan="4" id="blob-cell-${esc(ns)}" style="padding:0"></td>
+          <td colspan="3" id="blob-cell-${esc(ns)}" style="padding:0"></td>
         </tr>`);
     }
 
@@ -3257,12 +3406,11 @@ function renderNamespaceControlsSection(byNs) {
             pending   > 0 ? `<span class="stat-val warn" style="font-size:11px">${fmt(pending)} pending</span>`     : '',
             exhausted > 0 ? `<span class="stat-val bad"  style="font-size:11px">${fmt(exhausted)} exhausted</span>` : '',
           ].filter(Boolean).join(' ');
-      result.push(`
+      vectorRows.push(`
         <tr>
           <td class="text-mono">${esc(ns)}</td>
-          <td><span class="badge badge-vec_f32">Vector Semantic</span></td>
           <td>${queueDepthHtml}</td>
-          <td class="gap-8" style="white-space:nowrap">
+          <td class="ns-ops-actions gap-8">
             <button class="btn btn-xs btn-ghost" onclick="showReindexDocVectorModal('${esc(ns)}')"
                     title="Re-enqueue a single document for embedding">Reindex Doc…</button>
             <button class="btn btn-xs btn-ghost" onclick="adminVectorReindexAll('${esc(ns)}',this)"
@@ -3276,25 +3424,68 @@ function renderNamespaceControlsSection(byNs) {
           </td>
         </tr>`);
     }
-
-    return result;
   });
+
+  const activeTab = state.nsOpsTab === 'vector' && vectorRows.length ? 'vector'
+                  : state.nsOpsTab === 'field'  && fieldRows.length  ? 'field'
+                  : fieldRows.length ? 'field' : 'vector';
+
+  const emptyRow = (cols, msg) =>
+    `<tr><td colspan="${cols}" class="text-muted" style="padding:14px 12px">${msg}</td></tr>`;
+
+  const fieldTable = `
+    <div class="tbl-wrap">
+      <table class="tbl ns-ops-tbl">
+        <colgroup>
+          <col class="ns-ops-col-ns"><col><col class="ns-ops-col-actions">
+        </colgroup>
+        <thead><tr>
+          <th>Namespace</th><th>Indexed Fields</th><th>Operations</th>
+        </tr></thead>
+        <tbody>${fieldRows.join('') || emptyRow(3, 'No stores with field indices')}</tbody>
+      </table>
+    </div>`;
+
+  const vectorTable = `
+    <div class="tbl-wrap">
+      <table class="tbl ns-ops-tbl">
+        <colgroup>
+          <col class="ns-ops-col-ns"><col><col class="ns-ops-col-actions">
+        </colgroup>
+        <thead><tr>
+          <th>Namespace</th>
+          <th title="Embedding queue backlog for this namespace — pending (awaiting embedding) and exhausted (gave up after max retries) counts. 'idle' means the queue is empty.">Queue Depth</th>
+          <th>Operations</th>
+        </tr></thead>
+        <tbody>${vectorRows.join('') || emptyRow(3, 'No stores with semantic search enabled')}</tbody>
+      </table>
+    </div>`;
 
   return `
     <div class="section">
       <div class="section-header">
-        <span class="section-title">NAMESPACE OPERATIONS (${relevantStores.length})</span>
+        <span class="section-title">INDEX OPERATIONS (${relevantStores.length})</span>
       </div>
-      <div class="tbl-wrap">
-        <table class="tbl">
-          <thead><tr>
-            <th>Namespace</th><th>Index Type</th><th>Details</th><th>Operations</th>
-          </tr></thead>
-          <tbody>${rows.join('')}</tbody>
-        </table>
+      <div class="sub-tab-nav">
+        <button class="sub-tab-btn ${activeTab === 'field' ? 'active' : ''}"
+                data-nsops-tab="field" onclick="switchNsOpsTab('field')">Field Indices (${fieldRows.length})</button>
+        <button class="sub-tab-btn ${activeTab === 'vector' ? 'active' : ''}"
+                data-nsops-tab="vector" onclick="switchNsOpsTab('vector')">Vector Semantic (${vectorRows.length})</button>
       </div>
+      <div id="nsops-field-panel" class="sub-panel ${activeTab === 'field' ? 'active' : ''}">${fieldTable}</div>
+      <div id="nsops-vector-panel" class="sub-panel ${activeTab === 'vector' ? 'active' : ''}">${vectorTable}</div>
     </div>
   `;
+}
+
+function switchNsOpsTab(tab) {
+  state.nsOpsTab = tab;
+  document.querySelectorAll('[data-nsops-tab]').forEach(b =>
+    b.classList.toggle('active', b.dataset.nsopsTab === tab));
+  ['field', 'vector'].forEach(t => {
+    const p = document.getElementById(`nsops-${t}-panel`);
+    if (p) p.classList.toggle('active', t === tab);
+  });
 }
 
 function renderVqBrowserHtml() {
@@ -3355,13 +3546,11 @@ async function adminVectorReconcile(btn) {
   btn.disabled = true;
   if (el) el.innerHTML = '<div class="spinner"></div>';
   try {
-    const result = await Api.vectorReconcile();
-    const n = result?.reenqueued ?? 0;
-    const msg = n === 0
-      ? 'Vector index reconcile complete — all documents are already indexed'
-      : `Vector index reconcile complete — ${fmt(n)} document${n === 1 ? '' : 's'} re-enqueued for embedding`;
+    await Api.vectorReconcile();
+    const msg = 'Vector index reconcile started — it runs in the background. '
+      + 'Check the server log file for progress, the re-enqueued count, and any errors.';
     if (el) el.innerHTML = `<div class="alert alert-success">${msg}</div>`;
-    toast(`Reconcile complete (${fmt(n)} re-enqueued)`);
+    toast('Reconcile started — see log for progress');
     await adminIndexRefresh();
   } catch (e) {
     if (el) el.innerHTML = `<div class="alert alert-error">${esc(e.message)}</div>`;
@@ -3774,5 +3963,16 @@ document.addEventListener('keydown', (e) => {
     if (!container) continue;
     const btn = container.querySelector('.btn-accent:not([disabled])');
     if (btn) { btn.click(); e.preventDefault(); return; }
+  }
+});
+
+// ── Esc-key dismiss ───────────────────────────────────────────────────────────
+// Any pop-up (incl. query-result payload views) shares the #modal overlay, so a
+// single handler dismisses whichever one is open.
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  if (document.getElementById('modal')?.classList.contains('open')) {
+    closeModal();
+    e.preventDefault();
   }
 });
