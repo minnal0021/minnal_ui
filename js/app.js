@@ -2738,6 +2738,19 @@ function lsmCompactionBadge(lsm) {
     ? '<span class="badge badge-indexed">⚙ compacting</span>' : '';
 }
 
+// Unique DOM id per LSM card so the per-level shard tabs of multiple cards on the
+// same page (system store + companion stores, etc.) don't collide.
+let lsmCardSeq = 0;
+
+// Switch the active level tab inside a single LSM card. Scoped by data-lsm-card so
+// other LSM cards' tabs are untouched.
+function switchLsmLevel(cardId, idx) {
+  document.querySelectorAll(`.lsm-lvl-tab[data-lsm-card="${cardId}"]`).forEach(b =>
+    b.classList.toggle('active', Number(b.dataset.lsmIdx) === idx));
+  document.querySelectorAll(`.lsm-lvl-panel[data-lsm-card="${cardId}"]`).forEach(p =>
+    p.classList.toggle('active', Number(p.dataset.lsmIdx) === idx));
+}
+
 function renderLsmCard(lsm) {
   if (!lsm) return `
     <div class="admin-card" style="flex:1">
@@ -2772,16 +2785,50 @@ function renderLsmCard(lsm) {
       <div class="stat-row"><span class="stat-key">Created</span>
         <span class="stat-val" style="font-size:11px">${new Date(lsm.created_at_ms).toLocaleString()}</span></div>
       ${inMemoryHtml}
-      ${lsm.levels.map(lvl => `
-        <div style="margin-top:8px">
-          <div class="admin-card-title" style="margin-bottom:4px">LEVEL ${lvl.level}</div>
-          <div class="stat-row"><span class="stat-key">Buckets</span>
-            <span class="stat-val">${lvl.bucket_count}</span></div>
-          <div class="stat-row"><span class="stat-key">Entries</span>
-            <span class="stat-val">${fmt(lvl.total_entries)}</span></div>
-        </div>
-      `).join('')}
+      ${renderLsmLevelTabs(lsm.levels)}
     </div>`;
+}
+
+// Per-level (L0 / L1 / …) shard breakdown. Each level's buckets are the SSTable
+// shards the manifest tracks; the /admin/storage LSM payload carries them but the
+// summary card used to drop everything below the level aggregate. Stacked as tabs
+// so a wide bucket count doesn't blow up the card height.
+function renderLsmLevelTabs(levels) {
+  levels = levels ?? [];
+  if (!levels.length) return '';
+  const cardId = `lsm-card-${++lsmCardSeq}`;
+
+  const tabs = levels.map((lvl, i) => `
+    <button class="lsm-lvl-tab ${i === 0 ? 'active' : ''}"
+            data-lsm-card="${cardId}" data-lsm-idx="${i}"
+            onclick="switchLsmLevel('${cardId}', ${i})"
+            title="${lvl.bucket_count} shard(s), ${fmt(lvl.total_entries)} entries">L${lvl.level} · ${lvl.bucket_count}</button>
+  `).join('');
+
+  const panels = levels.map((lvl, i) => {
+    const buckets = lvl.buckets ?? [];
+    const rows = buckets.length ? buckets.map(b => {
+      const files = b.files ?? [];
+      const size = files.reduce((a, f) => a + (f.size_bytes || 0), 0);
+      const fc = b.file_count ?? files.length;
+      return `
+        <div class="stat-row" title="${fc} SSTable file(s), ${fmtBytes(size)} on disk">
+          <span class="stat-key">Shard ${b.bucket}</span>
+          <span class="stat-val">${fmt(b.total_entries)} entries</span>
+          <span class="stat-val" style="margin-left:8px">${fmtBytes(size)}</span>
+          <span class="stat-val text-muted" style="margin-left:8px;font-size:11px">${fc} file${fc === 1 ? '' : 's'}</span>
+        </div>`;
+    }).join('') : '<div class="text-muted" style="font-size:11px;padding:4px 0">No shards at this level</div>';
+    return `
+      <div class="lsm-lvl-panel ${i === 0 ? 'active' : ''}" data-lsm-card="${cardId}" data-lsm-idx="${i}">
+        ${rows}
+      </div>`;
+  }).join('');
+
+  return `
+    <div class="admin-card-title" style="margin-top:10px;margin-bottom:6px">SHARDS BY LEVEL</div>
+    <div class="lsm-lvl-tabs">${tabs}</div>
+    ${panels}`;
 }
 
 function renderVlogCard(vlog) {

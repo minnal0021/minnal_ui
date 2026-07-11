@@ -334,6 +334,19 @@ select { cursor: pointer; }
 .sub-panel { display: none; }
 .sub-panel.active { display: block; }
 
+/* Compact per-level (L0/L1) shard tabs inside an LSM card. */
+.lsm-lvl-tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+.lsm-lvl-tab {
+  padding: 2px 10px; border-radius: 99px; border: 1px solid var(--border);
+  background: none; color: var(--text-2); font-size: 11px; font-weight: 600;
+  font-family: monospace; cursor: pointer; transition: all .15s;
+}
+.lsm-lvl-tab:hover  { background: var(--bg-hover); color: var(--text); }
+.lsm-lvl-tab.active { background: var(--accent-dim); color: var(--accent);
+                      border-color: var(--accent); }
+.lsm-lvl-panel { display: none; }
+.lsm-lvl-panel.active { display: block; }
+
 /* Ops-metrics engine-wide / per-namespace panels shown side by side. */
 .ops-metrics-cols {
   display: grid;
