@@ -2261,6 +2261,11 @@ function renderOpsMetricsHtml(m, opts = {}) {
         <div class="admin-card-title" title="Value-log and WAL space reclamation. In-memory, reset on restart.">GARBAGE COLLECTION</div>
         ${row('VLog GC Runs', fmt(g.vlog_gc_runs), '', 'Value-log GC passes run.')}
         ${row('VLog GC Duration', fmtMillis(g.vlog_gc_duration_ms), '', 'Cumulative value-log GC time.')}
+        ${row('VLog Segments Reclaimed', fmt(g.vlog_segments_reclaimed), '', 'Value-log segment files unlinked whole by GC.')}
+        ${row('VLog Bytes Reclaimed', fmtBytes(g.vlog_gc_bytes_reclaimed), '', 'Bytes handed back to the filesystem by unlinking those segments.')}
+        ${row('VLog Bytes Rewritten', fmtBytes(g.vlog_gc_bytes_rewritten), '', 'Bytes of survivors GC rewrote to relocate them out of the segments it collected — the cost of the work.')}
+        ${row('VLog Write Amp', fmtWriteAmp(g.vlog_gc_write_amplification), writeAmpClass(g.vlog_gc_write_amplification),
+              'Rewritten / reclaimed. Well below 1× is healthy — GC frees far more than it rewrites. Above 1× it is relocating more data than it frees (the segments it picks are mostly survivors); page_gc_threshold is the knob. Blank until GC has reclaimed anything.')}
         ${perNs
           ? `<div class="stat-row text-muted" style="font-size:12px"><span>WAL GC is engine-global — see the engine-wide panel.</span></div>`
           : `${row('WAL GC Runs', fmt(g.wal_gc_runs), '', 'WAL GC passes run.')}
@@ -2280,6 +2285,49 @@ function fmtMillis(ms) {
   if (ms < 1000)        return `${fmt(ms)} ms`;
   if (ms < 60000)       return `${(ms / 1000).toFixed(2)} s`;
   return `${Math.floor(ms / 60000)}m ${Math.round((ms % 60000) / 1000)}s`;
+}
+
+// GC write amplification: bytes rewritten per byte reclaimed. Null until GC has
+// reclaimed anything, so it stays blank rather than reading as a healthy 0×.
+function fmtWriteAmp(x) {
+  return x == null ? '—' : `${x.toFixed(2)}×`;
+}
+
+// At 1× GC rewrites as much as it frees — it is treading water. Flag before that.
+function writeAmpClass(x) {
+  if (x == null) return '';
+  return x >= 1 ? 'bad' : x >= 0.5 ? 'warn' : 'good';
+}
+
+// The WAL is a sequence of segment files. Expandable, like value-log shards: each
+// row is one segment file and its entry backlog. Pending entries are what a restart
+// would replay, so a segment carrying pending entries is one the LSM has not caught
+// up with yet; fully-persisted segments below the live window are what WAL GC unlinks.
+function renderWalSegments(segments) {
+  segments = segments ?? [];
+  if (!segments.length) return '';
+
+  const rows = segments.map(s => {
+    const pc = s.pending_entries > 0 ? 'warn' : 'good';
+    return `
+      <div class="vlog-seg" title="${fmt(s.total_entries)} entries — ${fmt(s.persisted_entries)} persisted to the LSM, ${fmt(s.pending_entries)} would be replayed on the next open">
+        <span class="vlog-seg-id">seg ${fmt(s.segment_id)}</span>
+        <span class="stat-val">${fmt(s.total_entries)} entries</span>
+        <span class="stat-val good">${fmt(s.persisted_entries)} persisted</span>
+        <span class="stat-val ${pc}">${fmt(s.pending_entries)} pending</span>
+      </div>`;
+  }).join('');
+
+  return `
+    <div style="margin-top:8px">
+      <div class="vlog-shard-head" onclick="toggleVlogShard('wal-segs', this)"
+           title="Every WAL segment file currently tracked.">
+        <span class="vlog-caret">▸</span>
+        <span class="stat-key">Segments</span>
+        <span class="stat-val">${fmt(segments.length)} file${segments.length === 1 ? '' : 's'}</span>
+      </div>
+      <div class="vlog-seg-list" id="wal-segs" style="display:none">${rows}</div>
+    </div>`;
 }
 
 async function loadStorageStats() {
@@ -2320,15 +2368,19 @@ async function loadStorageStats() {
         </div>
 
         <div class="admin-card">
-          <div class="admin-card-title" title="Engine-wide value-log aggregate, recomputed from on-disk state on every request — survives restart.">STORAGE STATS</div>
+          <div class="admin-card-title" title="Value-log aggregate across every namespace, recomputed from on-disk state on every request — survives restart.">STORAGE STATS</div>
           <div class="stat-row"><span class="stat-key" title="Live (non-garbage) bytes in the value log.">Live Data</span>
             <span class="stat-val">${fmtBytes(s.live_bytes)}</span></div>
           <div class="stat-row"><span class="stat-key" title="Reclaimable dead bytes across the value log (superseded or deleted records awaiting GC).">Garbage</span>
             <span class="stat-val ${wasteClass}">${fmtBytes(s.garbage_bytes)}</span></div>
           <div class="stat-row"><span class="stat-key" title="Dead / total written. High = value-log GC is overdue.">Waste Ratio</span>
             <span class="stat-val ${wasteClass}">${s.waste_ratio_pct.toFixed(1)}%</span></div>
-          <div class="stat-row"><span class="stat-key" title="Free fraction of the allocated value-log region.">Free Space</span>
-            <span class="stat-val">${s.free_space_ratio_pct.toFixed(1)}%</span></div>
+          ${s.segment_count != null ? `
+          <div class="stat-row"><span class="stat-key" title="Value-log segment files on disk across every namespace.">Segment Files</span>
+            <span class="stat-val">${fmt(s.segment_count)}${s.namespaces != null ? ` <span class="text-muted" style="font-size:11px">across ${fmt(s.namespaces)} ns</span>` : ''}</span></div>` : ''}
+          ${s.disk_bytes != null ? `
+          <div class="stat-row"><span class="stat-key" title="Bytes those segment files occupy on disk.">On-disk</span>
+            <span class="stat-val">${fmtBytes(s.disk_bytes)}</span></div>` : ''}
           <div class="stat-row"><span class="stat-key" title="Value-log GC passes ever run (persisted in metadata).">GC Runs</span>
             <span class="stat-val">${fmt(s.total_gc_runs)}</span></div>
           <div class="stat-row"><span class="stat-key" title="Bytes ever reclaimed by value-log GC (persisted).">Bytes Reclaimed</span>
@@ -2355,6 +2407,7 @@ async function loadStorageStats() {
             <span class="stat-val">${fmt(w.last_sequence)}</span></div>` : ''}
           <div class="stat-row"><span class="stat-key" title="WAL byte offsets of the live window (start → end).">Head → Tail</span>
             <span class="stat-val" style="font-size:11px">${fmt(w.head)} → ${fmt(w.tail)}</span></div>
+          ${renderWalSegments(w.segments)}
         </div>
 
         <div class="admin-card">
@@ -2858,83 +2911,102 @@ function renderVlogCard(vlog) {
           </div>
         </div>
       </div>
-      ${vlog.shards.length > 1 ? `
-        <div class="admin-card-title" style="margin-top:10px;margin-bottom:4px">SHARDS (${vlog.shards.length})</div>
-        ${vlog.shards.map(sh => {
-          const sc = sh.waste_ratio_pct > 40 ? 'bad' : sh.waste_ratio_pct > 20 ? 'warn' : 'good';
-          const phys = sh.physical_bytes != null
-            ? `<span class="stat-val text-muted" style="margin-left:8px;font-size:11px"
-                     title="Physical st_blocks${sh.logical_bytes != null ? ` of ${fmtBytes(sh.logical_bytes)} logical` : ''}">${fmtBytes(sh.physical_bytes)} on disk</span>`
-            : '';
-          return `
-          <div class="stat-row">
-            <span class="stat-key">Shard ${sh.bucket}</span>
-            <span class="stat-val">${fmtBytes(sh.live_bytes)} live</span>
-            <span class="stat-val ${sc}" style="margin-left:8px">${sh.waste_ratio_pct.toFixed(1)}% waste</span>
-            ${phys}
-          </div>`;
-        }).join('')}
-      ` : ''}
-      ${vlog.namespace ? `
-        <div style="margin-top:8px">
-          <button class="btn btn-sm btn-ghost" id="vlog-pages-btn-${esc(vlog.namespace)}"
-                  onclick="toggleVlogPages('${esc(vlog.namespace)}')"
-                  title="Per-page garbage breakdown (scans every page; on-demand)">Pages ▾</button>
-          <div id="vlog-pages-${esc(vlog.namespace)}" style="display:none;margin-top:6px"></div>
-        </div>` : ''}
+      ${renderVlogShards(vlog.shards)}
     </div>`;
 }
 
-// On-demand deep dive: GET /admin/storage/value-log/{ns}/pages. Expensive
-// (O(pages × records)), so only fetched when the user expands it. Lists the
-// highest-garbage pages per shard to show where reclaimable waste sits.
-async function toggleVlogPages(ns) {
-  const box = document.getElementById(`vlog-pages-${ns}`);
-  const btn = document.getElementById(`vlog-pages-btn-${ns}`);
-  if (!box) return;
-  if (box.style.display !== 'none') {
-    box.style.display = 'none';
-    if (btn) btn.textContent = 'Pages ▾';
-    return;
-  }
-  box.style.display = 'block';
-  if (btn) btn.textContent = 'Pages ▴';
-  box.innerHTML = '<div class="spinner" style="margin:8px 0"></div>';
-  try {
-    const data = await Api.valueLogPages(ns);
-    box.innerHTML = renderVlogPagesHtml(data);
-  } catch (e) {
-    box.innerHTML = `<div class="alert alert-error" style="margin-top:6px">${esc(e.message)}</div>`;
-  }
-}
+// Unique DOM id per value-log card, so the per-shard segment panels of several
+// cards on one page (store + its companion stores) don't collide.
+let vlogCardSeq = 0;
 
-function renderVlogPagesHtml(data) {
-  const shards = data?.shards ?? [];
-  if (!shards.length) return '<div class="text-muted" style="padding:6px 0">No pages</div>';
-  const TOP = 8;
-  return shards.map(sh => {
-    const pages = [...(sh.pages ?? [])].sort((a, b) => b.garbage_bytes - a.garbage_bytes);
-    const shown = pages.slice(0, TOP);
-    const rows = shown.map(p => {
-      const gc = p.garbage_ratio_pct > 40 ? 'bad' : p.garbage_ratio_pct > 20 ? 'warn' : 'good';
-      return `
-        <div class="stat-row">
-          <span class="stat-key" style="font-family:monospace;font-size:11px">@${fmt(p.page_offset)}</span>
-          <span class="stat-val">${fmtBytes(p.garbage_bytes)} garbage</span>
-          <span class="stat-val ${gc}" style="margin-left:8px">${p.garbage_ratio_pct.toFixed(1)}%</span>
-          <span class="stat-val text-muted" style="margin-left:8px;font-size:11px">${fmt(p.garbage_records)}/${fmt(p.total_records)} recs</span>
-        </div>`;
-    }).join('');
-    const more = pages.length > TOP
-      ? `<div class="text-muted" style="font-size:11px;padding-top:2px">+${pages.length - TOP} more page(s)</div>`
+// Shards, each expandable into the segment files it holds. A sharded value log is
+// now n append-only segment files per shard: exactly one unsealed active tail
+// (never collected) plus sealed segments, which are what GC selects from. The
+// segment rows are what make an imminent GC legible — a sealed segment at 100%
+// garbage is a file about to be unlinked whole.
+function renderVlogShards(shards) {
+  shards = shards ?? [];
+  if (!shards.length) return '';
+  const cardId = `vlog-card-${++vlogCardSeq}`;
+
+  const rows = shards.map((sh, i) => {
+    const sc = sh.waste_ratio_pct > 40 ? 'bad' : sh.waste_ratio_pct > 20 ? 'warn' : 'good';
+    const panelId = `${cardId}-shard-${i}`;
+    const segs = sh.segments ?? [];
+    // segment_count is authoritative; segments[] is the breakdown of the same files.
+    const n = sh.segment_count ?? segs.length;
+    const sealed = sh.sealed_segment_count;
+
+    const phys = sh.physical_bytes != null
+      ? `<span class="stat-val text-muted" style="margin-left:8px;font-size:11px"
+               title="Bytes the shard's segment files occupy on disk${sh.logical_bytes != null ? ` (${fmtBytes(sh.logical_bytes)} of tracked record bytes)` : ''}">${fmtBytes(sh.physical_bytes)} on disk</span>`
       : '';
+
+    const meta = [
+      `${n} seg${n === 1 ? '' : 's'}`,
+      sealed != null ? `${sealed} sealed` : null,
+      sh.active_segment_id != null ? `active #${sh.active_segment_id}` : null,
+      sh.next_segment_id != null ? `next #${sh.next_segment_id}` : null,
+    ].filter(Boolean).join(' · ');
+
     return `
-      <div style="margin-top:4px">
-        <div class="admin-card-title" style="margin-bottom:4px">SHARD ${sh.bucket} — ${sh.page_count} page(s)</div>
-        ${rows || '<div class="text-muted" style="font-size:11px">No garbage pages</div>'}
-        ${more}
+      <div class="vlog-shard">
+        <div class="vlog-shard-head" onclick="toggleVlogShard('${panelId}', this)"
+             title="Click to list this shard's segment files.${sh.next_segment_id != null
+               ? ` Segment ids are never reused, so next #${sh.next_segment_id} also counts every segment this shard has ever created.` : ''}">
+          <span class="vlog-caret">▸</span>
+          <span class="stat-key">Shard ${sh.bucket}</span>
+          <span class="stat-val">${fmtBytes(sh.live_bytes)} live</span>
+          <span class="stat-val ${sc}" style="margin-left:8px">${sh.waste_ratio_pct.toFixed(1)}% waste</span>
+          ${phys}
+        </div>
+        <div class="vlog-shard-meta">${esc(meta)}</div>
+        <div class="vlog-seg-list" id="${panelId}" style="display:none">
+          ${renderVlogSegmentRows(segs)}
+        </div>
       </div>`;
   }).join('');
+
+  return `
+    <div class="admin-card-title" style="margin-top:10px;margin-bottom:4px">SHARDS (${shards.length})</div>
+    ${rows}`;
+}
+
+function renderVlogSegmentRows(segs) {
+  if (!segs.length) {
+    return '<div class="text-muted" style="font-size:11px;padding:4px 0">No segment files yet</div>';
+  }
+  return segs.map(s => {
+    const gc = s.garbage_ratio_pct > 40 ? 'bad' : s.garbage_ratio_pct > 20 ? 'warn' : 'good';
+    // The active tail is still being appended to and is never a GC target, so it is
+    // called out even when its garbage ratio looks alarming.
+    const tag = s.sealed
+      ? '<span class="badge badge-attr" title="Immutable — GC selects from these">sealed</span>'
+      : '<span class="badge badge-indexed" title="The active tail: still being appended to, never collected">active</span>';
+    return `
+      <div class="vlog-seg" title="File ${fmtBytes(s.file_bytes)} (16-byte header + records) · ${fmtBytes(s.total_bytes)} of records, ${fmtBytes(s.live_bytes)} live / ${fmtBytes(s.garbage_bytes)} garbage">
+        <span class="vlog-seg-id">seg ${s.segment_id}</span>
+        <span class="vlog-seg-file">${fmtBytes(s.file_bytes)}</span>
+        <span class="stat-val">${fmtBytes(s.live_bytes)} live</span>
+        <span class="stat-val ${gc}">${s.garbage_ratio_pct.toFixed(0)}% garbage</span>
+        <span class="vlog-seg-bar">
+          <span class="progress-wrap" style="height:4px">
+            <span class="progress-bar" style="display:block;height:100%;width:${Math.min(s.garbage_ratio_pct, 100)}%;
+                  background:${s.garbage_ratio_pct > 40 ? 'var(--error)' : s.garbage_ratio_pct > 20 ? 'var(--warning)' : 'var(--success)'}"></span>
+          </span>
+        </span>
+        ${tag}
+      </div>`;
+  }).join('');
+}
+
+function toggleVlogShard(panelId, head) {
+  const panel = document.getElementById(panelId);
+  if (!panel) return;
+  const open = panel.style.display !== 'none';
+  panel.style.display = open ? 'none' : 'block';
+  const caret = head?.querySelector('.vlog-caret');
+  if (caret) caret.textContent = open ? '▸' : '▾';
 }
 
 function renderTtlCard(m) {
