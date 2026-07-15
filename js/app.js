@@ -26,7 +26,10 @@ const state = {
   adminLsm:       null,
   adminVlog:      null,
   adminTab:       'storage', // 'storage' | 'ops' | 'index'
+  adminSys:       null, // /admin/system-stores payload cached during loadStorageStats
   adminRowCounts: {}, // { [namespace]: number }
+  storageStoresTab:  'doc', // 'doc' | 'kv' | 'system' — active tab in the namespaces section
+  storageSelectedNs: { doc: null, kv: null, system: null }, // selected namespace per tab
   opsByNamespace: [],   // NamespaceOpsMetrics[] cached from the by-namespace endpoint
   opsSelectedNs:  null, // namespace selected in the per-namespace ops panel
 
@@ -2341,6 +2344,7 @@ async function loadStorageStats() {
     state.adminStats = s; state.adminWal = w;
     state.adminLsm  = Object.fromEntries((lsmArr  ?? []).map(x => [x.namespace, x]));
     state.adminVlog = Object.fromEntries((vlogArr ?? []).map(x => [x.namespace, x]));
+    state.adminSys  = sys;
 
     const rowCountResults = await Promise.allSettled(
       state.stores.map(ds => Api.storeRowCount(ds.namespace))
@@ -2409,175 +2413,177 @@ async function loadStorageStats() {
             <span class="stat-val" style="font-size:11px">${fmt(w.head)} → ${fmt(w.tail)}</span></div>
           ${renderWalSegments(w.segments)}
         </div>
-
-        <div class="admin-card">
-          <div class="admin-card-title">WASTE RATIO</div>
-          <div style="margin-bottom:8px">
-            <div class="progress-wrap" style="height:12px">
-              <div class="progress-bar" style="width:${Math.min(s.waste_ratio_pct,100)}%;
-                   background:${s.waste_ratio_pct>40?'var(--error)':s.waste_ratio_pct>20?'var(--warning)':'var(--success)'}">
-              </div>
-            </div>
-            <div class="progress-label">${s.waste_ratio_pct.toFixed(1)}% garbage</div>
-          </div>
-          <div class="admin-card-title" style="margin-top:12px">
-            DOC STORES (${state.stores.length})
-          </div>
-          ${state.stores.map(ds => `
-            <div class="stat-row">
-              <span class="stat-key">${esc(ds.namespace)}</span>
-              ${keyTypeBadge(ds.key_type)}
-            </div>`).join('')}
-          ${state.kvStores.length ? `
-            <div class="admin-card-title" style="margin-top:12px">
-              KV STORES (${state.kvStores.length})
-            </div>
-            ${state.kvStores.map(kv => `
-              <div class="stat-row">
-                <span class="stat-key">${esc(kv.namespace)}</span>
-                <span class="badge badge-kv">KV</span>
-                ${kvValueTypeBadge(kv.value_type)}
-              </div>`).join('')}` : ''}
-        </div>
       </div>
 
-      ${renderSystemStoresSection(sys)}
-      ${renderDocStoresSection(state.stores, state.adminLsm, state.adminRowCounts)}
-      ${renderKvStoresSection(state.kvStores, state.adminLsm)}
+      <div class="section">
+        <div class="section-header"><span class="section-title">OVERALL WASTE RATIO</span></div>
+        <div class="progress-wrap" style="height:12px">
+          <div class="progress-bar" style="width:${Math.min(s.waste_ratio_pct,100)}%;
+               background:${s.waste_ratio_pct>40?'var(--error)':s.waste_ratio_pct>20?'var(--warning)':'var(--success)'}">
+          </div>
+        </div>
+        <div class="progress-label">${s.waste_ratio_pct.toFixed(1)}% garbage</div>
+      </div>
+
+      <div id="storage-stores-section">${renderStorageStoresTabs()}</div>
     `;
+    renderStorageNsSelect();
   } catch (e) {
     area.innerHTML = `<div class="alert alert-error">Failed to load stats: ${esc(e.message)}</div>`;
   }
 }
 
-function renderSystemStoresSection(sys) {
-  const kvStores  = sys?.kv_stores  ?? [];
-  const docStores = sys?.doc_stores ?? [];
+// ── Namespaces section (tabbed) ─────────────────────────────────────────────────
+// One tab per store category (Doc / KV / System). Each tab has a namespace
+// dropdown (like the per-namespace ops panel) and shows the storage metrics for
+// the single selected namespace, rather than listing every namespace at once.
 
-  const kvRows = kvStores.map(kv => `
-    <div class="sys-store-row" id="sys-kv-${esc(kv.name)}">
-      <div class="sys-store-header">
-        <div class="sys-store-identity">
-          <span class="sys-store-name">${esc(kv.name)}</span>
-          <span class="badge badge-attr">KV</span>
-          ${kv.ttl_enabled
-            ? `<span class="badge badge-indexed">TTL ${fmtDuration(kv.ttl_secs)}</span>${kv.ttl_max_deletes_per_run != null ? `<span class="badge badge-attr">max ${fmt(kv.ttl_max_deletes_per_run)}/run</span>` : ''}`
-            : ''}
-          <span class="sys-store-purpose">${esc(kv.purpose)}</span>
-        </div>
-        <div class="sys-store-meta">
-          <span class="stat-key">NS ID</span>
-          <span class="stat-val" style="font-size:11px">#${kv.ns_id}</span>
-          <span class="stat-key" style="margin-left:12px">LSM Entries</span>
-          <span class="stat-val">${fmt(kv.lsm_entry_count)}</span>
-          <button class="btn btn-sm btn-ghost sys-monitor-btn"
-                  onclick="toggleSystemStoreMeta('${esc(kv.name)}')">Monitor ▾</button>
-        </div>
-      </div>
-      <div class="sys-store-detail" id="sys-detail-${esc(kv.name)}" style="display:none"></div>
-    </div>
-  `).join('');
+// Build the list of selectable namespaces for a tab. Each entry carries the
+// info its summary header needs plus a `kind` that decides which meta endpoint
+// and renderer the detail uses.
+function storageTabEntries(tab) {
+  if (tab === 'doc') {
+    return state.stores.map(s => ({ key: s.namespace, name: s.namespace, kind: 'doc', store: s }));
+  }
+  if (tab === 'kv') {
+    return state.kvStores.map(s => ({ key: s.namespace, name: s.namespace, kind: 'kv', store: s }));
+  }
+  // system: kv system stores first, then doc system stores
+  const sys = state.adminSys ?? {};
+  return [
+    ...(sys.kv_stores  ?? []).map(k => ({ key: `kv:${k.name}`,      name: k.name,      kind: 'sys-kv',  store: k })),
+    ...(sys.doc_stores ?? []).map(d => ({ key: `doc:${d.namespace}`, name: d.namespace, kind: 'sys-doc', store: d })),
+  ];
+}
 
-  const docRows = docStores.length === 0 ? '' : docStores.map(ds => `
-    <div class="sys-store-row">
-      <div class="sys-store-header">
-        <div class="sys-store-identity">
-          <span class="sys-store-name">${esc(ds.namespace)}</span>
-          <span class="badge badge-uuid">Doc</span>
-          ${ds.semantic_search_enabled
-            ? '<span class="badge badge-indexed">✨ Semantic ON</span>'
-            : ''}
-        </div>
-        <div class="sys-store-meta">
-          <span class="stat-key">NS ID</span>
-          <span class="stat-val" style="font-size:11px">#${ds.ns_id}</span>
-        </div>
-      </div>
-    </div>
-  `).join('');
+const STORAGE_TAB_LABELS = { doc: 'DOC STORE', kv: 'KV STORE', system: 'SYSTEM' };
 
-  const totalArtifacts = kvStores.length + docStores.length;
-
+function renderStorageStoresTabs() {
+  const sys   = state.adminSys ?? {};
+  const sysN  = (sys.kv_stores?.length ?? 0) + (sys.doc_stores?.length ?? 0);
+  const counts = { doc: state.stores.length, kv: state.kvStores.length, system: sysN };
+  const tab   = state.storageStoresTab;
+  const btn   = (t, label) => `
+    <button class="sub-tab-btn ${tab === t ? 'active' : ''}"
+            onclick="switchStorageStoresTab('${t}')">${label} (${counts[t]})</button>`;
   return `
     <div class="section">
+      <div class="sub-tab-nav" style="margin-bottom:14px">
+        ${btn('doc', 'Doc Stores')}
+        ${btn('kv', 'KV Stores')}
+        ${btn('system', 'System')}
+      </div>
       <div class="section-header">
-        <span class="section-title">SYSTEM NAMESPACE (${totalArtifacts} artifact${totalArtifacts !== 1 ? 's' : ''})</span>
+        <span class="section-title">${STORAGE_TAB_LABELS[tab]} NAMESPACES</span>
+        <select id="storage-ns-select" style="max-width:320px"
+                onchange="onStorageNsChange()"></select>
       </div>
-      <div class="sys-stores-list">
-        ${totalArtifacts === 0
-          ? '<div class="text-muted" style="padding:12px 0">No system stores found</div>'
-          : kvRows + docRows}
-      </div>
+      <div id="storage-ns-detail"><div class="spinner"></div></div>
     </div>
   `;
 }
 
-function renderDocStoresSection(stores, lsmMap, rowCountMap) {
-  if (!stores.length) return '';
+function switchStorageStoresTab(tab) {
+  state.storageStoresTab = tab;
+  const section = document.getElementById('storage-stores-section');
+  if (!section) return;
+  section.innerHTML = renderStorageStoresTabs();
+  renderStorageNsSelect();
+}
 
-  const rows = stores.map(store => {
-    const lsm = lsmMap?.[store.namespace];
-    const entryCount = lsm ? fmt(lsm.total_entries) : '—';
-    const diskSize = lsm ? fmtBytes(lsm.total_size_bytes) : '—';
-    const rowCount = rowCountMap?.[store.namespace];
-    const rowCountDisplay = rowCount != null ? fmt(rowCount) : '—';
-    const nsEscaped = esc(store.namespace);
+// Populate the dropdown for the active tab, preserving the current selection
+// where possible, then render the selected namespace's detail.
+function renderStorageNsSelect() {
+  const sel = document.getElementById('storage-ns-select');
+  if (!sel) return;
+  const tab     = state.storageStoresTab;
+  const entries = storageTabEntries(tab);
+  const detail  = document.getElementById('storage-ns-detail');
+  if (!entries.length) {
+    sel.innerHTML = '';
+    sel.style.display = 'none';
+    if (detail) detail.innerHTML =
+      `<div class="text-muted" style="padding:12px 0">No ${STORAGE_TAB_LABELS[tab].toLowerCase()} namespaces found.</div>`;
+    return;
+  }
+  sel.style.display = '';
+  if (!entries.some(e => e.key === state.storageSelectedNs[tab])) {
+    state.storageSelectedNs[tab] = entries[0].key;
+  }
+  sel.innerHTML = entries.map(e =>
+    `<option value="${esc(e.key)}" ${e.key === state.storageSelectedNs[tab] ? 'selected' : ''}>${esc(e.name)}</option>`
+  ).join('');
+  renderStorageNsDetail();
+}
+
+function onStorageNsChange() {
+  const sel = document.getElementById('storage-ns-select');
+  if (!sel) return;
+  state.storageSelectedNs[state.storageStoresTab] = sel.value;
+  renderStorageNsDetail();
+}
+
+function renderStorageNsDetail() {
+  const area = document.getElementById('storage-ns-detail');
+  if (!area) return;
+  const tab     = state.storageStoresTab;
+  const entry   = storageTabEntries(tab).find(e => e.key === state.storageSelectedNs[tab]);
+  if (!entry) {
+    area.innerHTML = '<div class="text-muted" style="padding:12px 0">Select a namespace.</div>';
+    return;
+  }
+  const needsMeta = entry.kind !== 'sys-doc';
+  area.innerHTML = `
+    ${renderStorageEntrySummary(entry)}
+    ${needsMeta ? '<div id="storage-ns-meta"><div class="spinner" style="margin:12px 0"></div></div>' : ''}
+  `;
+  if (needsMeta) loadStorageEntryMeta(entry);
+}
+
+// The summary header card for a selected namespace, mirroring the header row that
+// used to appear in each per-category list.
+function renderStorageEntrySummary(entry) {
+  const { kind, store } = entry;
+  const lsm = state.adminLsm?.[entry.name];
+  const entryCount = lsm ? fmt(lsm.total_entries) : '—';
+  const diskSize   = lsm ? fmtBytes(lsm.total_size_bytes) : '—';
+
+  if (kind === 'doc') {
+    const rowCount = state.adminRowCounts?.[entry.name];
+    const nsEsc = esc(entry.name);
     return `
-      <div class="sys-store-row" id="doc-store-${nsEscaped}">
+      <div class="sys-store-row">
         <div class="sys-store-header">
           <div class="sys-store-identity">
-            <span class="sys-store-name">${nsEscaped}</span>
+            <span class="sys-store-name">${nsEsc}</span>
             ${keyTypeBadge(store.key_type)}
             ${lsmCompactionBadge(lsm)}
           </div>
           <div class="sys-store-meta">
             <span class="stat-key">Rows</span>
-            <span class="stat-val">${rowCountDisplay}</span>
+            <span class="stat-val">${rowCount != null ? fmt(rowCount) : '—'}</span>
             <span class="stat-key" style="margin-left:12px">LSM Entries</span>
             <span class="stat-val">${entryCount}</span>
             <span class="stat-key" style="margin-left:12px">On-disk</span>
             <span class="stat-val">${diskSize}</span>
             <button class="btn btn-sm btn-ghost"
-                    onclick="adminExportSchema('${nsEscaped}')">⬇ Export</button>
-            <button class="btn btn-sm btn-ghost sys-monitor-btn"
-                    onclick="toggleDocStoreLsm('${nsEscaped}')">Monitor ▾</button>
+                    onclick="adminExportSchema('${nsEsc}')">⬇ Export</button>
           </div>
         </div>
-        <div class="sys-store-detail" id="doc-lsm-${nsEscaped}" style="display:none"></div>
-      </div>
-    `;
-  }).join('');
+      </div>`;
+  }
 
-  return `
-    <div class="section">
-      <div class="section-header">
-        <span class="section-title">DOC STORE NAMESPACES (${stores.length})</span>
-      </div>
-      <div class="sys-stores-list">
-        ${rows}
-      </div>
-    </div>
-  `;
-}
-
-function renderKvStoresSection(kvStores, lsmMap) {
-  if (!kvStores.length) return '';
-
-  const rows = kvStores.map(store => {
-    const lsm = lsmMap?.[store.namespace];
-    const entryCount = lsm ? fmt(lsm.total_entries) : '—';
-    const diskSize = lsm ? fmtBytes(lsm.total_size_bytes) : '—';
+  if (kind === 'kv') {
     return `
-      <div class="sys-store-row" id="kv-store-${esc(store.namespace)}">
+      <div class="sys-store-row">
         <div class="sys-store-header">
           <div class="sys-store-identity">
-            <span class="sys-store-name">${esc(store.namespace)}</span>
+            <span class="sys-store-name">${esc(entry.name)}</span>
             <span class="badge badge-kv">KV</span>
             ${keyTypeBadge(store.key_type)}
             ${kvValueTypeBadge(store.value_type)}
             ${store.semantic_search_enabled
-              ? '<span class="badge badge-indexed">✨ Semantic ON</span>'
-              : ''}
+              ? '<span class="badge badge-indexed">✨ Semantic ON</span>' : ''}
             ${lsmCompactionBadge(lsm)}
           </div>
           <div class="sys-store-meta">
@@ -2588,23 +2594,84 @@ function renderKvStoresSection(kvStores, lsmMap) {
             <span class="stat-val">${entryCount}</span>
             <span class="stat-key" style="margin-left:12px">On-disk</span>
             <span class="stat-val">${diskSize}</span>
-            <button class="btn btn-sm btn-ghost sys-monitor-btn"
-                    onclick="toggleKvStoreDetail('${esc(store.namespace)}')">Monitor ▾</button>
           </div>
         </div>
-        <div class="sys-store-detail" id="kv-lsm-${esc(store.namespace)}" style="display:none"></div>
-      </div>
-    `;
-  }).join('');
+      </div>`;
+  }
 
+  if (kind === 'sys-kv') {
+    return `
+      <div class="sys-store-row">
+        <div class="sys-store-header">
+          <div class="sys-store-identity">
+            <span class="sys-store-name">${esc(store.name)}</span>
+            <span class="badge badge-attr">KV</span>
+            ${store.ttl_enabled
+              ? `<span class="badge badge-indexed">TTL ${fmtDuration(store.ttl_secs)}</span>${store.ttl_max_deletes_per_run != null ? `<span class="badge badge-attr">max ${fmt(store.ttl_max_deletes_per_run)}/run</span>` : ''}`
+              : ''}
+            <span class="sys-store-purpose">${esc(store.purpose)}</span>
+          </div>
+          <div class="sys-store-meta">
+            <span class="stat-key">NS ID</span>
+            <span class="stat-val" style="font-size:11px">#${store.ns_id}</span>
+            <span class="stat-key" style="margin-left:12px">LSM Entries</span>
+            <span class="stat-val">${fmt(store.lsm_entry_count)}</span>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  // sys-doc — no per-store meta endpoint, so the summary is the whole view
   return `
-    <div class="section">
-      <div class="section-header">
-        <span class="section-title">KV STORE NAMESPACES (${kvStores.length})</span>
+    <div class="sys-store-row">
+      <div class="sys-store-header">
+        <div class="sys-store-identity">
+          <span class="sys-store-name">${esc(store.namespace)}</span>
+          <span class="badge badge-uuid">Doc</span>
+          ${store.semantic_search_enabled
+            ? '<span class="badge badge-indexed">✨ Semantic ON</span>' : ''}
+        </div>
+        <div class="sys-store-meta">
+          <span class="stat-key">NS ID</span>
+          <span class="stat-val" style="font-size:11px">#${store.ns_id}</span>
+        </div>
       </div>
-      <div class="sys-stores-list">${rows}</div>
     </div>
-  `;
+    <div class="alert alert-info" style="margin-top:8px">
+      This system doc store exposes no per-namespace storage metrics.
+    </div>`;
+}
+
+// Load and render the LSM/value-log detail for the selected namespace into
+// #storage-ns-meta. Dispatches endpoint + renderer by kind.
+async function loadStorageEntryMeta(entry) {
+  const meta = document.getElementById('storage-ns-meta');
+  if (!meta) return;
+  try {
+    let m, html;
+    if (entry.kind === 'sys-kv') {
+      m = await Api.systemStoreMeta(entry.name);
+      graftStorageMeta(m);
+      html = renderSystemStoreMeta(m);
+    } else {
+      m = await Api.storeKvMeta(entry.name);
+      graftStorageMeta(m);
+      html = entry.kind === 'doc' ? renderDocStoreKvMeta(m) : renderSystemStoreMeta(m);
+    }
+    // Guard against a race where the selection changed while the request was in flight.
+    if (document.getElementById('storage-ns-meta') !== meta) return;
+    meta.innerHTML = html;
+  } catch (e) {
+    if (e.message.includes('404') || e.message.toLowerCase().includes('not been opened')) {
+      meta.innerHTML = `
+        <div class="alert alert-info" style="margin-top:8px">
+          This store has not been opened yet — it is created on first use
+          (e.g. after the first semantic-search query).
+        </div>`;
+    } else {
+      meta.innerHTML = `<div class="alert alert-error" style="margin-top:8px">${esc(e.message)}</div>`;
+    }
+  }
 }
 
 // ── Field-index waste ───────────────────────────────────────────────────────────
@@ -2672,86 +2739,6 @@ function renderIndexWasteSection(waste) {
       </div>
     </div>
   `;
-}
-
-async function toggleKvStoreDetail(ns) {
-  const detail = document.getElementById(`kv-lsm-${ns}`);
-  const btn    = detail?.previousElementSibling?.querySelector('.sys-monitor-btn');
-  if (!detail) return;
-
-  if (detail.style.display !== 'none') {
-    detail.style.display = 'none';
-    if (btn) btn.textContent = 'Monitor ▾';
-    return;
-  }
-
-  detail.style.display = 'block';
-  if (btn) btn.textContent = 'Monitor ▴';
-  detail.innerHTML = '<div class="spinner" style="margin:12px 0"></div>';
-
-  try {
-    const m = await Api.storeKvMeta(ns);
-    graftStorageMeta(m);
-    detail.innerHTML = renderSystemStoreMeta(m);
-  } catch (e) {
-    detail.innerHTML = `<div class="alert alert-error" style="margin-top:8px">${esc(e.message)}</div>`;
-  }
-}
-
-async function toggleDocStoreLsm(ns) {
-  const detail = document.getElementById(`doc-lsm-${ns}`);
-  const btn    = detail?.previousElementSibling?.querySelector('.sys-monitor-btn');
-  if (!detail) return;
-
-  if (detail.style.display !== 'none') {
-    detail.style.display = 'none';
-    if (btn) btn.textContent = 'Monitor ▾';
-    return;
-  }
-
-  detail.style.display = 'block';
-  if (btn) btn.textContent = 'Monitor ▴';
-  detail.innerHTML = '<div class="spinner" style="margin:12px 0"></div>';
-
-  try {
-    const m = await Api.storeKvMeta(ns);
-    graftStorageMeta(m);
-    detail.innerHTML = renderDocStoreKvMeta(m);
-  } catch (e) {
-    detail.innerHTML = `<div class="alert alert-error" style="margin-top:8px">${esc(e.message)}</div>`;
-  }
-}
-
-async function toggleSystemStoreMeta(ns) {
-  const detail = document.getElementById(`sys-detail-${ns}`);
-  const btn    = detail?.previousElementSibling?.querySelector('.sys-monitor-btn');
-  if (!detail) return;
-
-  if (detail.style.display !== 'none') {
-    detail.style.display = 'none';
-    if (btn) btn.textContent = 'Monitor ▾';
-    return;
-  }
-
-  detail.style.display = 'block';
-  if (btn) btn.textContent = 'Monitor ▴';
-  detail.innerHTML = '<div class="spinner" style="margin:12px 0"></div>';
-
-  try {
-    const m = await Api.systemStoreMeta(ns);
-    graftStorageMeta(m);
-    detail.innerHTML = renderSystemStoreMeta(m);
-  } catch (e) {
-    if (e.message.includes('404') || e.message.toLowerCase().includes('not been opened')) {
-      detail.innerHTML = `
-        <div class="alert alert-info" style="margin-top:8px">
-          This store has not been opened yet — it is created on first use
-          (e.g. after the first semantic-search query).
-        </div>`;
-    } else {
-      detail.innerHTML = `<div class="alert alert-error" style="margin-top:8px">${esc(e.message)}</div>`;
-    }
-  }
 }
 
 // The per-store kv-meta endpoints omit data that only the engine-wide listings
