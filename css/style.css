@@ -347,6 +347,35 @@ select { cursor: pointer; }
 .lsm-lvl-panel { display: none; }
 .lsm-lvl-panel.active { display: block; }
 
+/* Value-log shards / WAL, each expanding into the segment files it holds. */
+.vlog-shard { border-bottom: 1px solid var(--border); }
+.vlog-shard:last-child { border-bottom: none; }
+.vlog-shard-head {
+  display: flex; align-items: center; gap: 4px; padding: 5px 0;
+  cursor: pointer; user-select: none;
+}
+.vlog-shard-head:hover { background: var(--bg-hover); }
+.vlog-shard-head .stat-key { flex: 1; }
+.vlog-caret { color: var(--text-3); font-size: 10px; width: 12px; }
+.vlog-shard-meta {
+  color: var(--text-3); font-size: 11px; font-family: monospace;
+  padding: 0 0 5px 16px;
+}
+.vlog-seg-list { padding: 2px 0 6px 16px; }
+.vlog-seg {
+  display: flex; align-items: center; gap: 8px; padding: 3px 0;
+  font-size: 11px;
+}
+.vlog-seg .stat-val { font-size: 11px; }
+.vlog-seg-id {
+  font-family: monospace; font-weight: 600; color: var(--text-2);
+  min-width: 46px;
+}
+.vlog-seg-file { font-family: monospace; color: var(--text-3); min-width: 58px; }
+/* The garbage bar: .progress-wrap is height-based, so the span must not stay inline. */
+.vlog-seg-bar { flex: 1; min-width: 40px; }
+.vlog-seg-bar .progress-wrap { display: block; }
+
 /* Ops-metrics engine-wide / per-namespace panels shown side by side. */
 .ops-metrics-cols {
   display: grid;

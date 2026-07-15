@@ -26,7 +26,10 @@ const state = {
   adminLsm:       null,
   adminVlog:      null,
   adminTab:       'storage', // 'storage' | 'ops' | 'index'
+  adminSys:       null, // /admin/system-stores payload cached during loadStorageStats
   adminRowCounts: {}, // { [namespace]: number }
+  storageStoresTab:  'doc', // 'doc' | 'kv' | 'system' — active tab in the namespaces section
+  storageSelectedNs: { doc: null, kv: null, system: null }, // selected namespace per tab
   opsByNamespace: [],   // NamespaceOpsMetrics[] cached from the by-namespace endpoint
   opsSelectedNs:  null, // namespace selected in the per-namespace ops panel
 
@@ -2261,6 +2264,11 @@ function renderOpsMetricsHtml(m, opts = {}) {
         <div class="admin-card-title" title="Value-log and WAL space reclamation. In-memory, reset on restart.">GARBAGE COLLECTION</div>
         ${row('VLog GC Runs', fmt(g.vlog_gc_runs), '', 'Value-log GC passes run.')}
         ${row('VLog GC Duration', fmtMillis(g.vlog_gc_duration_ms), '', 'Cumulative value-log GC time.')}
+        ${row('VLog Segments Reclaimed', fmt(g.vlog_segments_reclaimed), '', 'Value-log segment files unlinked whole by GC.')}
+        ${row('VLog Bytes Reclaimed', fmtBytes(g.vlog_gc_bytes_reclaimed), '', 'Bytes handed back to the filesystem by unlinking those segments.')}
+        ${row('VLog Bytes Rewritten', fmtBytes(g.vlog_gc_bytes_rewritten), '', 'Bytes of survivors GC rewrote to relocate them out of the segments it collected — the cost of the work.')}
+        ${row('VLog Write Amp', fmtWriteAmp(g.vlog_gc_write_amplification), writeAmpClass(g.vlog_gc_write_amplification),
+              'Rewritten / reclaimed. Well below 1× is healthy — GC frees far more than it rewrites. Above 1× it is relocating more data than it frees (the segments it picks are mostly survivors); page_gc_threshold is the knob. Blank until GC has reclaimed anything.')}
         ${perNs
           ? `<div class="stat-row text-muted" style="font-size:12px"><span>WAL GC is engine-global — see the engine-wide panel.</span></div>`
           : `${row('WAL GC Runs', fmt(g.wal_gc_runs), '', 'WAL GC passes run.')}
@@ -2282,6 +2290,49 @@ function fmtMillis(ms) {
   return `${Math.floor(ms / 60000)}m ${Math.round((ms % 60000) / 1000)}s`;
 }
 
+// GC write amplification: bytes rewritten per byte reclaimed. Null until GC has
+// reclaimed anything, so it stays blank rather than reading as a healthy 0×.
+function fmtWriteAmp(x) {
+  return x == null ? '—' : `${x.toFixed(2)}×`;
+}
+
+// At 1× GC rewrites as much as it frees — it is treading water. Flag before that.
+function writeAmpClass(x) {
+  if (x == null) return '';
+  return x >= 1 ? 'bad' : x >= 0.5 ? 'warn' : 'good';
+}
+
+// The WAL is a sequence of segment files. Expandable, like value-log shards: each
+// row is one segment file and its entry backlog. Pending entries are what a restart
+// would replay, so a segment carrying pending entries is one the LSM has not caught
+// up with yet; fully-persisted segments below the live window are what WAL GC unlinks.
+function renderWalSegments(segments) {
+  segments = segments ?? [];
+  if (!segments.length) return '';
+
+  const rows = segments.map(s => {
+    const pc = s.pending_entries > 0 ? 'warn' : 'good';
+    return `
+      <div class="vlog-seg" title="${fmt(s.total_entries)} entries — ${fmt(s.persisted_entries)} persisted to the LSM, ${fmt(s.pending_entries)} would be replayed on the next open">
+        <span class="vlog-seg-id">seg ${fmt(s.segment_id)}</span>
+        <span class="stat-val">${fmt(s.total_entries)} entries</span>
+        <span class="stat-val good">${fmt(s.persisted_entries)} persisted</span>
+        <span class="stat-val ${pc}">${fmt(s.pending_entries)} pending</span>
+      </div>`;
+  }).join('');
+
+  return `
+    <div style="margin-top:8px">
+      <div class="vlog-shard-head" onclick="toggleVlogShard('wal-segs', this)"
+           title="Every WAL segment file currently tracked.">
+        <span class="vlog-caret">▸</span>
+        <span class="stat-key">Segments</span>
+        <span class="stat-val">${fmt(segments.length)} file${segments.length === 1 ? '' : 's'}</span>
+      </div>
+      <div class="vlog-seg-list" id="wal-segs" style="display:none">${rows}</div>
+    </div>`;
+}
+
 async function loadStorageStats() {
   const area = document.getElementById('admin-storage-stats');
   if (!area) return;
@@ -2293,6 +2344,7 @@ async function loadStorageStats() {
     state.adminStats = s; state.adminWal = w;
     state.adminLsm  = Object.fromEntries((lsmArr  ?? []).map(x => [x.namespace, x]));
     state.adminVlog = Object.fromEntries((vlogArr ?? []).map(x => [x.namespace, x]));
+    state.adminSys  = sys;
 
     const rowCountResults = await Promise.allSettled(
       state.stores.map(ds => Api.storeRowCount(ds.namespace))
@@ -2320,15 +2372,19 @@ async function loadStorageStats() {
         </div>
 
         <div class="admin-card">
-          <div class="admin-card-title" title="Engine-wide value-log aggregate, recomputed from on-disk state on every request — survives restart.">STORAGE STATS</div>
+          <div class="admin-card-title" title="Value-log aggregate across every namespace, recomputed from on-disk state on every request — survives restart.">STORAGE STATS</div>
           <div class="stat-row"><span class="stat-key" title="Live (non-garbage) bytes in the value log.">Live Data</span>
             <span class="stat-val">${fmtBytes(s.live_bytes)}</span></div>
           <div class="stat-row"><span class="stat-key" title="Reclaimable dead bytes across the value log (superseded or deleted records awaiting GC).">Garbage</span>
             <span class="stat-val ${wasteClass}">${fmtBytes(s.garbage_bytes)}</span></div>
           <div class="stat-row"><span class="stat-key" title="Dead / total written. High = value-log GC is overdue.">Waste Ratio</span>
             <span class="stat-val ${wasteClass}">${s.waste_ratio_pct.toFixed(1)}%</span></div>
-          <div class="stat-row"><span class="stat-key" title="Free fraction of the allocated value-log region.">Free Space</span>
-            <span class="stat-val">${s.free_space_ratio_pct.toFixed(1)}%</span></div>
+          ${s.segment_count != null ? `
+          <div class="stat-row"><span class="stat-key" title="Value-log segment files on disk across every namespace.">Segment Files</span>
+            <span class="stat-val">${fmt(s.segment_count)}${s.namespaces != null ? ` <span class="text-muted" style="font-size:11px">across ${fmt(s.namespaces)} ns</span>` : ''}</span></div>` : ''}
+          ${s.disk_bytes != null ? `
+          <div class="stat-row"><span class="stat-key" title="Bytes those segment files occupy on disk.">On-disk</span>
+            <span class="stat-val">${fmtBytes(s.disk_bytes)}</span></div>` : ''}
           <div class="stat-row"><span class="stat-key" title="Value-log GC passes ever run (persisted in metadata).">GC Runs</span>
             <span class="stat-val">${fmt(s.total_gc_runs)}</span></div>
           <div class="stat-row"><span class="stat-key" title="Bytes ever reclaimed by value-log GC (persisted).">Bytes Reclaimed</span>
@@ -2355,176 +2411,179 @@ async function loadStorageStats() {
             <span class="stat-val">${fmt(w.last_sequence)}</span></div>` : ''}
           <div class="stat-row"><span class="stat-key" title="WAL byte offsets of the live window (start → end).">Head → Tail</span>
             <span class="stat-val" style="font-size:11px">${fmt(w.head)} → ${fmt(w.tail)}</span></div>
-        </div>
-
-        <div class="admin-card">
-          <div class="admin-card-title">WASTE RATIO</div>
-          <div style="margin-bottom:8px">
-            <div class="progress-wrap" style="height:12px">
-              <div class="progress-bar" style="width:${Math.min(s.waste_ratio_pct,100)}%;
-                   background:${s.waste_ratio_pct>40?'var(--error)':s.waste_ratio_pct>20?'var(--warning)':'var(--success)'}">
-              </div>
-            </div>
-            <div class="progress-label">${s.waste_ratio_pct.toFixed(1)}% garbage</div>
-          </div>
-          <div class="admin-card-title" style="margin-top:12px">
-            DOC STORES (${state.stores.length})
-          </div>
-          ${state.stores.map(ds => `
-            <div class="stat-row">
-              <span class="stat-key">${esc(ds.namespace)}</span>
-              ${keyTypeBadge(ds.key_type)}
-            </div>`).join('')}
-          ${state.kvStores.length ? `
-            <div class="admin-card-title" style="margin-top:12px">
-              KV STORES (${state.kvStores.length})
-            </div>
-            ${state.kvStores.map(kv => `
-              <div class="stat-row">
-                <span class="stat-key">${esc(kv.namespace)}</span>
-                <span class="badge badge-kv">KV</span>
-                ${kvValueTypeBadge(kv.value_type)}
-              </div>`).join('')}` : ''}
+          ${renderWalSegments(w.segments)}
         </div>
       </div>
 
-      ${renderSystemStoresSection(sys)}
-      ${renderDocStoresSection(state.stores, state.adminLsm, state.adminRowCounts)}
-      ${renderKvStoresSection(state.kvStores, state.adminLsm)}
+      <div class="section">
+        <div class="section-header"><span class="section-title">OVERALL WASTE RATIO</span></div>
+        <div class="progress-wrap" style="height:12px">
+          <div class="progress-bar" style="width:${Math.min(s.waste_ratio_pct,100)}%;
+               background:${s.waste_ratio_pct>40?'var(--error)':s.waste_ratio_pct>20?'var(--warning)':'var(--success)'}">
+          </div>
+        </div>
+        <div class="progress-label">${s.waste_ratio_pct.toFixed(1)}% garbage</div>
+      </div>
+
+      <div id="storage-stores-section">${renderStorageStoresTabs()}</div>
     `;
+    renderStorageNsSelect();
   } catch (e) {
     area.innerHTML = `<div class="alert alert-error">Failed to load stats: ${esc(e.message)}</div>`;
   }
 }
 
-function renderSystemStoresSection(sys) {
-  const kvStores  = sys?.kv_stores  ?? [];
-  const docStores = sys?.doc_stores ?? [];
+// ── Namespaces section (tabbed) ─────────────────────────────────────────────────
+// One tab per store category (Doc / KV / System). Each tab has a namespace
+// dropdown (like the per-namespace ops panel) and shows the storage metrics for
+// the single selected namespace, rather than listing every namespace at once.
 
-  const kvRows = kvStores.map(kv => `
-    <div class="sys-store-row" id="sys-kv-${esc(kv.name)}">
-      <div class="sys-store-header">
-        <div class="sys-store-identity">
-          <span class="sys-store-name">${esc(kv.name)}</span>
-          <span class="badge badge-attr">KV</span>
-          ${kv.ttl_enabled
-            ? `<span class="badge badge-indexed">TTL ${fmtDuration(kv.ttl_secs)}</span>${kv.ttl_max_deletes_per_run != null ? `<span class="badge badge-attr">max ${fmt(kv.ttl_max_deletes_per_run)}/run</span>` : ''}`
-            : ''}
-          <span class="sys-store-purpose">${esc(kv.purpose)}</span>
-        </div>
-        <div class="sys-store-meta">
-          <span class="stat-key">NS ID</span>
-          <span class="stat-val" style="font-size:11px">#${kv.ns_id}</span>
-          <span class="stat-key" style="margin-left:12px">LSM Entries</span>
-          <span class="stat-val">${fmt(kv.lsm_entry_count)}</span>
-          <button class="btn btn-sm btn-ghost sys-monitor-btn"
-                  onclick="toggleSystemStoreMeta('${esc(kv.name)}')">Monitor ▾</button>
-        </div>
-      </div>
-      <div class="sys-store-detail" id="sys-detail-${esc(kv.name)}" style="display:none"></div>
-    </div>
-  `).join('');
+// Build the list of selectable namespaces for a tab. Each entry carries the
+// info its summary header needs plus a `kind` that decides which meta endpoint
+// and renderer the detail uses.
+function storageTabEntries(tab) {
+  if (tab === 'doc') {
+    return state.stores.map(s => ({ key: s.namespace, name: s.namespace, kind: 'doc', store: s }));
+  }
+  if (tab === 'kv') {
+    return state.kvStores.map(s => ({ key: s.namespace, name: s.namespace, kind: 'kv', store: s }));
+  }
+  // system: kv system stores first, then doc system stores
+  const sys = state.adminSys ?? {};
+  return [
+    ...(sys.kv_stores  ?? []).map(k => ({ key: `kv:${k.name}`,      name: k.name,      kind: 'sys-kv',  store: k })),
+    ...(sys.doc_stores ?? []).map(d => ({ key: `doc:${d.namespace}`, name: d.namespace, kind: 'sys-doc', store: d })),
+  ];
+}
 
-  const docRows = docStores.length === 0 ? '' : docStores.map(ds => `
-    <div class="sys-store-row">
-      <div class="sys-store-header">
-        <div class="sys-store-identity">
-          <span class="sys-store-name">${esc(ds.namespace)}</span>
-          <span class="badge badge-uuid">Doc</span>
-          ${ds.semantic_search_enabled
-            ? '<span class="badge badge-indexed">✨ Semantic ON</span>'
-            : ''}
-        </div>
-        <div class="sys-store-meta">
-          <span class="stat-key">NS ID</span>
-          <span class="stat-val" style="font-size:11px">#${ds.ns_id}</span>
-        </div>
-      </div>
-    </div>
-  `).join('');
+const STORAGE_TAB_LABELS = { doc: 'DOC STORE', kv: 'KV STORE', system: 'SYSTEM' };
 
-  const totalArtifacts = kvStores.length + docStores.length;
-
+function renderStorageStoresTabs() {
+  const sys   = state.adminSys ?? {};
+  const sysN  = (sys.kv_stores?.length ?? 0) + (sys.doc_stores?.length ?? 0);
+  const counts = { doc: state.stores.length, kv: state.kvStores.length, system: sysN };
+  const tab   = state.storageStoresTab;
+  const btn   = (t, label) => `
+    <button class="sub-tab-btn ${tab === t ? 'active' : ''}"
+            onclick="switchStorageStoresTab('${t}')">${label} (${counts[t]})</button>`;
   return `
     <div class="section">
+      <div class="sub-tab-nav" style="margin-bottom:14px">
+        ${btn('doc', 'Doc Stores')}
+        ${btn('kv', 'KV Stores')}
+        ${btn('system', 'System')}
+      </div>
       <div class="section-header">
-        <span class="section-title">SYSTEM NAMESPACE (${totalArtifacts} artifact${totalArtifacts !== 1 ? 's' : ''})</span>
+        <span class="section-title">${STORAGE_TAB_LABELS[tab]} NAMESPACES</span>
+        <select id="storage-ns-select" style="max-width:320px"
+                onchange="onStorageNsChange()"></select>
       </div>
-      <div class="sys-stores-list">
-        ${totalArtifacts === 0
-          ? '<div class="text-muted" style="padding:12px 0">No system stores found</div>'
-          : kvRows + docRows}
-      </div>
+      <div id="storage-ns-detail"><div class="spinner"></div></div>
     </div>
   `;
 }
 
-function renderDocStoresSection(stores, lsmMap, rowCountMap) {
-  if (!stores.length) return '';
+function switchStorageStoresTab(tab) {
+  state.storageStoresTab = tab;
+  const section = document.getElementById('storage-stores-section');
+  if (!section) return;
+  section.innerHTML = renderStorageStoresTabs();
+  renderStorageNsSelect();
+}
 
-  const rows = stores.map(store => {
-    const lsm = lsmMap?.[store.namespace];
-    const entryCount = lsm ? fmt(lsm.total_entries) : '—';
-    const diskSize = lsm ? fmtBytes(lsm.total_size_bytes) : '—';
-    const rowCount = rowCountMap?.[store.namespace];
-    const rowCountDisplay = rowCount != null ? fmt(rowCount) : '—';
-    const nsEscaped = esc(store.namespace);
+// Populate the dropdown for the active tab, preserving the current selection
+// where possible, then render the selected namespace's detail.
+function renderStorageNsSelect() {
+  const sel = document.getElementById('storage-ns-select');
+  if (!sel) return;
+  const tab     = state.storageStoresTab;
+  const entries = storageTabEntries(tab);
+  const detail  = document.getElementById('storage-ns-detail');
+  if (!entries.length) {
+    sel.innerHTML = '';
+    sel.style.display = 'none';
+    if (detail) detail.innerHTML =
+      `<div class="text-muted" style="padding:12px 0">No ${STORAGE_TAB_LABELS[tab].toLowerCase()} namespaces found.</div>`;
+    return;
+  }
+  sel.style.display = '';
+  if (!entries.some(e => e.key === state.storageSelectedNs[tab])) {
+    state.storageSelectedNs[tab] = entries[0].key;
+  }
+  sel.innerHTML = entries.map(e =>
+    `<option value="${esc(e.key)}" ${e.key === state.storageSelectedNs[tab] ? 'selected' : ''}>${esc(e.name)}</option>`
+  ).join('');
+  renderStorageNsDetail();
+}
+
+function onStorageNsChange() {
+  const sel = document.getElementById('storage-ns-select');
+  if (!sel) return;
+  state.storageSelectedNs[state.storageStoresTab] = sel.value;
+  renderStorageNsDetail();
+}
+
+function renderStorageNsDetail() {
+  const area = document.getElementById('storage-ns-detail');
+  if (!area) return;
+  const tab     = state.storageStoresTab;
+  const entry   = storageTabEntries(tab).find(e => e.key === state.storageSelectedNs[tab]);
+  if (!entry) {
+    area.innerHTML = '<div class="text-muted" style="padding:12px 0">Select a namespace.</div>';
+    return;
+  }
+  const needsMeta = entry.kind !== 'sys-doc';
+  area.innerHTML = `
+    ${renderStorageEntrySummary(entry)}
+    ${needsMeta ? '<div id="storage-ns-meta"><div class="spinner" style="margin:12px 0"></div></div>' : ''}
+  `;
+  if (needsMeta) loadStorageEntryMeta(entry);
+}
+
+// The summary header card for a selected namespace, mirroring the header row that
+// used to appear in each per-category list.
+function renderStorageEntrySummary(entry) {
+  const { kind, store } = entry;
+  const lsm = state.adminLsm?.[entry.name];
+  const entryCount = lsm ? fmt(lsm.total_entries) : '—';
+  const diskSize   = lsm ? fmtBytes(lsm.total_size_bytes) : '—';
+
+  if (kind === 'doc') {
+    const rowCount = state.adminRowCounts?.[entry.name];
+    const nsEsc = esc(entry.name);
     return `
-      <div class="sys-store-row" id="doc-store-${nsEscaped}">
+      <div class="sys-store-row">
         <div class="sys-store-header">
           <div class="sys-store-identity">
-            <span class="sys-store-name">${nsEscaped}</span>
+            <span class="sys-store-name">${nsEsc}</span>
             ${keyTypeBadge(store.key_type)}
             ${lsmCompactionBadge(lsm)}
           </div>
           <div class="sys-store-meta">
             <span class="stat-key">Rows</span>
-            <span class="stat-val">${rowCountDisplay}</span>
+            <span class="stat-val">${rowCount != null ? fmt(rowCount) : '—'}</span>
             <span class="stat-key" style="margin-left:12px">LSM Entries</span>
             <span class="stat-val">${entryCount}</span>
             <span class="stat-key" style="margin-left:12px">On-disk</span>
             <span class="stat-val">${diskSize}</span>
             <button class="btn btn-sm btn-ghost"
-                    onclick="adminExportSchema('${nsEscaped}')">⬇ Export</button>
-            <button class="btn btn-sm btn-ghost sys-monitor-btn"
-                    onclick="toggleDocStoreLsm('${nsEscaped}')">Monitor ▾</button>
+                    onclick="adminExportSchema('${nsEsc}')">⬇ Export</button>
           </div>
         </div>
-        <div class="sys-store-detail" id="doc-lsm-${nsEscaped}" style="display:none"></div>
-      </div>
-    `;
-  }).join('');
+      </div>`;
+  }
 
-  return `
-    <div class="section">
-      <div class="section-header">
-        <span class="section-title">DOC STORE NAMESPACES (${stores.length})</span>
-      </div>
-      <div class="sys-stores-list">
-        ${rows}
-      </div>
-    </div>
-  `;
-}
-
-function renderKvStoresSection(kvStores, lsmMap) {
-  if (!kvStores.length) return '';
-
-  const rows = kvStores.map(store => {
-    const lsm = lsmMap?.[store.namespace];
-    const entryCount = lsm ? fmt(lsm.total_entries) : '—';
-    const diskSize = lsm ? fmtBytes(lsm.total_size_bytes) : '—';
+  if (kind === 'kv') {
     return `
-      <div class="sys-store-row" id="kv-store-${esc(store.namespace)}">
+      <div class="sys-store-row">
         <div class="sys-store-header">
           <div class="sys-store-identity">
-            <span class="sys-store-name">${esc(store.namespace)}</span>
+            <span class="sys-store-name">${esc(entry.name)}</span>
             <span class="badge badge-kv">KV</span>
             ${keyTypeBadge(store.key_type)}
             ${kvValueTypeBadge(store.value_type)}
             ${store.semantic_search_enabled
-              ? '<span class="badge badge-indexed">✨ Semantic ON</span>'
-              : ''}
+              ? '<span class="badge badge-indexed">✨ Semantic ON</span>' : ''}
             ${lsmCompactionBadge(lsm)}
           </div>
           <div class="sys-store-meta">
@@ -2535,23 +2594,84 @@ function renderKvStoresSection(kvStores, lsmMap) {
             <span class="stat-val">${entryCount}</span>
             <span class="stat-key" style="margin-left:12px">On-disk</span>
             <span class="stat-val">${diskSize}</span>
-            <button class="btn btn-sm btn-ghost sys-monitor-btn"
-                    onclick="toggleKvStoreDetail('${esc(store.namespace)}')">Monitor ▾</button>
           </div>
         </div>
-        <div class="sys-store-detail" id="kv-lsm-${esc(store.namespace)}" style="display:none"></div>
-      </div>
-    `;
-  }).join('');
+      </div>`;
+  }
 
+  if (kind === 'sys-kv') {
+    return `
+      <div class="sys-store-row">
+        <div class="sys-store-header">
+          <div class="sys-store-identity">
+            <span class="sys-store-name">${esc(store.name)}</span>
+            <span class="badge badge-attr">KV</span>
+            ${store.ttl_enabled
+              ? `<span class="badge badge-indexed">TTL ${fmtDuration(store.ttl_secs)}</span>${store.ttl_max_deletes_per_run != null ? `<span class="badge badge-attr">max ${fmt(store.ttl_max_deletes_per_run)}/run</span>` : ''}`
+              : ''}
+            <span class="sys-store-purpose">${esc(store.purpose)}</span>
+          </div>
+          <div class="sys-store-meta">
+            <span class="stat-key">NS ID</span>
+            <span class="stat-val" style="font-size:11px">#${store.ns_id}</span>
+            <span class="stat-key" style="margin-left:12px">LSM Entries</span>
+            <span class="stat-val">${fmt(store.lsm_entry_count)}</span>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  // sys-doc — no per-store meta endpoint, so the summary is the whole view
   return `
-    <div class="section">
-      <div class="section-header">
-        <span class="section-title">KV STORE NAMESPACES (${kvStores.length})</span>
+    <div class="sys-store-row">
+      <div class="sys-store-header">
+        <div class="sys-store-identity">
+          <span class="sys-store-name">${esc(store.namespace)}</span>
+          <span class="badge badge-uuid">Doc</span>
+          ${store.semantic_search_enabled
+            ? '<span class="badge badge-indexed">✨ Semantic ON</span>' : ''}
+        </div>
+        <div class="sys-store-meta">
+          <span class="stat-key">NS ID</span>
+          <span class="stat-val" style="font-size:11px">#${store.ns_id}</span>
+        </div>
       </div>
-      <div class="sys-stores-list">${rows}</div>
     </div>
-  `;
+    <div class="alert alert-info" style="margin-top:8px">
+      This system doc store exposes no per-namespace storage metrics.
+    </div>`;
+}
+
+// Load and render the LSM/value-log detail for the selected namespace into
+// #storage-ns-meta. Dispatches endpoint + renderer by kind.
+async function loadStorageEntryMeta(entry) {
+  const meta = document.getElementById('storage-ns-meta');
+  if (!meta) return;
+  try {
+    let m, html;
+    if (entry.kind === 'sys-kv') {
+      m = await Api.systemStoreMeta(entry.name);
+      graftStorageMeta(m);
+      html = renderSystemStoreMeta(m);
+    } else {
+      m = await Api.storeKvMeta(entry.name);
+      graftStorageMeta(m);
+      html = entry.kind === 'doc' ? renderDocStoreKvMeta(m) : renderSystemStoreMeta(m);
+    }
+    // Guard against a race where the selection changed while the request was in flight.
+    if (document.getElementById('storage-ns-meta') !== meta) return;
+    meta.innerHTML = html;
+  } catch (e) {
+    if (e.message.includes('404') || e.message.toLowerCase().includes('not been opened')) {
+      meta.innerHTML = `
+        <div class="alert alert-info" style="margin-top:8px">
+          This store has not been opened yet — it is created on first use
+          (e.g. after the first semantic-search query).
+        </div>`;
+    } else {
+      meta.innerHTML = `<div class="alert alert-error" style="margin-top:8px">${esc(e.message)}</div>`;
+    }
+  }
 }
 
 // ── Field-index waste ───────────────────────────────────────────────────────────
@@ -2619,86 +2739,6 @@ function renderIndexWasteSection(waste) {
       </div>
     </div>
   `;
-}
-
-async function toggleKvStoreDetail(ns) {
-  const detail = document.getElementById(`kv-lsm-${ns}`);
-  const btn    = detail?.previousElementSibling?.querySelector('.sys-monitor-btn');
-  if (!detail) return;
-
-  if (detail.style.display !== 'none') {
-    detail.style.display = 'none';
-    if (btn) btn.textContent = 'Monitor ▾';
-    return;
-  }
-
-  detail.style.display = 'block';
-  if (btn) btn.textContent = 'Monitor ▴';
-  detail.innerHTML = '<div class="spinner" style="margin:12px 0"></div>';
-
-  try {
-    const m = await Api.storeKvMeta(ns);
-    graftStorageMeta(m);
-    detail.innerHTML = renderSystemStoreMeta(m);
-  } catch (e) {
-    detail.innerHTML = `<div class="alert alert-error" style="margin-top:8px">${esc(e.message)}</div>`;
-  }
-}
-
-async function toggleDocStoreLsm(ns) {
-  const detail = document.getElementById(`doc-lsm-${ns}`);
-  const btn    = detail?.previousElementSibling?.querySelector('.sys-monitor-btn');
-  if (!detail) return;
-
-  if (detail.style.display !== 'none') {
-    detail.style.display = 'none';
-    if (btn) btn.textContent = 'Monitor ▾';
-    return;
-  }
-
-  detail.style.display = 'block';
-  if (btn) btn.textContent = 'Monitor ▴';
-  detail.innerHTML = '<div class="spinner" style="margin:12px 0"></div>';
-
-  try {
-    const m = await Api.storeKvMeta(ns);
-    graftStorageMeta(m);
-    detail.innerHTML = renderDocStoreKvMeta(m);
-  } catch (e) {
-    detail.innerHTML = `<div class="alert alert-error" style="margin-top:8px">${esc(e.message)}</div>`;
-  }
-}
-
-async function toggleSystemStoreMeta(ns) {
-  const detail = document.getElementById(`sys-detail-${ns}`);
-  const btn    = detail?.previousElementSibling?.querySelector('.sys-monitor-btn');
-  if (!detail) return;
-
-  if (detail.style.display !== 'none') {
-    detail.style.display = 'none';
-    if (btn) btn.textContent = 'Monitor ▾';
-    return;
-  }
-
-  detail.style.display = 'block';
-  if (btn) btn.textContent = 'Monitor ▴';
-  detail.innerHTML = '<div class="spinner" style="margin:12px 0"></div>';
-
-  try {
-    const m = await Api.systemStoreMeta(ns);
-    graftStorageMeta(m);
-    detail.innerHTML = renderSystemStoreMeta(m);
-  } catch (e) {
-    if (e.message.includes('404') || e.message.toLowerCase().includes('not been opened')) {
-      detail.innerHTML = `
-        <div class="alert alert-info" style="margin-top:8px">
-          This store has not been opened yet — it is created on first use
-          (e.g. after the first semantic-search query).
-        </div>`;
-    } else {
-      detail.innerHTML = `<div class="alert alert-error" style="margin-top:8px">${esc(e.message)}</div>`;
-    }
-  }
 }
 
 // The per-store kv-meta endpoints omit data that only the engine-wide listings
@@ -2858,83 +2898,102 @@ function renderVlogCard(vlog) {
           </div>
         </div>
       </div>
-      ${vlog.shards.length > 1 ? `
-        <div class="admin-card-title" style="margin-top:10px;margin-bottom:4px">SHARDS (${vlog.shards.length})</div>
-        ${vlog.shards.map(sh => {
-          const sc = sh.waste_ratio_pct > 40 ? 'bad' : sh.waste_ratio_pct > 20 ? 'warn' : 'good';
-          const phys = sh.physical_bytes != null
-            ? `<span class="stat-val text-muted" style="margin-left:8px;font-size:11px"
-                     title="Physical st_blocks${sh.logical_bytes != null ? ` of ${fmtBytes(sh.logical_bytes)} logical` : ''}">${fmtBytes(sh.physical_bytes)} on disk</span>`
-            : '';
-          return `
-          <div class="stat-row">
-            <span class="stat-key">Shard ${sh.bucket}</span>
-            <span class="stat-val">${fmtBytes(sh.live_bytes)} live</span>
-            <span class="stat-val ${sc}" style="margin-left:8px">${sh.waste_ratio_pct.toFixed(1)}% waste</span>
-            ${phys}
-          </div>`;
-        }).join('')}
-      ` : ''}
-      ${vlog.namespace ? `
-        <div style="margin-top:8px">
-          <button class="btn btn-sm btn-ghost" id="vlog-pages-btn-${esc(vlog.namespace)}"
-                  onclick="toggleVlogPages('${esc(vlog.namespace)}')"
-                  title="Per-page garbage breakdown (scans every page; on-demand)">Pages ▾</button>
-          <div id="vlog-pages-${esc(vlog.namespace)}" style="display:none;margin-top:6px"></div>
-        </div>` : ''}
+      ${renderVlogShards(vlog.shards)}
     </div>`;
 }
 
-// On-demand deep dive: GET /admin/storage/value-log/{ns}/pages. Expensive
-// (O(pages × records)), so only fetched when the user expands it. Lists the
-// highest-garbage pages per shard to show where reclaimable waste sits.
-async function toggleVlogPages(ns) {
-  const box = document.getElementById(`vlog-pages-${ns}`);
-  const btn = document.getElementById(`vlog-pages-btn-${ns}`);
-  if (!box) return;
-  if (box.style.display !== 'none') {
-    box.style.display = 'none';
-    if (btn) btn.textContent = 'Pages ▾';
-    return;
-  }
-  box.style.display = 'block';
-  if (btn) btn.textContent = 'Pages ▴';
-  box.innerHTML = '<div class="spinner" style="margin:8px 0"></div>';
-  try {
-    const data = await Api.valueLogPages(ns);
-    box.innerHTML = renderVlogPagesHtml(data);
-  } catch (e) {
-    box.innerHTML = `<div class="alert alert-error" style="margin-top:6px">${esc(e.message)}</div>`;
-  }
-}
+// Unique DOM id per value-log card, so the per-shard segment panels of several
+// cards on one page (store + its companion stores) don't collide.
+let vlogCardSeq = 0;
 
-function renderVlogPagesHtml(data) {
-  const shards = data?.shards ?? [];
-  if (!shards.length) return '<div class="text-muted" style="padding:6px 0">No pages</div>';
-  const TOP = 8;
-  return shards.map(sh => {
-    const pages = [...(sh.pages ?? [])].sort((a, b) => b.garbage_bytes - a.garbage_bytes);
-    const shown = pages.slice(0, TOP);
-    const rows = shown.map(p => {
-      const gc = p.garbage_ratio_pct > 40 ? 'bad' : p.garbage_ratio_pct > 20 ? 'warn' : 'good';
-      return `
-        <div class="stat-row">
-          <span class="stat-key" style="font-family:monospace;font-size:11px">@${fmt(p.page_offset)}</span>
-          <span class="stat-val">${fmtBytes(p.garbage_bytes)} garbage</span>
-          <span class="stat-val ${gc}" style="margin-left:8px">${p.garbage_ratio_pct.toFixed(1)}%</span>
-          <span class="stat-val text-muted" style="margin-left:8px;font-size:11px">${fmt(p.garbage_records)}/${fmt(p.total_records)} recs</span>
-        </div>`;
-    }).join('');
-    const more = pages.length > TOP
-      ? `<div class="text-muted" style="font-size:11px;padding-top:2px">+${pages.length - TOP} more page(s)</div>`
+// Shards, each expandable into the segment files it holds. A sharded value log is
+// now n append-only segment files per shard: exactly one unsealed active tail
+// (never collected) plus sealed segments, which are what GC selects from. The
+// segment rows are what make an imminent GC legible — a sealed segment at 100%
+// garbage is a file about to be unlinked whole.
+function renderVlogShards(shards) {
+  shards = shards ?? [];
+  if (!shards.length) return '';
+  const cardId = `vlog-card-${++vlogCardSeq}`;
+
+  const rows = shards.map((sh, i) => {
+    const sc = sh.waste_ratio_pct > 40 ? 'bad' : sh.waste_ratio_pct > 20 ? 'warn' : 'good';
+    const panelId = `${cardId}-shard-${i}`;
+    const segs = sh.segments ?? [];
+    // segment_count is authoritative; segments[] is the breakdown of the same files.
+    const n = sh.segment_count ?? segs.length;
+    const sealed = sh.sealed_segment_count;
+
+    const phys = sh.physical_bytes != null
+      ? `<span class="stat-val text-muted" style="margin-left:8px;font-size:11px"
+               title="Bytes the shard's segment files occupy on disk${sh.logical_bytes != null ? ` (${fmtBytes(sh.logical_bytes)} of tracked record bytes)` : ''}">${fmtBytes(sh.physical_bytes)} on disk</span>`
       : '';
+
+    const meta = [
+      `${n} seg${n === 1 ? '' : 's'}`,
+      sealed != null ? `${sealed} sealed` : null,
+      sh.active_segment_id != null ? `active #${sh.active_segment_id}` : null,
+      sh.next_segment_id != null ? `next #${sh.next_segment_id}` : null,
+    ].filter(Boolean).join(' · ');
+
     return `
-      <div style="margin-top:4px">
-        <div class="admin-card-title" style="margin-bottom:4px">SHARD ${sh.bucket} — ${sh.page_count} page(s)</div>
-        ${rows || '<div class="text-muted" style="font-size:11px">No garbage pages</div>'}
-        ${more}
+      <div class="vlog-shard">
+        <div class="vlog-shard-head" onclick="toggleVlogShard('${panelId}', this)"
+             title="Click to list this shard's segment files.${sh.next_segment_id != null
+               ? ` Segment ids are never reused, so next #${sh.next_segment_id} also counts every segment this shard has ever created.` : ''}">
+          <span class="vlog-caret">▸</span>
+          <span class="stat-key">Shard ${sh.bucket}</span>
+          <span class="stat-val">${fmtBytes(sh.live_bytes)} live</span>
+          <span class="stat-val ${sc}" style="margin-left:8px">${sh.waste_ratio_pct.toFixed(1)}% waste</span>
+          ${phys}
+        </div>
+        <div class="vlog-shard-meta">${esc(meta)}</div>
+        <div class="vlog-seg-list" id="${panelId}" style="display:none">
+          ${renderVlogSegmentRows(segs)}
+        </div>
       </div>`;
   }).join('');
+
+  return `
+    <div class="admin-card-title" style="margin-top:10px;margin-bottom:4px">SHARDS (${shards.length})</div>
+    ${rows}`;
+}
+
+function renderVlogSegmentRows(segs) {
+  if (!segs.length) {
+    return '<div class="text-muted" style="font-size:11px;padding:4px 0">No segment files yet</div>';
+  }
+  return segs.map(s => {
+    const gc = s.garbage_ratio_pct > 40 ? 'bad' : s.garbage_ratio_pct > 20 ? 'warn' : 'good';
+    // The active tail is still being appended to and is never a GC target, so it is
+    // called out even when its garbage ratio looks alarming.
+    const tag = s.sealed
+      ? '<span class="badge badge-attr" title="Immutable — GC selects from these">sealed</span>'
+      : '<span class="badge badge-indexed" title="The active tail: still being appended to, never collected">active</span>';
+    return `
+      <div class="vlog-seg" title="File ${fmtBytes(s.file_bytes)} (16-byte header + records) · ${fmtBytes(s.total_bytes)} of records, ${fmtBytes(s.live_bytes)} live / ${fmtBytes(s.garbage_bytes)} garbage">
+        <span class="vlog-seg-id">seg ${s.segment_id}</span>
+        <span class="vlog-seg-file">${fmtBytes(s.file_bytes)}</span>
+        <span class="stat-val">${fmtBytes(s.live_bytes)} live</span>
+        <span class="stat-val ${gc}">${s.garbage_ratio_pct.toFixed(0)}% garbage</span>
+        <span class="vlog-seg-bar">
+          <span class="progress-wrap" style="height:4px">
+            <span class="progress-bar" style="display:block;height:100%;width:${Math.min(s.garbage_ratio_pct, 100)}%;
+                  background:${s.garbage_ratio_pct > 40 ? 'var(--error)' : s.garbage_ratio_pct > 20 ? 'var(--warning)' : 'var(--success)'}"></span>
+          </span>
+        </span>
+        ${tag}
+      </div>`;
+  }).join('');
+}
+
+function toggleVlogShard(panelId, head) {
+  const panel = document.getElementById(panelId);
+  if (!panel) return;
+  const open = panel.style.display !== 'none';
+  panel.style.display = open ? 'none' : 'block';
+  const caret = head?.querySelector('.vlog-caret');
+  if (caret) caret.textContent = open ? '▸' : '▾';
 }
 
 function renderTtlCard(m) {
