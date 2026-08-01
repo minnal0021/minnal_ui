@@ -42,6 +42,9 @@ const state = {
   // Last doc list results (range / query / get — for popup callback)
   _docResults: [],
 
+  // Gap records from the last field-index health load (for the Gap… popup)
+  _healthGaps: [],
+
   // Create-store field rows counter (for unique IDs)
   fieldRowSeq: 0,
 
@@ -1861,6 +1864,27 @@ function renderCursorNav(scanId, nextCursor, count) {
     </div>`;
 }
 
+// A query answer is only as complete as the indices it read. When the response
+// names degraded fields, the results may be MISSING rows — say so above them
+// rather than letting a short answer pass for a complete one. Only fields this
+// predicate actually touched are listed, so the warning is specific to the
+// query, not to the namespace.
+//
+// Scans (range/prefix) never carry the field, so this renders nothing for them.
+function renderDegradedBanner(data) {
+  const fields = data?.degraded_fields ?? [];
+  if (!fields.length) return '';
+  const list = fields.map(f => `<span class="text-mono">${esc(f)}</span>`).join(', ');
+  return `
+    <div class="alert alert-warning">
+      ⚠ <strong>Results may be incomplete.</strong>
+      ${fields.length === 1 ? 'The index for' : 'The indices for'} ${list}
+      ${fields.length === 1 ? 'is' : 'are'} known to be missing updates, so matching
+      documents may be absent from this answer.
+      Repair from <strong>Admin → Indices → Field Index Health</strong>, then re-run the query.
+    </div>`;
+}
+
 function renderDocResults(data, optsOrScanId) {
   const isCursorMode = typeof optsOrScanId === 'string';
   const isPaginated  = data && !Array.isArray(data) && 'results' in data;
@@ -1868,7 +1892,11 @@ function renderDocResults(data, optsOrScanId) {
   const pageInfo = (!isCursorMode && isPaginated) ? data : null;
   const nextCursor = isCursorMode ? (data?.next_cursor ?? null) : null;
 
-  if (!results?.length) return '<div class="alert alert-info">No results</div>';
+  // Before the empty check: "no results" from a degraded index is exactly the
+  // case the caller must not read as "nothing matched".
+  const degraded = renderDegradedBanner(data);
+
+  if (!results?.length) return degraded + '<div class="alert alert-info">No results</div>';
 
   // Persist so the popup callback can look up by row index
   state._docResults = results;
@@ -1904,7 +1932,7 @@ function renderDocResults(data, optsOrScanId) {
       </tr>`;
   }).join('');
 
-  return header + nav + `<div class="tbl-wrap"><table class="tbl">
+  return degraded + header + nav + `<div class="tbl-wrap"><table class="tbl">
     <thead><tr>
       <th style="min-width:100px">Document ID</th>
       ${fieldHeaders}
@@ -1931,7 +1959,12 @@ function renderSemanticResults(data, opts) {
   const results  = isPaginated ? data.results : data;
   const pageInfo = isPaginated ? data : null;
 
-  if (!results?.length) return '<div class="alert alert-info">No results</div>';
+  // Filtered search carries the same signal: a degraded predicate index means
+  // the ANN candidates were filtered against a short allow-list, so a nearest
+  // neighbour can be dropped even though its vector is perfectly healthy.
+  const degraded = renderDegradedBanner(data);
+
+  if (!results?.length) return degraded + '<div class="alert alert-info">No results</div>';
 
   // Persist results so the popup callback can access them by index
   state._semanticResults = results;
@@ -1973,7 +2006,7 @@ function renderSemanticResults(data, opts) {
       </tr>`;
   }).join('');
 
-  return header + nav + `<div class="tbl-wrap"><table class="tbl">
+  return degraded + header + nav + `<div class="tbl-wrap"><table class="tbl">
     <thead><tr>
       <th style="min-width:100px">Document ID</th><th>Dot Product</th>
       ${fieldHeaders}
@@ -3227,6 +3260,7 @@ async function loadAdminIndexPanel() {
     </div>
     <div id="admin-index-action-result"></div>
     <div id="admin-index-builds"></div>
+    <div id="admin-index-health"></div>
     <div class="index-frame">
       <div class="index-frame-title">VECTOR INDEX</div>
       <div id="admin-index-vector-stats"><div class="spinner"></div></div>
@@ -3270,6 +3304,195 @@ async function adminIndexRefresh() {
     refreshVqNsSelect(summary?.by_namespace ?? []);
   } catch (e) {
     vstats.innerHTML = `<div class="alert alert-error">Failed to load index data: ${esc(e.message)}</div>`;
+  }
+  // Health fans out one request per indexed namespace, so it loads on its own
+  // and a failure there never blanks the rest of the panel.
+  loadFieldIndexHealth();
+}
+
+// ── Field index health / repair ───────────────────────────────────────────────
+//
+// The per-query `degraded_fields` warning tells a *caller* their answer may be
+// short; this tells an operator which indices to repair. Loaded on every panel
+// refresh so a degraded index is visible without anyone having to click.
+
+async function loadFieldIndexHealth() {
+  const el = document.getElementById('admin-index-health');
+  if (!el) return;
+
+  const namespaces = state.stores
+    .filter(s => (s.indices?.length ?? 0) > 0)
+    .map(s => s.namespace);
+
+  if (!namespaces.length) { el.innerHTML = ''; return; }
+
+  el.innerHTML = '<div class="spinner"></div>';
+  const results = await Promise.all(namespaces.map(ns =>
+    Api.indexHealth(ns)
+      .then(data => ({ ns, data }))
+      .catch(e => ({ ns, error: e.message }))
+  ));
+  el.innerHTML = renderFieldIndexHealthSection(results);
+}
+
+// Cause and repair mode both matter: a wedged checkpoint worker, a crash after
+// bulk loading, and a genuine index fault produce the same symptom but have
+// completely different fixes.
+const GAP_CAUSES = {
+  backstop_reclaim: {
+    label: 'backstop reclaim',
+    hint:  'WAL GC reclaimed a segment this field still needed — the index-replay watermark had fallen too far behind. Check whether the index checkpoint worker is wedged.',
+  },
+  no_wal_writes: {
+    label: 'no-WAL writes',
+    hint:  'The database came up after an unclean shutdown with no-WAL writes outstanding. Those writes have no WAL entries, so repair is necessarily a full rebuild.',
+  },
+  rejected_update: {
+    label: 'rejected update',
+    hint:  'A field index refused an update on the write path. The affected keys were captured exactly, so repair is row-scoped.',
+  },
+};
+
+function renderFieldIndexHealthSection(results) {
+  state._healthGaps = [];
+
+  const rows = [];
+  let degradedCount = 0;
+  let fieldCount    = 0;
+
+  results.forEach(r => {
+    if (r.error) {
+      rows.push({ degraded: false, html: `
+        <tr>
+          <td class="text-mono">${esc(r.ns)}</td>
+          <td colspan="5" class="text-muted" style="font-size:11px">${esc(r.error)}</td>
+        </tr>` });
+      return;
+    }
+
+    (r.data?.fields ?? []).forEach(f => {
+      fieldCount++;
+      const gap = f.gap ?? null;
+      if (gap) degradedCount++;
+
+      const badges = [
+        gap    ? '<span class="badge badge-error">⚠ Degraded</span>'
+               : '<span class="badge badge-indexed">✓ Healthy</span>',
+        f.active ? '' : '<span class="badge badge-attr" title="Not activated in memory, so not queryable — a different condition from a degraded index.">inactive</span>',
+      ].filter(Boolean).join(' ');
+
+      // "never" is not a fault on its own: a field that has taken no writes has
+      // nothing to checkpoint.
+      const checkpoint = f.checkpoint_offset != null
+        ? `<span class="text-mono">${fmt(f.checkpoint_offset)}</span>`
+        : '<span class="text-muted" title="Never checkpointed — nothing has been persisted for this field yet.">never</span>';
+
+      let gapCell = '<span class="text-muted">—</span>';
+      let gapBtn  = '';
+      if (gap) {
+        const cause = GAP_CAUSES[gap.cause] ?? { label: gap.cause, hint: '' };
+        const mode  = gap.repair?.mode === 'row_scoped'
+          ? `row-scoped · ${fmt(gap.repair.keys?.length ?? 0)} key${(gap.repair.keys?.length ?? 0) === 1 ? '' : 's'}`
+          : 'full rebuild';
+        // Detection time answers the first question an operator asks: how long
+        // have queries on this field been returning short answers?
+        const since = gap.detected_at_ms
+          ? `<div class="text-muted" style="font-size:11px">since ${esc(new Date(gap.detected_at_ms).toLocaleString())}</div>`
+          : '';
+        gapCell = `
+          <span class="stat-val bad" title="${esc(cause.hint)}">${esc(cause.label)}</span>
+          <span class="text-muted" style="font-size:11px"> · ${esc(mode)}</span>
+          ${since}`;
+        const idx = state._healthGaps.push({ ns: r.ns, field: f.field_name, gap }) - 1;
+        gapBtn = `<button class="btn btn-xs btn-ghost" onclick="showIndexGap(${idx})"
+                          title="Full gap record: WAL range, missing segments, worklist">Gap…</button>`;
+      }
+
+      rows.push({ degraded: !!gap, html: `
+        <tr>
+          <td class="text-mono">${esc(r.ns)}</td>
+          <td class="text-mono">${esc(f.field_name)}</td>
+          <td>${badges}</td>
+          <td style="text-align:right">${checkpoint}</td>
+          <td>${gapCell}</td>
+          <td class="ns-ops-actions gap-8">
+            ${gapBtn}
+            ${gap ? `<button class="btn btn-xs btn-accent"
+                             onclick="adminRepairFieldIndex('${esc(r.ns)}','${esc(f.field_name)}',this)"
+                             title="Replay the gap's worklist (or rebuild the field) and clear the gap record">Repair</button>` : ''}
+          </td>
+        </tr>` });
+    });
+  });
+
+  if (!rows.length) return '';
+
+  // Degraded first — the whole point of the section is that damage is not
+  // something you have to scroll for.
+  const ordered = [...rows].sort((a, b) => Number(b.degraded) - Number(a.degraded));
+
+  const banner = degradedCount > 0
+    ? `<div class="alert alert-warning">
+         ⚠ <strong>${fmt(degradedCount)} field ${degradedCount === 1 ? 'index is' : 'indices are'} incomplete.</strong>
+         Queries touching ${degradedCount === 1 ? 'it' : 'them'} return <em>degraded_fields</em> and may be
+         missing rows until repaired.
+       </div>`
+    : '';
+
+  return `
+    <div class="section">
+      <div class="section-header">
+        <span class="section-title">FIELD INDEX HEALTH (${fmt(fieldCount)}${degradedCount > 0 ? ` · ${fmt(degradedCount)} degraded` : ''})</span>
+      </div>
+      ${banner}
+      <div class="tbl-wrap"><table class="tbl">
+        <thead><tr>
+          <th>Namespace</th><th>Field</th><th>Status</th>
+          <th style="text-align:right" title="WAL offset the field's persisted index reflects.">Checkpoint</th>
+          <th title="Why the index is incomplete, and what repair it needs.">Gap</th>
+          <th>Operations</th>
+        </tr></thead>
+        <tbody>${ordered.map(r => r.html).join('')}</tbody>
+      </table></div>
+    </div>
+  `;
+}
+
+function showIndexGap(idx) {
+  const entry = state._healthGaps?.[idx];
+  if (!entry) return;
+  openModal(`
+    <div class="modal-title">Gap Record — ${esc(entry.ns)} / ${esc(entry.field)}</div>
+    <div class="json-view" style="max-height:60vh;overflow:auto;padding:12px">${prettyJson(entry.gap)}</div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal()">Close</button>
+    </div>
+  `);
+}
+
+async function adminRepairFieldIndex(ns, field, btn) {
+  if (!confirm(`Repair the "${field}" index of "${ns}"?\n\nThis re-reads each affected key's current value — it is safe to run more than once. A full rebuild scans the namespace and can take a while on a large store.`)) return;
+  btn.disabled = true;
+  const original = btn.textContent;
+  btn.textContent = 'Repairing…';
+  try {
+    const res = await Api.attributeRepair(ns, field);
+    if (res?.status === 'not_degraded') {
+      toast(`"${field}" had no outstanding gap — nothing to repair`);
+    } else {
+      const o = res?.result ?? {};
+      const detail = o.outcome === 'row_scoped'
+        ? `${fmt(o.reindexed)} reindexed, ${fmt(o.absent)} absent of ${fmt(o.keys_total)} keys`
+        : o.outcome === 'full_rebuild'
+          ? `full rebuild — ${fmt(o.scanned)} keys scanned`
+          : 'done';
+      toast(`Repaired "${ns}" / "${field}": ${detail}`);
+    }
+    loadFieldIndexHealth();
+  } catch (e) {
+    toast('Repair failed: ' + e.message, 'error');
+    btn.disabled = false;
+    btn.textContent = original;
   }
 }
 

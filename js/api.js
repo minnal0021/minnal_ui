@@ -175,6 +175,14 @@ const Api = (() => {
   const fieldBlobStats = (ns, field) =>
     req('GET', `/admin/indices/${encodeURIComponent(ns)}/${encodeURIComponent(field)}/blob-stats`);
 
+  // ── Admin Indices — field index health / repair ───────────────────
+  // health: per-field checkpoint offset, active flag, and any outstanding gap.
+  // repair: replays the gap's worklist (or rebuilds the field) and clears it.
+  const indexHealth = (ns) =>
+    req('GET', `/admin/indices/${encodeURIComponent(ns)}/health`);
+  const attributeRepair = (ns, field) =>
+    req('POST', `/admin/indices/${encodeURIComponent(ns)}/attribute/${encodeURIComponent(field)}/repair`);
+
   // ── Admin Indices — single-document reindex ───────────────────────
   const attributeReindexDoc = (ns, field, docId) =>
     req('POST', `/admin/indices/${encodeURIComponent(ns)}/attribute/${encodeURIComponent(field)}/reindex/${encodeURIComponent(docId)}`);
@@ -248,6 +256,8 @@ const Api = (() => {
     clearQueryEmbeddingCache, vectorReconcile,
     // admin indices — corruption / blob stats / single-doc reindex
     vectorCorruptionMetrics, fieldBlobStats, attributeReindexDoc, vectorReindexDoc,
+    // admin indices — field index health / repair
+    indexHealth, attributeRepair,
     // admin indices — progress
     indicesProgress, indicesProgressNs,
     // admin indices — attribute ops

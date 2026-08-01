@@ -535,6 +535,7 @@ select { cursor: pointer; }
 .alert-error   { background: var(--error-dim);   color: var(--error);   border: 1px solid var(--error); }
 .alert-success { background: var(--success-dim); color: var(--success); border: 1px solid var(--success); }
 .alert-info    { background: var(--info-dim);    color: var(--info);    border: 1px solid var(--info); }
+.alert-warning { background: var(--warning-dim); color: var(--warning); border: 1px solid var(--warning); }
 
 /* ── Toast ────────────────────────────────────────────────────────────── */
 .toast-container {
