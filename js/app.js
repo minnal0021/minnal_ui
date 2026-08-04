@@ -78,6 +78,61 @@ function esc(str) {
 function keyTypeBadge(kt) {
   return `<span class="badge badge-${kt}">${kt}</span>`;
 }
+
+/** minnal_db's MAX_STR_KEY_LEN — the cap on str keys in both doc and KV stores. */
+const MAX_STR_KEY_LEN = 50;
+
+/** Byte length of a string as the server sees it: the cap counts UTF-8 bytes, not chars. */
+function utf8Len(s) {
+  return new TextEncoder().encode(s).length;
+}
+
+/**
+ * Validate a str key for `store` before it reaches the server, so an over-long
+ * key fails here instead of after a round trip. Returns an error message, or
+ * null when the key is fine or the store is not string-keyed.
+ */
+function strKeyIssue(store, key) {
+  if (store?.key_type !== 'str') return null;
+  const len = utf8Len(key);
+  if (len === 0) return 'Key must not be empty';
+  if (len > MAX_STR_KEY_LEN) {
+    return `Key is ${len} UTF-8 bytes — the limit is ${MAX_STR_KEY_LEN}`;
+  }
+  return null;
+}
+
+/**
+ * Same cap, applied to a scan prefix: no key can be longer than
+ * MAX_STR_KEY_LEN, so a longer prefix matches nothing.
+ */
+function strPrefixIssue(store, prefix) {
+  if (store?.key_type !== 'str') return null;
+  const len = utf8Len(prefix);
+  if (len > MAX_STR_KEY_LEN) {
+    return `Prefix is ${len} UTF-8 bytes — keys are capped at ${MAX_STR_KEY_LEN}, so it cannot match anything`;
+  }
+  return null;
+}
+
+/** Placeholder for a single document ID input, in the store's key format. */
+function docIdPlaceholder(s, short) {
+  switch (s.key_type) {
+    case 'uuid': return short ? 'e.g. 550e8400-...' : 'e.g. 550e8400-e29b-41d4-a716-446655440000';
+    case 'str':  return `e.g. acme-corp (1–${MAX_STR_KEY_LEN} UTF-8 bytes)`;
+    default:     return 'e.g. 42';
+  }
+}
+
+/** Placeholder for the inclusive start bound of a document range scan. */
+function docRangeStartPlaceholder(s) {
+  switch (s.key_type) {
+    case 'uuid': return '00000000-0000-...';
+    case 'str':  return 'e.g. acme-';
+    default:     return '0';
+  }
+}
+
 function idxTypeBadge(it) {
   return `<span class="badge badge-${it}">${it}</span>`;
 }
@@ -514,9 +569,20 @@ function showCreateStoreModal() {
       <div id="cs-doc-key" class="form-group">
         <label>KEY TYPE</label>
         <div class="radio-group">
-          <label><input type="radio" name="cs-kt" value="uuid" checked> uuid</label>
-          <label><input type="radio" name="cs-kt" value="u64"> u64</label>
-          <label><input type="radio" name="cs-kt" value="u128"> u128</label>
+          <label><input type="radio" name="cs-kt" value="uuid" checked
+                        onchange="onDocKeyTypeChange()"> uuid</label>
+          <label><input type="radio" name="cs-kt" value="u64"
+                        onchange="onDocKeyTypeChange()"> u64</label>
+          <label><input type="radio" name="cs-kt" value="u128"
+                        onchange="onDocKeyTypeChange()"> u128</label>
+          <label><input type="radio" name="cs-kt" value="str"
+                        onchange="onDocKeyTypeChange()"> str</label>
+        </div>
+        <div id="cs-doc-key-note" class="text-muted" style="margin-top:6px;display:none">
+          UTF-8, 1–${MAX_STR_KEY_LEN} bytes, ordered lexicographically — so range and
+          prefix scans read in string order. Vary the <strong>leading</strong> bytes:
+          keys sharing their first 8 bytes (e.g. <code style="font-family:monospace">user:profile:…</code>)
+          all land in one storage bucket.
         </div>
       </div>
 
@@ -527,6 +593,9 @@ function showCreateStoreModal() {
           <div class="radio-group">
             <label><input type="radio" name="cs-kv-kt" value="str" checked> str</label>
             <label><input type="radio" name="cs-kv-kt" value="int"> int</label>
+          </div>
+          <div class="text-muted" style="margin-top:6px">
+            str keys are UTF-8 and capped at ${MAX_STR_KEY_LEN} bytes.
           </div>
         </div>
         <div class="form-group" style="margin-bottom:12px">
@@ -593,6 +662,12 @@ function onCreateStoreTypeChange() {
   document.getElementById('cs-kv-fields').style.display        = isKv ? '' : 'none';
   document.getElementById('cs-doc-fields-section').style.display = isKv ? 'none' : '';
   document.getElementById('cs-doc-semantic-section').style.display = isKv ? 'none' : '';
+}
+
+function onDocKeyTypeChange() {
+  const kt   = document.querySelector('input[name="cs-kt"]:checked')?.value;
+  const note = document.getElementById('cs-doc-key-note');
+  if (note) note.style.display = kt === 'str' ? '' : 'none';
 }
 
 function onKvValueTypeChange() {
@@ -1019,7 +1094,7 @@ function renderDocumentsTab() {
       <div class="form-row" style="margin-bottom:14px">
         <div class="form-group" style="flex:1">
           <label>DOCUMENT ID</label>
-          <input type="text" id="get-id" placeholder="${s.key_type === 'uuid' ? 'e.g. 550e8400-e29b-41d4-a716-446655440000' : 'e.g. 42'}" />
+          <input type="text" id="get-id" placeholder="${docIdPlaceholder(s)}" />
         </div>
         <button class="btn btn-accent" onclick="doGetDoc()">Fetch</button>
       </div>
@@ -1031,7 +1106,7 @@ function renderDocumentsTab() {
       <div class="form-row" style="margin-bottom:14px">
         <div class="form-group" style="flex:1">
           <label>DOCUMENT ID</label>
-          <input type="text" id="put-id" placeholder="${s.key_type === 'uuid' ? 'e.g. 550e8400-...' : 'e.g. 42'}" />
+          <input type="text" id="put-id" placeholder="${docIdPlaceholder(s, true)}" />
         </div>
         <button class="btn btn-accent" onclick="doPutDoc()">Upsert</button>
       </div>
@@ -1050,7 +1125,7 @@ function renderDocumentsTab() {
       <div class="form-row" style="margin-bottom:14px">
         <div class="form-group" style="flex:1">
           <label>DOCUMENT ID</label>
-          <input type="text" id="del-id" placeholder="Document ID to delete" />
+          <input type="text" id="del-id" placeholder="${docIdPlaceholder(s, true)}" />
         </div>
         <button class="btn btn-danger" onclick="confirmDeleteDoc()">Delete</button>
       </div>
@@ -1062,7 +1137,7 @@ function renderDocumentsTab() {
       <div class="form-row" style="margin-bottom:14px">
         <div class="form-group" style="flex:1">
           <label>START KEY <span class="text-muted">(inclusive)</span></label>
-          <input type="text" id="range-start" placeholder="${s.key_type === 'uuid' ? '00000000-0000-...' : '0'}" />
+          <input type="text" id="range-start" placeholder="${docRangeStartPlaceholder(s)}" />
         </div>
         <div class="form-group" style="flex:1">
           <label>END KEY <span class="text-muted">(exclusive, optional)</span></label>
@@ -1162,6 +1237,8 @@ async function doGetKv() {
   const ns  = state.selectedStore?.namespace;
   const el  = document.getElementById('kv-get-result');
   if (!key || !ns) return;
+  const bad = strKeyIssue(state.selectedStore, key);
+  if (bad) { el.innerHTML = `<div class="alert alert-error">${esc(bad)}</div>`; return; }
   el.innerHTML = '<div class="spinner"></div>';
   try {
     const value = await Api.getKv(ns, key);
@@ -1189,6 +1266,8 @@ async function doPutKv() {
   const ns    = state.selectedStore?.namespace;
   const el    = document.getElementById('kv-set-result');
   if (!key || !ns) return;
+  const badKey = strKeyIssue(state.selectedStore, key);
+  if (badKey) { el.innerHTML = `<div class="alert alert-error">${esc(badKey)}</div>`; return; }
 
   let value;
   const vt = state.selectedStore?.value_type;
@@ -1224,6 +1303,8 @@ function confirmDeleteKv() {
   const key = document.getElementById('kv-del-key').value.trim();
   const ns  = state.selectedStore?.namespace;
   if (!key || !ns) { toast('Enter a key', 'error'); return; }
+  const bad = strKeyIssue(state.selectedStore, key);
+  if (bad) { toast(bad, 'error'); return; }
   openModal(`
     <div class="modal-title">Delete KV Entry</div>
     <p class="confirm-msg">
@@ -1257,6 +1338,8 @@ async function doGetDoc() {
   const ns  = state.selectedStore?.namespace;
   const el  = document.getElementById('get-result');
   if (!id || !ns) return;
+  const bad = strKeyIssue(state.selectedStore, id);
+  if (bad) { el.innerHTML = `<div class="alert alert-error">${esc(bad)}</div>`; return; }
   el.innerHTML = '<div class="spinner"></div>';
   try {
     const doc = await Api.getDoc(ns, id);
@@ -1299,6 +1382,8 @@ async function doPutDoc() {
   const ns   = state.selectedStore?.namespace;
   const el   = document.getElementById('put-result');
   if (!id || !ns) return;
+  const bad = strKeyIssue(state.selectedStore, id);
+  if (bad) { el.innerHTML = `<div class="alert alert-error">${esc(bad)}</div>`; return; }
   let doc;
   try { doc = JSON.parse(body); }
   catch { el.innerHTML = '<div class="alert alert-error">Invalid JSON body</div>'; return; }
@@ -1316,6 +1401,8 @@ function confirmDeleteDoc() {
   const id = document.getElementById('del-id').value.trim();
   const ns = state.selectedStore?.namespace;
   if (!id || !ns) { toast('Enter a document ID', 'error'); return; }
+  const bad = strKeyIssue(state.selectedStore, id);
+  if (bad) { toast(bad, 'error'); return; }
   openModal(`
     <div class="modal-title">Delete Document</div>
     <p class="confirm-msg">
@@ -1346,6 +1433,9 @@ async function doRangeScan() {
   const ns    = state.selectedStore?.namespace;
   const el    = document.getElementById('range-result');
   if (!start || !ns) { toast('Start key is required', 'error'); return; }
+  const bad = strKeyIssue(state.selectedStore, start)
+           ?? (end ? strKeyIssue(state.selectedStore, end) : null);
+  if (bad) { el.innerHTML = `<div class="alert alert-error">${esc(bad)}</div>`; return; }
   el.innerHTML = '<div class="spinner"></div>';
   try {
     const data   = await Api.rangeScan(ns, start, end, currentScanCursor('docRange'), limit);
@@ -1418,7 +1508,7 @@ function renderQueryTab() {
       <div class="form-row" style="margin-bottom:14px">
         <div class="form-group" style="flex:1">
           <label>START KEY <span class="text-muted">(inclusive)</span></label>
-          <input type="text" id="q-range-start" placeholder="${s.key_type === 'uuid' ? '00000000-0000-...' : '0'}" />
+          <input type="text" id="q-range-start" placeholder="${docRangeStartPlaceholder(s)}" />
         </div>
         <div class="form-group" style="flex:1">
           <label>END KEY <span class="text-muted">(exclusive, optional)</span></label>
@@ -1436,12 +1526,14 @@ function renderQueryTab() {
     <!-- Prefix -->
     <div id="q-prefix" class="sub-panel ${sub==='prefix'?'active':''}">
       <p class="text-muted" style="margin-bottom:10px">
-        Enter the doc ID prefix as a hex string (e.g. <code style="font-family:monospace">deadbeef</code> or a partial UUID without hyphens).
+        ${s.key_type === 'str'
+          ? `Enter the doc ID prefix as a plain string (e.g. <code style="font-family:monospace">acme-</code> matches <code style="font-family:monospace">acme-1</code>). At most ${MAX_STR_KEY_LEN} UTF-8 bytes — a longer prefix could not match any key.`
+          : 'Enter the doc ID prefix as a hex string (e.g. <code style="font-family:monospace">deadbeef</code> or a partial UUID without hyphens).'}
       </p>
       <div class="form-row" style="margin-bottom:14px">
         <div class="form-group" style="flex:1">
-          <label>PREFIX <span class="text-muted">(hex bytes)</span></label>
-          <input type="text" id="q-prefix-input" placeholder="e.g. deadbeef or 550e8400e29b" />
+          <label>PREFIX <span class="text-muted">(${s.key_type === 'str' ? 'string' : 'hex bytes'})</span></label>
+          <input type="text" id="q-prefix-input" placeholder="${s.key_type === 'str' ? 'e.g. acme-' : 'e.g. deadbeef or 550e8400e29b'}" />
         </div>
         <div class="form-group" style="max-width:100px">
           <label>LIMIT</label>
@@ -1597,6 +1689,9 @@ async function doKvRangeScan() {
   const ns    = state.selectedStore?.namespace;
   const el    = document.getElementById('kv-range-result');
   if (!start || !ns) { toast('Start key is required', 'error'); return; }
+  const bad = strKeyIssue(state.selectedStore, start)
+           ?? (end ? strKeyIssue(state.selectedStore, end) : null);
+  if (bad) { el.innerHTML = `<div class="alert alert-error">${esc(bad)}</div>`; return; }
   el.innerHTML = '<div class="spinner"></div>';
   try {
     const data = await Api.kvRangeScan(ns, start, end, currentScanCursor('kvRange'), limit);
@@ -1612,6 +1707,8 @@ async function doKvPrefixScan() {
   const ns     = state.selectedStore?.namespace;
   const el     = document.getElementById('kv-prefix-result');
   if (!prefix || !ns) { toast('Prefix is required', 'error'); return; }
+  const bad = strPrefixIssue(state.selectedStore, prefix);
+  if (bad) { el.innerHTML = `<div class="alert alert-error">${esc(bad)}</div>`; return; }
   el.innerHTML = '<div class="spinner"></div>';
   try {
     const data = await Api.kvPrefixScan(ns, prefix, currentScanCursor('kvPrefix'), limit);
@@ -1762,6 +1859,9 @@ async function doQueryRangeScan() {
   const ns    = state.selectedStore?.namespace;
   const el    = document.getElementById('q-range-result');
   if (!start || !ns) { toast('Start key is required', 'error'); return; }
+  const bad = strKeyIssue(state.selectedStore, start)
+           ?? (end ? strKeyIssue(state.selectedStore, end) : null);
+  if (bad) { el.innerHTML = `<div class="alert alert-error">${esc(bad)}</div>`; return; }
   el.innerHTML = '<div class="spinner"></div>';
   try {
     const data   = await Api.rangeScan(ns, start, end, currentScanCursor('docQueryRange'), limit);
@@ -1777,6 +1877,8 @@ async function doPrefixScan() {
   const ns     = state.selectedStore?.namespace;
   const el     = document.getElementById('q-prefix-result');
   if (!prefix || !ns) { toast('Prefix is required', 'error'); return; }
+  const bad = strPrefixIssue(state.selectedStore, prefix);
+  if (bad) { el.innerHTML = `<div class="alert alert-error">${esc(bad)}</div>`; return; }
   el.innerHTML = '<div class="spinner"></div>';
   try {
     const data   = await Api.prefixScan(ns, prefix, currentScanCursor('docPrefix'), limit);
