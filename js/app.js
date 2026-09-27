@@ -3221,8 +3221,13 @@ async function adminTriggerWalGc() {
   el.innerHTML = '<div class="spinner"></div>';
   try {
     const r = await Api.triggerWalGc();
+    // Servers before minnal#28 sent these two values under the wrong names
+    // (total_entries = bytes reclaimed, persisted_entries = entries still unpersisted).
+    const reclaimed = r.bytes_reclaimed ?? r.total_entries;
+    const unpersisted = r.unpersisted_entries ?? r.persisted_entries;
     el.innerHTML = `<div class="alert alert-success">
-      WAL GC complete — total: ${fmt(r.total_entries)}, persisted: ${fmt(r.persisted_entries)}
+      WAL GC complete — reclaimed ${fmtBytes(reclaimed)};
+      ${fmt(unpersisted)} entries still waiting to be persisted
     </div>`;
     toast('WAL GC complete');
     loadStorageStats();
