@@ -2372,8 +2372,11 @@ function renderOpsMetricsHtml(m, opts = {}) {
         ${row('Fast-path Hits', fmt(l.fast_path_hits), 'good', 'Lookups served by the active memtable without scanning lower layers.')}
         ${row('Fast-path Ratio', ratioPct(l.fast_path_hit_ratio), ratioCls(l.fast_path_hit_ratio, 0.5), 'Fast-path Hits / Lookups.')}
         ${row('L0 Probes', fmt(l.l0_probes), '', 'Lookups that scanned at least one L0 SSTable.')}
-        ${row('L1 Probes', fmt(l.l1_probes), '', 'Lookups that scanned the L1 SSTable (not rejected by the bloom filter).')}
+        ${row('L1 Probes', fmt(l.l1_probes), '', 'Lookups that scanned the L1 SSTable (not skipped by the bloom filter or by seq).')}
         ${row('Bloom Rejects', fmt(l.bloom_rejects), '', 'L1 lookups short-circuited by the bloom filter ("definitely absent") — work avoided.')}
+        ${row('L0 Bloom Rejects', fmt(l.l0_bloom_rejects), '', 'L0 files a lookup skipped without reading: the key is outside the file\'s key range, or its bloom filter says "definitely absent" — work avoided.')}
+        ${row('Seq Prunes', fmt(l.seq_prunes), '', 'SSTables (L0 files or the L1 file) a lookup skipped without reading because a newer layer already held a copy at least as new as anything in them — work avoided.')}
+        ${row('Sparse Hint Rejects', fmt(l.sparse_hint_rejects), (l.sparse_hint_rejects ?? 0) > 0 ? 'warn' : '', 'Lookups whose sparse-index hint failed validation, so the scan restarted from the top of the file. Answers stay correct, only slower. A few are expected briefly for L1 during a compaction; a steady climb means the index offsets are wrong.')}
       </div>
 
       <div class="admin-card">
