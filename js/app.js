@@ -1981,9 +1981,10 @@ function renderDegradedBanner(data) {
     <div class="alert alert-warning">
       ⚠ <strong>Results may be incomplete.</strong>
       ${fields.length === 1 ? 'The index for' : 'The indices for'} ${list}
-      ${fields.length === 1 ? 'is' : 'are'} known to be missing updates, so matching
-      documents may be absent from this answer.
-      Repair from <strong>Admin → Indices → Field Index Health</strong>, then re-run the query.
+      ${fields.length === 1 ? 'is' : 'are'} either still being built or known to be missing
+      updates, so matching documents may be absent from this answer.
+      A build fills in by itself (see <strong>Admin → Index Management → Active Index Builds</strong>);
+      a gap is repaired from <strong>Field Index Health</strong> on the same page. Then re-run the query.
     </div>`;
 }
 
@@ -2413,12 +2414,52 @@ function renderOpsMetricsHtml(m, opts = {}) {
         ${row('WAL Segments Deleted', fmt(g.wal_segments_deleted), '', 'WAL segments reclaimed by GC.')}`}
       </div>
 
+      ${perNs ? '' : renderIndexWriteBufferCard(m.index_overlay, row)}
+
       ${perNs ? '' : `<div class="admin-card">
         <div class="admin-card-title">UPTIME</div>
         ${row('Since Startup', fmtUptime(m.uptime_s), '', 'Seconds since the server process started.')}
       </div>`}
     </div>
   `;
+}
+
+// Field-index write buffers (engine-wide `index_overlay`). Every field index
+// keeps the bitmap containers changed since the last index checkpoint in
+// memory; one budget covers all of them. Past the soft limit the server asks
+// for an early checkpoint; past the hard limit the writer that crossed it writes
+// its own field out before returning (two fsyncs, so that write is slow). The
+// limits are the server's `thresholds.index_overlay_soft_bytes` /
+// `index_overlay_hard_bytes` settings.
+function renderIndexWriteBufferCard(o, row) {
+  if (!o) return '';
+  const used = o.used_bytes ?? 0, peak = o.peak_bytes ?? 0;
+  const soft = o.soft_limit_bytes ?? 0, hard = o.hard_limit_bytes ?? 0;
+  const ratio = hard > 0 ? peak / hard : 0;
+  const peakCls = peak > hard ? 'bad' : peak >= soft ? 'warn' : 'good';
+  const spills = o.hard_spills ?? 0;
+  const avgUs = spills > 0 ? (o.hard_spill_micros ?? 0) / spills : null;
+  const avgSpill = avgUs == null ? '—'
+    : avgUs < 1000 ? `${Math.round(avgUs)} µs`
+    : avgUs < 10000 ? `${(avgUs / 1000).toFixed(1)} ms`
+    : fmtMillis(Math.round(avgUs / 1000));
+  return `<div class="admin-card">
+        <div class="admin-card-title" title="Memory the field indexes hold for changes not yet written to their files, shared by every field of the database. In-memory counters, reset on restart.">FIELD-INDEX WRITE BUFFER</div>
+        <div style="margin:6px 0 10px">
+          <div class="progress-wrap" style="height:10px">
+            <div class="progress-bar" style="width:${Math.min(ratio * 100, 100)}%;
+                 background:${peak > hard ? 'var(--error)' : peak >= soft ? 'var(--warning)' : 'var(--success)'}"></div>
+          </div>
+          <div class="progress-label">peak ${fmtBytes(peak)} of ${fmtBytes(hard)} hard limit</div>
+        </div>
+        ${row('Used Now', fmtBytes(used), '', 'Bytes the write buffers hold now: changes made since the last index checkpoint, across every field.')}
+        ${row('Peak', fmtBytes(peak), peakCls, 'Highest use since startup. Compare with the soft limit: a peak near it means early checkpoints are firing; raise the limits if the server has the memory.')}
+        ${row('Soft Limit', fmtBytes(soft), '', 'thresholds.index_overlay_soft_bytes — crossing it requests an index checkpoint now.')}
+        ${row('Hard Limit', fmtBytes(hard), '', 'thresholds.index_overlay_hard_bytes — a write that leaves use above it writes its own field out before returning.')}
+        ${row('Soft Crossings', fmt(o.soft_crossings), (o.soft_crossings ?? 0) > 0 ? 'warn' : '', 'Times use rose past the soft limit, each asking for an early checkpoint. A steady climb means the write rate fills the buffers within one checkpoint interval.')}
+        ${row('Hard-limit Spills', fmt(spills), spills > 0 ? 'bad' : 'good', 'Writes that found use over the hard limit and wrote their field out themselves (two fsyncs each). Should stay at 0; a steady rate means the limits are too small for the write rate.')}
+        ${row('Avg Spill Time', avgSpill, '', 'Average time a hard-limit spill added to the write that triggered it.')}
+      </div>`;
 }
 
 function fmtMillis(ms) {
@@ -2840,7 +2881,7 @@ function renderIndexWasteSection(waste) {
           ${f.over_threshold ? '<span class="badge badge-error">over threshold</span>' : ''}
         </span>
         <span class="sys-store-meta">
-          <span class="stat-key" title="Reclaimable fraction of the bitmap blob store (one blob per distinct value, re-appended on every write). Grows with per-document churn.">bitmap</span> ${wasteCell(f.bitmap_waste_ratio)}
+          <span class="stat-key" title="Reclaimable fraction of the bitmap store. Each index checkpoint appends the bitmap containers that changed and a new directory per changed value, leaving the old copies behind. Grows with write churn; compaction reclaims it.">bitmap</span> ${wasteCell(f.bitmap_waste_ratio)}
           <span class="stat-key" style="margin-left:12px" title="Reclaimable fraction of the keymap blob store (slot → value). Grows under distinct-value churn.">keymap</span> ${wasteCell(f.keymap_waste_ratio)}
           ${f.distinct_count != null
             ? `<span class="stat-key" style="margin-left:12px" title="Distinct indexed values for this field.">distinct</span>
@@ -3457,6 +3498,10 @@ const GAP_CAUSES = {
     label: 'no-WAL writes',
     hint:  'The database came up after an unclean shutdown with no-WAL writes outstanding. Those writes have no WAL entries, so repair is necessarily a full rebuild.',
   },
+  damaged_index_file: {
+    label: 'damaged index file',
+    hint:  'The field\'s index files held entries torn by a crash (a power loss, say); they were dropped when the index opened. Rows they held may predate the WAL replay window, so repair is a full rebuild.',
+  },
   rejected_update: {
     label: 'rejected update',
     hint:  'A field index refused an update on the write path. The affected keys were captured exactly, so repair is row-scoped.',
@@ -3825,6 +3870,8 @@ function renderNamespaceControlsSection(byNs) {
           <td class="ns-ops-actions gap-8">
             <button class="btn btn-xs btn-ghost" onclick="toggleFieldBlobStats('${esc(ns)}',this)"
                     title="On-disk blob growth/waste per field (complements fleet-wide Field Index Waste)">Blob Stats ▾</button>
+            <button class="btn btn-xs btn-ghost" onclick="toggleRowMapStats('${esc(ns)}',this)"
+                    title="Row IDs held by deleted documents — what Reindex All would free (counts documents with a key scan)">Row Map ▾</button>
             <button class="btn btn-xs btn-ghost" onclick="showReindexDocFieldModal('${esc(ns)}')"
                     title="Reindex one field of a single document (synchronous)">Reindex Doc…</button>
             <button class="btn btn-xs btn-ghost" onclick="adminAttrReindexAll('${esc(ns)}',this)"
@@ -3835,6 +3882,9 @@ function renderNamespaceControlsSection(byNs) {
         </tr>
         <tr id="blob-row-${esc(ns)}" style="display:none">
           <td colspan="3" id="blob-cell-${esc(ns)}" style="padding:0"></td>
+        </tr>
+        <tr id="rowmap-row-${esc(ns)}" style="display:none">
+          <td colspan="3" id="rowmap-cell-${esc(ns)}" style="padding:0"></td>
         </tr>`);
     }
 
@@ -4002,7 +4052,7 @@ async function adminVectorReconcile(btn) {
 // ── Namespace index operations (async 202) ────────────────────────────────────
 
 async function adminAttrReindexAll(ns, btn) {
-  if (!confirm(`Drop and rebuild all field indices for "${ns}"?\n\nThis runs in the background — monitor progress in Active Index Builds.`)) return;
+  if (!confirm(`Drop and rebuild all field indices for "${ns}"?\n\nThis runs in the background — monitor progress in Active Index Builds. It also frees the row IDs of deleted documents (see Row Map). Queries on an index list it in degraded_fields until its build finishes; a run interrupted by a restart is finished when the server starts again.`)) return;
   btn.disabled = true;
   try {
     await Api.attributeReindexAll(ns);
@@ -4015,7 +4065,7 @@ async function adminAttrReindexAll(ns, btn) {
 }
 
 async function adminAttrDropAll(ns, btn) {
-  if (!confirm(`Drop all field indices for "${ns}"?\n\nThis cannot be undone.`)) return;
+  if (!confirm(`Drop all field indices for "${ns}"?\n\nThis cannot be undone. With no index left, the store's row map is reset too.`)) return;
   btn.disabled = true;
   try {
     await Api.attributeDropAll(ns);
@@ -4151,6 +4201,54 @@ async function submitReindexDocVector(ns) {
 }
 
 // ── Per-field blob stats (drill-down of fleet-wide Field Index Waste) ─────────
+
+// Row map: the dense numbering of documents the field indices use. It never
+// frees an ID on its own, so after many deletes it holds the IDs of documents
+// that no longer exist; Reindex All frees them. Loaded on demand — the server
+// counts live documents with a key scan.
+async function toggleRowMapStats(ns, btn) {
+  const row  = document.getElementById(`rowmap-row-${ns}`);
+  const cell = document.getElementById(`rowmap-cell-${ns}`);
+  if (!row || !cell) return;
+  if (row.style.display !== 'none') {
+    row.style.display = 'none';
+    btn.textContent = 'Row Map ▾';
+    return;
+  }
+  row.style.display = '';
+  btn.textContent = 'Row Map ▴';
+  cell.innerHTML = '<div class="spinner" style="margin:12px"></div>';
+  try {
+    cell.innerHTML = renderRowMapDetail(await Api.rowmapStats(ns));
+  } catch (e) {
+    cell.innerHTML = `<div class="alert alert-error" style="margin:8px">${esc(e.message)}</div>`;
+  }
+}
+
+function renderRowMapDetail(d) {
+  const wrap = (inner) => `<div style="padding:8px 12px;background:var(--bg-2);border-top:1px solid var(--border)">${inner}</div>`;
+  if (!d?.uses_row_map) {
+    return wrap(`<div class="text-muted" style="font-size:12px">
+      No row map: this store's row IDs come from its <span class="text-mono">u64</span> keys,
+      or its indices were never built. Nothing to compact.</div>`);
+  }
+  const alloc = d.ids_allocated ?? 0, live = d.live_docs ?? 0, dead = d.dead_ids ?? 0;
+  const deadFrac = alloc > 0 ? dead / alloc : 0;
+  const deadCls = deadFrac >= 0.5 ? 'bad' : deadFrac >= 0.2 ? 'warn' : 'good';
+  const stat = (k, v, cls, tip) => `<span class="stat-key" style="margin-left:12px" title="${esc(tip)}">${k}</span>
+    <span class="stat-val ${cls ?? ''}">${v}</span>`;
+  return wrap(`
+    <div class="text-muted" style="font-size:11px;margin-bottom:6px">
+      Every document a field index has seen keeps a row ID, deleted or not.
+      <strong>Reindex All</strong> frees the IDs of deleted documents and shrinks these files.
+    </div>
+    <div class="sys-store-meta">
+      ${stat('IDs allocated', fmt(alloc), '', 'Row IDs handed out: every document ever indexed, live or deleted.')}
+      ${stat('live documents', fmt(live), '', 'Documents in the store now.')}
+      ${stat('dead IDs', `${fmt(dead)} (${(deadFrac * 100).toFixed(1)}%)`, deadCls, 'IDs held by documents that no longer exist. Reindex All frees them.')}
+      ${stat('on disk', fmtBytes(d.bytes_on_disk), '', 'Size of the row map files.')}
+    </div>`);
+}
 
 async function toggleFieldBlobStats(ns, btn) {
   const row  = document.getElementById(`blob-row-${ns}`);
