@@ -30,7 +30,7 @@ The interface is organised into four tabs, each mapping onto a part of the minna
 | **Schema** | Create, view, amend, and delete document stores and KV stores; manage field indices and embedding fields. |
 | **Documents** | Browse, get, put, and delete documents; range scans and prefix scans with pagination. |
 | **Query** | Run predicate queries against field indices, plus semantic search and filtered semantic search. |
-| **Admin** | Server health and uptime, storage stats, ops metrics, WAL/LSM/value-log inspection, GC and compaction triggers, and vector index queue management. |
+| **Admin** | Server health and uptime, storage stats, ops metrics (including the field-index write buffer), WAL/LSM/value-log inspection, GC and compaction triggers, field-index health, blob and row-map stats, and vector index queue management. |
 
 ---
 

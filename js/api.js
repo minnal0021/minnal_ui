@@ -175,6 +175,12 @@ const Api = (() => {
   const fieldBlobStats = (ns, field) =>
     req('GET', `/admin/indices/${encodeURIComponent(ns)}/${encodeURIComponent(field)}/blob-stats`);
 
+  // ── Admin Indices — row map (dense row IDs for field indices) ─────
+  // ids_allocated / live_docs / dead_ids / bytes_on_disk; counts live docs
+  // with a key scan, so call it on demand rather than on every refresh.
+  const rowmapStats = (ns) =>
+    req('GET', `/admin/indices/${encodeURIComponent(ns)}/rowmap`);
+
   // ── Admin Indices — field index health / repair ───────────────────
   // health: per-field checkpoint offset, active flag, and any outstanding gap.
   // repair: replays the gap's worklist (or rebuilds the field) and clears it.
@@ -257,7 +263,7 @@ const Api = (() => {
     // admin indices — corruption / blob stats / single-doc reindex
     vectorCorruptionMetrics, fieldBlobStats, attributeReindexDoc, vectorReindexDoc,
     // admin indices — field index health / repair
-    indexHealth, attributeRepair,
+    indexHealth, attributeRepair, rowmapStats,
     // admin indices — progress
     indicesProgress, indicesProgressNs,
     // admin indices — attribute ops
