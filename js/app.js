@@ -310,6 +310,7 @@ function renderActiveTab() {
   else if (t === 'documents') renderDocumentsTab();
   else if (t === 'query')     renderQueryTab();
   else if (t === 'admin')     renderAdminTab();
+  else if (t === 'vector-ops') renderVectorOpsTab();
 }
 
 // ── Schema tab ────────────────────────────────────────────────────────────────

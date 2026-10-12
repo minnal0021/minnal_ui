@@ -23,13 +23,14 @@ A lightweight, dependency-free web console for [**minnal**](https://github.com/m
 
 ## What it does
 
-The interface is organised into four tabs, each mapping onto a part of the minnal REST API:
+The interface is organised into five tabs, each mapping onto a part of the minnal REST API:
 
 | Tab | Purpose |
 |---|---|
 | **Schema** | Create, view, amend, and delete document stores and KV stores; manage field indices and embedding fields. |
 | **Documents** | Browse, get, put, and delete documents; range scans and prefix scans with pagination. |
 | **Query** | Run predicate queries against field indices, plus semantic search and filtered semantic search. |
+| **Vector Index Ops** | One semantic-search store at a time (its own store selector): whether a partition rebuild would help (recall check, verdict, before/after comparison), running checks and rebuilds, the partition's size and maintenance counters, code metrics (centre drift and friends, each explained), every posting, the recorded history, and the store's vector-index settings beside the server's. |
 | **Admin** | Server health and uptime, storage stats, ops metrics (including the field-index write buffer), WAL/LSM/value-log inspection, GC and compaction triggers, field-index health, blob and row-map stats, and vector index queue management. |
 
 ---
@@ -137,6 +138,42 @@ For Docker, `build.sh` additionally honours `IMAGE_NAME` and `CONTAINER_NAME`.
 
 ---
 
+## Vector Index Ops
+
+A store with semantic search keeps its vectors in **postings** (clusters) that
+split and merge as data arrives. This tab answers one question for the store you
+pick: **would rebuilding its partition help, and did the last one?**
+
+- **Rebuild decision** — a plain-language verdict and the evidence behind it,
+  plus the two actions:
+  - *Recall check*: searches sampled real queries (from the query-embedding
+    cache, so no embedding calls) twice, with the store's probe budget and
+    reading every posting, and reports how much of the full read the normal
+    search found (overlap@10 … @100).
+  - *Rebuild*: re-fits the postings on everything stored. The verdict tells you
+    to check again with the same seed afterwards, and compares the two.
+  A store whose searches already read every entry needs no rebuild; the verdict
+  says so without a check.
+- **Partition** — postings, entries, chunks, size percentiles against the split
+  and merge limits (with a histogram), maintenance counters, corruption counters
+  and the last rebuild.
+- **Code metrics** — centre drift, foreign and zero-centre share, error band and
+  the re-encode candidates, with what each means. Drift measures code precision
+  and calls for re-embedding (vector reindex-all), never for a rebuild; a rebuild
+  raises it.
+- **Postings** — every posting, sortable, with its code metrics on request.
+- **History** — recall checks and rebuilds as a timeline, with the change in
+  overlap@10 between comparable checks (same seed, query source and budget).
+- **Settings** — the store's `vector_index` settings beside the server's
+  defaults (differences highlighted), and the server-wide `[semantic_search]`
+  values.
+
+Every label has a tooltip. The tab needs a minnal server built from its
+`dynamic-rabitq-index` branch (the partition, recall-check, rebuild, history and
+settings endpoints).
+
+---
+
 ## Project layout
 
 ```
@@ -145,7 +182,8 @@ minnal_ui/
 ├── css/style.css   # Styles
 ├── js/
 │   ├── api.js      # Thin async wrapper over the minnal REST API
-│   └── app.js      # UI logic, rendering, event handling
+│   ├── app.js      # UI logic, rendering, event handling
+│   └── vector_ops.js # The Vector Index Ops tab
 ├── img/logo.svg    # மின்னல் logo
 ├── server.py       # Static file server + /stores,/kv-stores,/admin proxy
 ├── start.sh        # Run server.py with sensible env defaults

@@ -238,6 +238,36 @@ const Api = (() => {
   const vectorQueueDeleteEntry = (ns, idHex) => req('DELETE', `/admin/indices/${encodeURIComponent(ns)}/vector/queue/${encodeURIComponent(idHex)}`);
   const vectorQueueRetryEntry  = (ns, idHex) => req('POST',   `/admin/indices/${encodeURIComponent(ns)}/vector/queue/${encodeURIComponent(idHex)}/retry`);
 
+  // ── Admin Indices — vector partition, recall check, rebuild, history ──
+  // partition: from memory; with codes=true it reads every chunk code (costly).
+  // recall-check: synchronous; costs `sample` searches plus as many full reads.
+  // rebuild: 202, runs in the background; its status is the partition's `rebuild`.
+  const enc = encodeURIComponent;
+  const vectorPartition = (ns, codes) =>
+    req('GET', `/admin/indices/${enc(ns)}/vector/partition${codes ? '?codes=true' : ''}`);
+  const vectorPostings = (ns, opts = {}) => {
+    const p = new URLSearchParams();
+    for (const k of ['sort', 'order', 'cursor', 'limit']) if (opts[k] != null && opts[k] !== '') p.set(k, opts[k]);
+    if (opts.codes) p.set('codes', 'true');
+    return req('GET', `/admin/indices/${enc(ns)}/vector/postings?${p}`);
+  };
+  const vectorRecallCheck = (ns, opts = {}) => {
+    const p = new URLSearchParams();
+    for (const k of ['sample', 'seed', 'min_overlap', 'probe_budget_entries', 'min_probes', 'max_probes'])
+      if (opts[k] != null && opts[k] !== '') p.set(k, opts[k]);
+    return req('GET', `/admin/indices/${enc(ns)}/vector/recall-check?${p}`);
+  };
+  const vectorRebuild = (ns, postings) =>
+    req('POST', `/admin/indices/${enc(ns)}/vector/rebuild`, postings ? { postings } : undefined);
+  const vectorHistory = (ns, kind, limit) => {
+    const p = new URLSearchParams();
+    if (kind)  p.set('kind', kind);
+    if (limit) p.set('limit', limit);
+    return req('GET', `/admin/indices/${enc(ns)}/vector/history?${p}`);
+  };
+  const vectorServerSettings = () => req('GET', '/admin/indices/vector/settings');
+  const vectorCorruptionMetricsNs = (ns) => req('GET', `/admin/indices/${enc(ns)}/vector/corruption-metrics`);
+
   return {
     setBaseUrl,
     // stores (doc + KV, dispatched on store_type)
@@ -276,5 +306,8 @@ const Api = (() => {
     vectorQueueByNamespace, vectorQueueRetriedByNamespace,
     // vector queue — per-entry
     vectorQueueGetEntry, vectorQueueDeleteEntry, vectorQueueRetryEntry,
+    // vector index ops — partition, recall check, rebuild, history, settings
+    vectorPartition, vectorPostings, vectorRecallCheck, vectorRebuild, vectorHistory,
+    vectorServerSettings, vectorCorruptionMetricsNs,
   };
 })();
