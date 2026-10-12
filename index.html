@@ -43,8 +43,6 @@
         <button class="tab-btn active" data-tab="schema"    onclick="switchTab('schema')">Schema</button>
         <button class="tab-btn"        data-tab="documents" onclick="switchTab('documents')">Documents</button>
         <button class="tab-btn"        data-tab="query"     onclick="switchTab('query')">Query</button>
-        <button class="tab-btn"        data-tab="vector-ops" onclick="switchTab('vector-ops')"
-                title="Per-store vector index: rebuild decision, partition, code metrics, postings, history and settings">Vector Index Ops</button>
         <button class="tab-btn"        data-tab="admin"     onclick="switchTab('admin')">Admin</button>
       </nav>
 
@@ -74,13 +72,6 @@
           </div>
         </div>
 
-        <!-- Vector Index Ops tab -->
-        <div id="tab-vector-ops" class="tab-panel">
-          <div class="welcome">
-            <p class="welcome-icon">🧭</p>
-            <p>Connect to see the vector index of your semantic-search stores.</p>
-          </div>
-        </div>
 
         <!-- Admin tab -->
         <div id="tab-admin" class="tab-panel">

@@ -25,7 +25,7 @@ const state = {
   adminWal:       null,
   adminLsm:       null,
   adminVlog:      null,
-  adminTab:       'storage', // 'storage' | 'ops' | 'index'
+  adminTab:       'storage', // 'storage' | 'ops' | 'index' | 'vector-ops'
   adminSys:       null, // /admin/system-stores payload cached during loadStorageStats
   adminRowCounts: {}, // { [namespace]: number }
   storageStoresTab:  'doc', // 'doc' | 'kv' | 'system' — active tab in the namespaces section
@@ -310,7 +310,6 @@ function renderActiveTab() {
   else if (t === 'documents') renderDocumentsTab();
   else if (t === 'query')     renderQueryTab();
   else if (t === 'admin')     renderAdminTab();
-  else if (t === 'vector-ops') renderVectorOpsTab();
 }
 
 // ── Schema tab ────────────────────────────────────────────────────────────────
@@ -2156,6 +2155,9 @@ async function renderAdminTab() {
               data-admin-tab="ops" onclick="switchAdminTab('ops')">Ops Metrics</button>
       <button class="sub-tab-btn ${state.adminTab === 'index' ? 'active' : ''}"
               data-admin-tab="index" onclick="switchAdminTab('index')">Index Management</button>
+      <button class="sub-tab-btn ${state.adminTab === 'vector-ops' ? 'active' : ''}"
+              data-admin-tab="vector-ops" onclick="switchAdminTab('vector-ops')"
+              title="Per-store vector index: rebuild decision, partition, code metrics, postings, history and settings">Vector Index Ops</button>
     </div>
     <div id="admin-storage-panel" class="sub-panel ${state.adminTab === 'storage' ? 'active' : ''}">
       <div class="spinner"></div>
@@ -2166,10 +2168,14 @@ async function renderAdminTab() {
     <div id="admin-index-panel" class="sub-panel ${state.adminTab === 'index' ? 'active' : ''}">
       <div class="spinner"></div>
     </div>
+    <div id="admin-vector-ops-panel" class="sub-panel ${state.adminTab === 'vector-ops' ? 'active' : ''}">
+      <div class="spinner"></div>
+    </div>
   `;
-  if (state.adminTab === 'storage')   await loadAdminStoragePanel();
-  else if (state.adminTab === 'ops')  await loadAdminOpsPanel();
-  else                                await loadAdminIndexPanel();
+  if (state.adminTab === 'storage')         await loadAdminStoragePanel();
+  else if (state.adminTab === 'ops')        await loadAdminOpsPanel();
+  else if (state.adminTab === 'vector-ops') renderVectorOpsTab();
+  else                                      await loadAdminIndexPanel();
 }
 
 function switchAdminTab(tab) {
@@ -2180,12 +2186,15 @@ function switchAdminTab(tab) {
   const storagePanel = document.getElementById('admin-storage-panel');
   const opsPanel     = document.getElementById('admin-ops-panel');
   const indexPanel   = document.getElementById('admin-index-panel');
+  const vopsPanel    = document.getElementById('admin-vector-ops-panel');
   if (storagePanel) storagePanel.classList.toggle('active', tab === 'storage');
   if (opsPanel)     opsPanel.classList.toggle('active', tab === 'ops');
   if (indexPanel)   indexPanel.classList.toggle('active', tab === 'index');
-  if (tab === 'storage')  loadAdminStoragePanel();
-  else if (tab === 'ops') loadAdminOpsPanel();
-  else                    loadAdminIndexPanel();
+  if (vopsPanel)    vopsPanel.classList.toggle('active', tab === 'vector-ops');
+  if (tab === 'storage')         loadAdminStoragePanel();
+  else if (tab === 'ops')        loadAdminOpsPanel();
+  else if (tab === 'vector-ops') renderVectorOpsTab();
+  else                           loadAdminIndexPanel();
 }
 
 // ── Admin storage panel ───────────────────────────────────────────────────────

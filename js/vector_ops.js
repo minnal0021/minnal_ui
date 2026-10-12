@@ -1,5 +1,5 @@
 /**
- * vector_ops.js — the Vector Index Ops tab: one semantic-search store at a time.
+ * vector_ops.js — Admin → Vector Index Ops: one semantic-search store at a time.
  *
  * Everything here is per namespace (chosen in the tab's own selector): the
  * store's partition (postings, sizes, maintenance), its code metrics (centre
@@ -174,7 +174,8 @@ function effectiveBudget(settings, entries) {
 
 // ── Tab entry ────────────────────────────────────────────────────────────────
 function renderVectorOpsTab() {
-  const el = document.getElementById('tab-vector-ops');
+  const el = document.getElementById('admin-vector-ops-panel');
+  if (!el) return;
   const stores = semanticStores();
   if (!stores.length) {
     el.innerHTML = `<div class="welcome"><p class="welcome-icon">🧭</p>
@@ -196,7 +197,7 @@ function renderVectorOpsTab() {
   el.innerHTML = `
     <div class="section vops-head">
       <div class="section-header">
-        <span class="section-title" title="Everything on this tab is for the selected store. Server-wide values are marked as such.">VECTOR INDEX OPS</span>
+        <span class="section-title" title="Everything on this panel is for the selected store. Server-wide values are marked as such.">VECTOR INDEX OPS</span>
         <div class="vops-ns">
           <label for="vops-ns-select" class="text-muted">Store</label>
           <select id="vops-ns-select" onchange="onVopsNsChange()">
@@ -259,7 +260,7 @@ function renderVopsBody() {
   if (!body) return;
   if (vops.loadError && !vops.partition) {
     body.innerHTML = `<div class="alert alert-error">Could not load the partition of ${esc(vops.ns)}: ${esc(vops.loadError)}.
-      This tab needs a minnal server from the dynamic-rabitq-index branch.</div>`;
+      This panel needs a minnal server from the dynamic-rabitq-index branch.</div>`;
     return;
   }
   const r = {
@@ -561,7 +562,7 @@ function startRebuildPoll() {
         vops.history = h.records ?? [];
         vops.allPostings = null;
       }
-      if (state.activeTab === 'vector-ops') renderVopsBody();
+      if (state.activeTab === 'admin' && state.adminTab === 'vector-ops') renderVopsBody();
     } catch { /* keep polling */ }
   }, 2000);
 }

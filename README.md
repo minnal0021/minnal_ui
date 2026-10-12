@@ -23,15 +23,14 @@ A lightweight, dependency-free web console for [**minnal**](https://github.com/m
 
 ## What it does
 
-The interface is organised into five tabs, each mapping onto a part of the minnal REST API:
+The interface is organised into four tabs, each mapping onto a part of the minnal REST API:
 
 | Tab | Purpose |
 |---|---|
 | **Schema** | Create, view, amend, and delete document stores and KV stores; manage field indices and embedding fields. |
 | **Documents** | Browse, get, put, and delete documents; range scans and prefix scans with pagination. |
 | **Query** | Run predicate queries against field indices, plus semantic search and filtered semantic search. |
-| **Vector Index Ops** | One semantic-search store at a time (its own store selector): whether a partition rebuild would help (recall check, verdict, before/after comparison), running checks and rebuilds, the partition's size and maintenance counters, code metrics (centre drift and friends, each explained), every posting, the recorded history, and the store's vector-index settings beside the server's. |
-| **Admin** | Server health and uptime, storage stats, ops metrics (including the field-index write buffer), WAL/LSM/value-log inspection, GC and compaction triggers, field-index health, blob and row-map stats, and vector index queue management. |
+| **Admin** | Server health and uptime, storage stats, ops metrics (including the field-index write buffer), WAL/LSM/value-log inspection, GC and compaction triggers, field-index health, blob and row-map stats, vector index queue management, and **Vector Index Ops**: per store, whether a partition rebuild would help, with every partition, code and maintenance metric (see [Vector Index Ops](#vector-index-ops)). |
 
 ---
 
@@ -140,8 +139,8 @@ For Docker, `build.sh` additionally honours `IMAGE_NAME` and `CONTAINER_NAME`.
 
 ## Vector Index Ops
 
-A store with semantic search keeps its vectors in **postings** (clusters) that
-split and merge as data arrives. This tab answers one question for the store you
+Under **Admin → Vector Index Ops**, next to Index Management. A store with semantic search keeps its vectors in **postings** (clusters) that
+split and merge as data arrives. This panel answers one question for the store you
 pick: **would rebuilding its partition help, and did the last one?**
 
 - **Rebuild decision** — a plain-language verdict and the evidence behind it,
@@ -168,7 +167,7 @@ pick: **would rebuilding its partition help, and did the last one?**
   defaults (differences highlighted), and the server-wide `[semantic_search]`
   values.
 
-Every label has a tooltip. The tab needs a minnal server built from its
+Every label has a tooltip. The panel needs a minnal server built from its
 `dynamic-rabitq-index` branch (the partition, recall-check, rebuild, history and
 settings endpoints).
 
@@ -183,7 +182,7 @@ minnal_ui/
 ├── js/
 │   ├── api.js      # Thin async wrapper over the minnal REST API
 │   ├── app.js      # UI logic, rendering, event handling
-│   └── vector_ops.js # The Vector Index Ops tab
+│   └── vector_ops.js # Admin → Vector Index Ops
 ├── img/logo.svg    # மின்னல் logo
 ├── server.py       # Static file server + /stores,/kv-stores,/admin proxy
 ├── start.sh        # Run server.py with sensible env defaults
