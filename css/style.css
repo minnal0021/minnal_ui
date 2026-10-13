@@ -633,7 +633,7 @@ select { cursor: pointer; }
   display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px;
 }
 .vq-browser-bar select {
-  padding: 5px 8px; border: 1px solid var(--border-light);
+  width: auto; padding: 5px 8px; border: 1px solid var(--border-light);
   border-radius: var(--radius); background: var(--bg-3); color: var(--text);
   outline: none; transition: border-color .15s;
 }
@@ -709,3 +709,15 @@ select { cursor: pointer; }
 .store-item-sys .store-name { color: var(--text-2); font-family: monospace; font-size: 12px; }
 .tab-btn:disabled { opacity: .4; cursor: not-allowed; }
 .vops-ns-name { font-family: monospace; font-weight: 600; color: var(--text); }
+
+/* ── Index tabs: the sidebar's store in all-stores tables ────────────── */
+.tbl tr.row-selected td { background: var(--accent-dim); }
+.ns-cell { cursor: pointer; }
+.ns-cell:hover { color: var(--accent); text-decoration: underline; }
+.vops-crumbs { display: flex; align-items: center; gap: 8px; font-size: 14px; }
+.vops-crumb { color: var(--accent); cursor: pointer; }
+.vops-crumb:hover { text-decoration: underline; }
+.vidx-progress { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-2); }
+.vidx-progress .progress-wrap { width: 120px; }
+.vops-decision-compact { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 16px; }
+.vops-decision-compact .vops-decision-title { font-size: 15px; margin-bottom: 2px; }

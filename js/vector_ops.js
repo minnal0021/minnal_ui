@@ -1,8 +1,11 @@
 /**
- * vector_ops.js — Admin → Vector Index Ops: one semantic-search store at a time.
+ * vector_ops.js — Admin → Vector Indexes.
  *
- * Everything here is per namespace (chosen in the tab's own selector): the
- * store's partition (postings, sizes, maintenance), its code metrics (centre
+ * With no semantic-search store selected in the sidebar, the tab shows every
+ * vector store: queue totals, indexing progress, corruption, the global
+ * reconcile and the retried-entries browser. With one selected, it shows that
+ * store in detail: its queue, actions and queue browser (Overview), its
+ * partition (postings, sizes, maintenance), its code metrics (centre
  * drift and friends), the recall check that says whether a rebuild helps, the
  * rebuild itself, the recorded history of all three, and the store's
  * vector-index settings beside the server's defaults.
@@ -15,11 +18,15 @@
  *   GET  /admin/indices/{ns}/vector/history
  *   GET  /admin/indices/{ns}/vector/corruption-metrics
  *   GET  /admin/indices/vector/settings
+ *   GET  /admin/indices/progress, /admin/indices/vector/queue/summary,
+ *        /admin/indices/vector/corruption-metrics (the all-stores view)
  */
 
 const vops = {
   ns:          null,
-  sub:         'decision',   // decision | partition | codes | postings | history | settings
+  sub:         'overview',   // overview | decision | partition | codes | postings | history | settings
+  queue:       null,         // this store's embedding-queue counts ({ pending, exhausted, … })
+  progress:    null,         // this store's indexing progress
   partition:   null,         // GET partition (memory only)
   corruption:  null,         // per-namespace corruption counters
   history:     [],           // every record, newest first
@@ -62,7 +69,7 @@ const VTIP = {
   m_rebuild_moves: 'Chunks a rebuild moved into its fitted postings (every chunk, once per rebuild).',
   m_moves_total: 'All chunk moves by ongoing maintenance (reassign + drain), excluding rebuilds: the write cost of keeping the partition in shape.',
   // corruption
-  c_sparse: 'Pass-1 (1-bit chunk) entries search skipped because they did not decode, since server start. Should be 0; if not, run the validating reconcile (Admin → Index Management).',
+  c_sparse: 'Pass-1 (1-bit chunk) entries search skipped because they did not decode, since server start. Should be 0; if not, run the validating reconcile (Admin → Vector Indexes, all-stores view).',
   c_dense: 'Pass-2 (8-bit whole-document) entries search skipped because they did not decode, since server start. Should be 0.',
   c_total: 'Sum of the two. Any non-zero value means some documents are silently missing from search results.',
   // rebuild
@@ -173,26 +180,27 @@ function effectiveBudget(settings, entries) {
 }
 
 // ── Tab entry ────────────────────────────────────────────────────────────────
-function renderVectorOpsTab() {
-  const el = document.getElementById('admin-vector-ops-panel');
+/** The sidebar's store when it has a vector index, else null. */
+function vectorDetailStore() {
+  const sel = state.selectedStore;
+  return sel?.semantic_search_enabled && state.selectedStoreType !== 'system' ? sel : null;
+}
+
+function renderVectorIndexesTab() {
+  const el = document.getElementById('admin-vector-panel');
   if (!el) return;
-  const stores = semanticStores();
-  if (!stores.length) {
+  if (!semanticStores().length) {
     el.innerHTML = `<div class="welcome"><p class="welcome-icon">🧭</p>
       <p>No store has semantic search enabled. Enable it on a store (Schema tab) to see its vector index here.</p></div>`;
     return;
   }
   // The store comes from the sidebar; this tab has no picker of its own.
-  const sel = state.selectedStore;
-  if (!sel?.semantic_search_enabled || state.selectedStoreType === 'system') {
-    el.innerHTML = `<div class="welcome"><p class="welcome-icon">🧭</p>
-      <p>${sel ? `${esc(sel.namespace)} has no vector index. ` : ''}Select a store with semantic search in the sidebar:</p>
-      <p>${stores.map(s => `<button class="btn btn-ghost btn-sm" onclick="selectStore('${esc(s.namespace)}', '${s.store_type === 'kv' ? 'kv' : 'doc'}')">${esc(s.namespace)}</button>`).join(' ')}</p></div>`;
-    return;
-  }
+  const sel = vectorDetailStore();
+  if (!sel) { renderVectorLanding(el); return; }
   if (sel.namespace !== vops.ns) resetVopsStore(sel.namespace);
 
   const tabs = [
+    ['overview', 'Overview'],
     ['decision', 'Rebuild decision'],
     ['partition', 'Partition'],
     ['codes', 'Code metrics'],
@@ -203,11 +211,12 @@ function renderVectorOpsTab() {
   el.innerHTML = `
     <div class="section vops-head">
       <div class="section-header">
-        <span class="section-title" title="Everything on this panel is for the selected store. Server-wide values are marked as such.">VECTOR INDEX OPS</span>
-        <div class="vops-ns">
+        <span class="vops-crumbs">
+          <a class="vops-crumb" onclick="clearStoreSelection()" title="Clear the sidebar selection and show every vector store">All vector stores</a>
+          <span class="text-muted">/</span>
           <span class="vops-ns-name" title="The store selected in the sidebar">${esc(vops.ns)}</span>
-          <button class="btn btn-secondary btn-sm" onclick="loadVectorOps()">↻ Refresh</button>
-        </div>
+        </span>
+        <button class="btn btn-secondary btn-sm" onclick="loadVectorOps()">↻ Refresh</button>
       </div>
       <div class="sub-tab-nav">
         ${tabs.map(([id, label]) => `<button class="sub-tab-btn ${vops.sub === id ? 'active' : ''}" data-vops-tab="${id}" onclick="switchVopsTab('${id}')">${label}</button>`).join('')}
@@ -217,6 +226,11 @@ function renderVectorOpsTab() {
   loadVectorOps();
 }
 
+/** Refresh whichever view of the tab is showing. */
+function refreshVectorIndexes() {
+  return vectorDetailStore() ? loadVectorOps() : loadVectorLanding();
+}
+
 /** Forget everything loaded for the previous store. */
 function resetVopsStore(ns) {
   vops.ns = ns;
@@ -224,9 +238,147 @@ function resetVopsStore(ns) {
   vops.partition = null;
   vops.history = [];
   vops.corruption = null;
+  vops.queue = null;
+  vops.progress = null;
   vops.lastCheck = null;
   vops.allPostings = null;
   vops.postings = { ...vops.postings, stack: [null], idx: 0, data: null, next: null };
+}
+
+// ── All vector stores ────────────────────────────────────────────────────────
+function renderVectorLanding(el) {
+  const sel = state.selectedStore;
+  el.innerHTML = `
+    ${sel ? `<div class="alert alert-info">${esc(sel.namespace)} has no vector index, so every vector store is shown.</div>` : ''}
+    <div class="admin-actions">
+      <button class="btn btn-secondary" onclick="loadVectorLanding()">↻ Refresh</button>
+      <button class="btn btn-ghost" onclick="adminVectorReconcile(this)"
+              title="Scan every vector store and re-enqueue any document missing a vector entry">⚡ Reconcile All Vector Stores</button>
+    </div>
+    <div id="admin-index-action-result"></div>
+    <div id="vidx-landing"><div class="spinner"></div></div>
+    ${renderVqBrowserHtml(null)}`;
+  loadVectorLanding();
+}
+
+async function loadVectorLanding() {
+  const area = document.getElementById('vidx-landing');
+  if (!area) return;
+  const [progress, summary, corruption] = await Promise.all([
+    Api.indicesProgress().catch(() => null),
+    Api.vectorQueueSummary().catch(() => null),
+    Api.vectorCorruptionMetrics().catch(() => null),
+  ]);
+  if (!document.getElementById('vidx-landing')) return;
+  vqState.maxRetries = summary?.max_retries_configured ?? 0;
+  area.innerHTML = `
+    ${renderVectorStoresTable(progress?.vector_progress ?? [], summary?.by_namespace ?? [], corruption ?? {})}
+    ${renderVectorQueueSummarySection(summary)}`;
+}
+
+function renderVectorStoresTable(progress, byNs, corruption) {
+  const prog  = Object.fromEntries(progress.map(p => [p.namespace, p]));
+  const queue = Object.fromEntries(byNs.map(q => [q.namespace, q]));
+  const corruptTotal = Object.values(corruption).reduce((n, m) => n + (m?.total ?? 0), 0);
+  const rows = semanticStores().map(s => {
+    const ns = s.namespace;
+    const type = s.store_type === 'kv' ? 'kv' : 'doc';
+    const p = prog[ns];
+    const pct = Math.min(p?.progress_pct ?? 0, 100);
+    const color = pct >= 90 ? 'var(--success)' : pct >= 50 ? 'var(--warning)' : 'var(--error)';
+    const pending = queue[ns]?.pending ?? 0;
+    const exhausted = queue[ns]?.exhausted ?? 0;
+    const skipped = corruption[ns]?.total ?? 0;
+    const queueHtml = pending === 0 && exhausted === 0
+      ? '<span class="text-muted">idle</span>'
+      : [
+          pending   > 0 ? `<span class="stat-val warn">${fmt(pending)} pending</span>` : '',
+          exhausted > 0 ? `<span class="stat-val bad">${fmt(exhausted)} exhausted</span>` : '',
+        ].filter(Boolean).join(' ');
+    return `
+      <tr>
+        ${nsCell(ns, type)}
+        <td>${p ? `
+          <div class="vidx-progress">
+            <div class="progress-wrap"><div class="progress-bar" style="width:${pct}%;background:${color}"></div></div>
+            <span>${pct.toFixed(1)}% · ${fmt(p.indexed_approx)}</span>
+          </div>` : '<span class="text-muted">—</span>'}</td>
+        <td>${queueHtml}</td>
+        <td><span class="stat-val ${skipped > 0 ? 'bad' : 'good'}">${fmt(skipped)}</span></td>
+        <td style="text-align:right">
+          <button class="btn btn-xs btn-accent" onclick="selectStore('${esc(ns)}', '${type}')"
+                  title="Select ${esc(ns)} in the sidebar and open its vector index">Open →</button>
+        </td>
+      </tr>`;
+  }).join('');
+  return `
+    <div class="section">
+      <div class="section-header"><span class="section-title">VECTOR STORES (${semanticStores().length})</span></div>
+      ${corruptTotal > 0 ? `<div class="alert alert-error">${fmt(corruptTotal)} corrupt vector entries were skipped on read since server start: searches on those stores are degraded. Run Reconcile All Vector Stores, or Reindex All on the affected store.</div>` : ''}
+      <div class="tbl-wrap"><table class="tbl">
+        <thead><tr>
+          <th>Store</th>
+          <th title="Documents embedded so far, as a share of the store (approximate).">Indexed</th>
+          <th title="Embedding queue backlog: pending (awaiting embedding) and exhausted (gave up after max retries). 'idle' means the queue is empty.">Queue</th>
+          <th title="Sparse (Pass-1) plus dense (Pass-2) entries skipped on read because their stored bytes did not decode, since server start. Should be 0.">Corrupt skipped</th>
+          <th></th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>
+    </div>`;
+}
+
+// ── Overview sub-tab (one store) ─────────────────────────────────────────────
+function renderVopsOverview() {
+  const ns = vops.ns;
+  const q = vops.queue ?? {};
+  const pending = q.pending ?? 0;
+  const exhausted = q.exhausted ?? 0;
+  const pr = vops.progress;
+  const c = vops.corruption ?? {};
+  const d = vops.partition ? vopsDecide() : null;
+  return `
+    ${d ? `
+      <div class="vops-decision vops-${d.level} vops-decision-compact">
+        <div>
+          <div class="vops-decision-title">${esc(d.title)}</div>
+          <div class="vops-decision-text">${esc(d.text)}</div>
+        </div>
+        <button class="btn btn-secondary btn-sm" onclick="switchVopsTab('decision')">Rebuild decision →</button>
+      </div>` : ''}
+    <div class="admin-grid">
+      <div class="admin-card">
+        <div class="admin-card-title" title="Documents waiting for the embedding worker. In-memory view of the queue namespace.">EMBEDDING QUEUE</div>
+        ${vrow('Pending', fmt(pending), pending > 0 ? 'warn' : 'good', 'Documents enqueued and awaiting embedding (actionable + retrying + exhausted).')}
+        ${vrow('Exhausted', fmt(exhausted), exhausted > 0 ? 'bad' : 'good', 'Entries that spent their retry budget: stuck until Retry Failed resets them, or they are removed.')}
+        ${vrow('Max retries', fmt(vqState.maxRetries), '', 'Embedding attempts per entry before it becomes exhausted (server-wide).')}
+      </div>
+      <div class="admin-card">
+        <div class="admin-card-title" title="Approximate: from the store's document count and its queue.">INDEXING</div>
+        ${vrow('Indexed (approx.)', fmt(pr?.indexed_approx), '', 'Documents with a vector entry, approximately.')}
+        ${vrow('Progress', pr ? `${Math.min(pr.progress_pct ?? 0, 100).toFixed(1)}%` : '—', (pr?.progress_pct ?? 100) >= 100 ? 'good' : 'warn', 'Indexed documents as a share of the store.')}
+      </div>
+      <div class="admin-card">
+        <div class="admin-card-title" title="Entries skipped on read because their stored bytes did not decode, since server start.">CORRUPTION</div>
+        ${vrow('Pass-1 skipped', fmt(c.sparse_corrupt_skipped), (c.sparse_corrupt_skipped ?? 0) > 0 ? 'bad' : 'good', vt('c_sparse'))}
+        ${vrow('Pass-2 skipped', fmt(c.dense_corrupt_skipped), (c.dense_corrupt_skipped ?? 0) > 0 ? 'bad' : 'good', 'Dense (Pass-2) entries skipped because they did not decode, since server start. Should be 0.')}
+      </div>
+    </div>
+    <div class="section">
+      <div class="section-header"><span class="section-title">ACTIONS</span></div>
+      <div class="admin-actions">
+        <button class="btn btn-ghost" onclick="showReindexDocVectorModal('${esc(ns)}')"
+                title="Re-enqueue a single document for embedding">Reindex Doc…</button>
+        <button class="btn btn-ghost" onclick="adminVectorReindexAll('${esc(ns)}',this)"
+                title="Re-enqueue every document of the store for embedding (runs in the background)">Reindex All</button>
+        ${exhausted > 0 ? `
+          <button class="btn btn-accent" onclick="adminVectorReindexFailed('${esc(ns)}',this)"
+                  title="Reset exhausted entries so they are retried">Retry Failed (${fmt(exhausted)})</button>` : ''}
+        <button class="btn btn-danger" onclick="adminVectorDropAll('${esc(ns)}',this)"
+                title="Disable semantic search on the store and clear all its vector data">Drop Vector Index</button>
+      </div>
+    </div>
+    ${renderVqBrowserHtml(ns)}`;
 }
 
 function switchVopsTab(id) {
@@ -242,11 +394,13 @@ async function loadVectorOps() {
   vops.loadError = null;
   const body = document.getElementById('vops-body');
   if (body && !vops.partition) body.innerHTML = '<div class="spinner"></div>';
-  const [p, h, c, srv] = await Promise.allSettled([
+  const [p, h, c, srv, q, pr] = await Promise.allSettled([
     Api.vectorPartition(ns, false),
     Api.vectorHistory(ns, null, 1000),
     Api.vectorCorruptionMetricsNs(ns),
     vops.server ? Promise.resolve(vops.server) : Api.vectorServerSettings(),
+    Api.vectorQueueSummary(),
+    Api.indicesProgress(),
   ]);
   if (ns !== vops.ns) return; // switched meanwhile
   vops.partition = p.status === 'fulfilled' ? p.value : null;
@@ -255,6 +409,11 @@ async function loadVectorOps() {
   vops.historyTtl = h.status === 'fulfilled' ? h.value.ttl_secs : null;
   vops.corruption = c.status === 'fulfilled' ? c.value : null;
   if (srv.status === 'fulfilled') vops.server = srv.value;
+  if (q.status === 'fulfilled') {
+    vqState.maxRetries = q.value?.max_retries_configured ?? 0;
+    vops.queue = q.value?.by_namespace?.find(x => x.namespace === ns) ?? { pending: 0, exhausted: 0 };
+  }
+  if (pr.status === 'fulfilled') vops.progress = pr.value?.vector_progress?.find(x => x.namespace === ns) ?? null;
   renderVopsBody();
   if (vops.sub === 'postings') loadVopsPostings();
   if (vops.sub === 'partition') loadVopsAllPostings();
@@ -264,12 +423,13 @@ async function loadVectorOps() {
 function renderVopsBody() {
   const body = document.getElementById('vops-body');
   if (!body) return;
-  if (vops.loadError && !vops.partition) {
+  if (vops.loadError && !vops.partition && vops.sub !== 'overview') {
     body.innerHTML = `<div class="alert alert-error">Could not load the partition of ${esc(vops.ns)}: ${esc(vops.loadError)}.
       This panel needs a minnal server from the dynamic-rabitq-index branch.</div>`;
     return;
   }
   const r = {
+    overview: renderVopsOverview,
     decision: renderVopsDecision,
     partition: renderVopsPartition,
     codes: renderVopsCodes,
@@ -409,7 +569,7 @@ function renderVopsDecision() {
         <div class="admin-card-title" title="Re-cluster the store's partition from its stored codes: k-means over every chunk, each moved to its nearest new posting. No embedding calls, no re-encoding. Searches and writes continue.">REBUILD THE PARTITION</div>
         <div class="text-muted vops-note">Fits new centres on everything stored now and moves every chunk once. Helps when searches read a
           small share of the store and the centres chosen one split at a time fit badly. It does <b>not</b> re-embed: it raises
-          centre drift. To re-embed, use vector reindex-all (Admin → Index Management).</div>
+          centre drift. To re-embed, use Reindex All on the Overview sub-tab.</div>
         <div class="vops-form">
           <label title="${esc(vt('rb_requested'))}">Postings <input id="vops-rb-postings" type="number" min="1" placeholder="${fmt(p.postings)} (as now)"></label>
         </div>
@@ -568,7 +728,7 @@ function startRebuildPoll() {
         vops.history = h.records ?? [];
         vops.allPostings = null;
       }
-      if (state.activeTab === 'admin' && state.adminTab === 'vector-ops') renderVopsBody();
+      if (state.activeTab === 'admin' && state.adminTab === 'vector') renderVopsBody();
     } catch { /* keep polling */ }
   }, 2000);
 }

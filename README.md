@@ -30,7 +30,15 @@ The interface is organised into four tabs, each mapping onto a part of the minna
 | **Schema** | Create, view, amend, and delete document stores and KV stores; manage field indices and embedding fields. |
 | **Documents** | Browse, get, put, and delete documents; range scans and prefix scans with pagination. |
 | **Query** | Run predicate queries against field indices, plus semantic search and filtered semantic search. |
-| **Admin** | Server health and uptime, storage stats, ops metrics (including the field-index write buffer), WAL/LSM/value-log inspection, GC and compaction triggers, field-index health, blob and row-map stats, vector index queue management, and **Vector Index Ops**: per store, whether a partition rebuild would help, with every partition, code and maintenance metric (see [Vector Index Ops](#vector-index-ops)). |
+| **Admin** | Four sub-tabs. **Storage**: server health, storage stats, WAL/LSM/value-log inspection, GC and compaction triggers. **Ops Metrics**: engine-wide and per-store counters, including the field-index write buffer. **Field Indexes**: builds, health and repair, waste, blob and row-map stats, reindex and drop. **Vector Indexes**: every vector store, and one store in detail, including whether a partition rebuild would help (see [Vector Indexes](#vector-indexes)). |
+
+**The sidebar picks the store everywhere.** The store selected in the sidebar is
+the one every per-store section shows, including in Admin; nothing in Admin has a
+store picker of its own. With no store selected (clear it with the × on the
+selected entry), Admin shows only its all-stores views. Under **System** (collapsed
+by default) the sidebar also lists the engine's own namespaces: the embedding
+queue, the query-embedding cache and the partition history. A system namespace
+opens in Admin only; Schema, Documents and Query do not apply to it.
 
 ---
 
@@ -137,12 +145,22 @@ For Docker, `build.sh` additionally honours `IMAGE_NAME` and `CONTAINER_NAME`.
 
 ---
 
-## Vector Index Ops
+## Vector Indexes
 
-Under **Admin → Vector Index Ops**, next to Index Management. A store with semantic search keeps its vectors in **postings** (clusters) that
-split and merge as data arrives. This panel answers one question for the store you
-pick: **would rebuilding its partition help, and did the last one?**
+Under **Admin → Vector Indexes**. With no vector store selected in the sidebar,
+the tab lists every vector store (indexing progress, queue backlog, corrupt
+entries skipped) with the queue totals, the reconcile that re-enqueues documents
+missing a vector, and the browser for retried queue entries. **Open →** on a row
+(or selecting the store in the sidebar) shows that store; *All vector stores*
+goes back.
 
+A store with semantic search keeps its vectors in **postings** (clusters) that
+split and merge as data arrives. The store view answers one question above all:
+**would rebuilding its partition help, and did the last one?**
+
+- **Overview** — the rebuild verdict in one line, the store's embedding queue,
+  indexing progress and corruption counters, its actions (reindex one document or
+  all, retry exhausted entries, drop the vector index) and its queue entries.
 - **Rebuild decision** — a plain-language verdict and the evidence behind it,
   plus the two actions:
   - *Recall check*: searches sampled real queries (from the query-embedding
@@ -167,7 +185,7 @@ pick: **would rebuilding its partition help, and did the last one?**
   defaults (differences highlighted), and the server-wide `[semantic_search]`
   values.
 
-Every label has a tooltip. The panel needs a minnal server built from its
+Every label has a tooltip. The store view needs a minnal server built from its
 `dynamic-rabitq-index` branch (the partition, recall-check, rebuild, history and
 settings endpoints).
 
@@ -182,7 +200,7 @@ minnal_ui/
 ├── js/
 │   ├── api.js      # Thin async wrapper over the minnal REST API
 │   ├── app.js      # UI logic, rendering, event handling
-│   └── vector_ops.js # Admin → Vector Index Ops
+│   └── vector_ops.js # Admin → Vector Indexes
 ├── img/logo.svg    # மின்னல் logo
 ├── server.py       # Static file server + /stores,/kv-stores,/admin proxy
 ├── start.sh        # Run server.py with sensible env defaults
