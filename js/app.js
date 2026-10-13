@@ -2237,12 +2237,14 @@ const ADMIN_TABS = [
   ['ops',     'Ops Metrics',    null],
   ['field',   'Field Indexes',  'Field-index builds, health, waste and per-store operations'],
   ['vector',  'Vector Indexes', 'All vector stores, and the selected store in detail: queue, rebuild decision, partition, code metrics, postings, history and settings'],
+  ['maintenance', 'System Maintenance', 'Server-wide maintenance actions: GC, WAL GC, LSM compaction, index checkpoint, query-cache clear'],
 ];
 
 function loadAdminSubTab(tab) {
   if (tab === 'storage')     return loadAdminStoragePanel();
   if (tab === 'ops')         return loadAdminOpsPanel();
   if (tab === 'field')       return loadAdminFieldPanel();
+  if (tab === 'maintenance') return loadAdminMaintenancePanel();
   return renderVectorIndexesTab();
 }
 
@@ -2312,23 +2314,57 @@ async function loadAdminStoragePanel() {
       </div>
       <input type="file" id="admin-import-file" accept=".json,application/json" style="display:none"
              onchange="adminImportSchemaFile(this)">
+      <div id="admin-import-result"></div>
     </div>
-    <div class="section">
-      <div class="section-header"><span class="section-title">ACTIONS</span></div>
-      <div class="admin-actions">
-        <button class="btn btn-ghost" onclick="adminTriggerGc()">⚡ Trigger GC</button>
-        <button class="btn btn-ghost" onclick="adminTriggerWalGc()">⚡ Trigger WAL GC</button>
-        <button class="btn btn-ghost" onclick="adminCompact()">⚡ Compact LSM</button>
-        <button class="btn btn-ghost" onclick="adminIndexCheckpoint(this)"
-                title="Flush and compact field indices in the background — only one run at a time">⚡ Index Checkpoint</button>
-        <button class="btn btn-danger" onclick="adminClearQueryCache()">🗑 Clear Query Cache</button>
-        <button class="btn btn-secondary" style="margin-left:auto" onclick="adminRefresh()">↻ Refresh Stats</button>
-      </div>
-      <div id="admin-action-result"></div>
+    <div class="admin-actions">
+      <button class="btn btn-secondary" style="margin-left:auto" onclick="adminRefresh()">↻ Refresh Stats</button>
     </div>
     <div id="admin-storage-stats"><div class="spinner"></div></div>
   `;
   await loadStorageStats();
+}
+
+// ── Admin system-maintenance panel ──────────────────────────────────────────────
+// Actions that act on the whole server, every namespace at once. The background
+// workers run each of them on their own schedule; these run one now.
+const MAINTENANCE_ACTIONS = [
+  { label: '⚡ Trigger GC', fn: 'adminTriggerGc()', title: 'Value-log GC',
+    tip: 'POST /admin/storage/gc — reclaim value-log garbage in every namespace now. The GC worker does this every value_log_gc_interval_secs for namespaces over value_log_waste_threshold.',
+    text: 'Rewrites every value-log segment whose garbage is over segment_gc_threshold, in every namespace, without waiting for a namespace to reach its GC trigger. Waits for the result and reports what each namespace reclaimed.' },
+  { label: '⚡ Trigger WAL GC', fn: 'adminTriggerWalGc()', title: 'WAL GC',
+    tip: 'POST /admin/storage/gc/wal — delete WAL segments that are no longer needed for recovery. The WAL GC worker does this every wal_gc_interval_secs.',
+    text: 'Deletes write-ahead-log segments every namespace has persisted and every field index has checkpointed past.' },
+  { label: '⚡ Compact LSM', fn: 'adminCompact()', title: 'LSM compaction',
+    tip: 'POST /admin/storage/compact — merge pending LSM files in every namespace now. The compaction worker does this whenever a memtable fills, and every lsm_compaction_interval_secs.',
+    text: 'Flushes sealed memtables and merges level-0 files into level 1, in every namespace.' },
+  { label: '⚡ Index Checkpoint', fn: 'adminIndexCheckpoint(this)', title: 'Index checkpoint',
+    tip: 'POST /admin/storage/index-checkpoint — make every field index durable now and compact bitmap stores over index_blob_waste_threshold. The checkpoint worker does this every index_checkpoint_interval_ms.',
+    text: 'Writes every field index and row map to disk, and compacts any field-index bitmap store over the waste threshold. Runs in the background, one run at a time; progress is in the server log.' },
+  { label: '🗑 Clear Query Cache', fn: 'adminClearQueryCache()', title: 'Clear query-embedding cache', danger: true,
+    tip: 'DELETE /admin/indices/vector/query-cache — delete every cached query embedding, for all stores. Cannot be undone; entries otherwise expire after query_embedding_cache_ttl_secs.',
+    text: 'Removes every cached query embedding (shared by all semantic-search stores). Later searches re-embed their query once, so the first searches are slower, and recall checks have fewer cached queries to sample until they refill.' },
+];
+
+function loadAdminMaintenancePanel() {
+  const panel = document.getElementById('admin-maintenance-panel');
+  if (!panel) return;
+  panel.innerHTML = `
+    <div class="section">
+      <div class="section-header"><span class="section-title">SYSTEM MAINTENANCE</span></div>
+      <div class="text-muted" style="font-size:12px;margin-bottom:12px">
+        Each action covers the whole server, not the store selected in the sidebar. The
+        background workers already run them on a schedule; use these to run one now.
+      </div>
+      <div class="maint-list">
+        ${MAINTENANCE_ACTIONS.map(a => `
+          <div class="maint-row">
+            <div><div class="maint-title">${esc(a.title)}</div>
+              <div class="text-muted maint-text">${esc(a.text)}</div></div>
+            <button class="btn ${a.danger ? 'btn-danger' : 'btn-ghost'}" onclick="${a.fn}" title="${esc(a.tip)}">${a.label}</button>
+          </div>`).join('')}
+      </div>
+      <div id="admin-action-result"></div>
+    </div>`;
 }
 
 // ── Admin ops-metrics panel ─────────────────────────────────────────────────────
@@ -3367,7 +3403,7 @@ function adminImportSchema() {
 async function adminImportSchemaFile(input) {
   const file = input.files[0];
   if (!file) return;
-  const el = document.getElementById('admin-action-result');
+  const el = document.getElementById('admin-import-result');
   if (el) el.innerHTML = '<div class="spinner"></div>';
   try {
     const text = await file.text();

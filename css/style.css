@@ -729,3 +729,11 @@ select { cursor: pointer; }
 .vset-field input, .vset-field select { font-family: inherit; }
 .vset-more { margin-top: 10px; }
 .vset-more summary { cursor: pointer; font-size: 12px; color: var(--accent); }
+
+/* ── Admin → System Maintenance ──────────────────────────────────────── */
+.maint-list { display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 12px; }
+.maint-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 14px; }
+.maint-row + .maint-row { border-top: 1px solid var(--border); }
+.maint-row .btn { flex-shrink: 0; min-width: 170px; }
+.maint-title { font-weight: 600; margin-bottom: 2px; }
+.maint-text { font-size: 12px; line-height: 1.5; }
