@@ -473,7 +473,8 @@ function renderSchemaTab() {
           <tbody>${attrRows}</tbody>
         </table>
       </div>
-    </div>`;
+    </div>
+    ${renderVectorSettingsSection(s)}`;
 }
 
 function renderKvSchemaTab(el, s) {
@@ -529,7 +530,8 @@ function renderKvSchemaTab(el, s) {
           </p>
         </div>
       </div>
-    </div>`;
+    </div>
+    ${renderVectorSettingsSection(s)}`;
 }
 
 // ── Index progress polling ─────────────────────────────────────────────────────
@@ -671,9 +673,10 @@ function showCreateStoreModal() {
         </div>
         <div id="cs-kv-semantic-row" class="form-group">
           <label class="radio-group" style="gap:8px">
-            <input type="checkbox" id="cs-kv-semantic" />
+            <input type="checkbox" id="cs-kv-semantic" onchange="syncVectorSpecForms()" />
             Enable semantic search <span class="text-muted">(str value type only)</span>
           </label>
+          <div id="cs-kv-vset-wrap" style="display:none;margin-top:10px">${renderVectorSpecForm('cs-kv')}</div>
         </div>
       </div>
     </div>
@@ -704,6 +707,7 @@ function showCreateStoreModal() {
           Enable semantic search — check one or more <strong>Embed</strong> fields above (str type only)
         </label>
       </div>
+      <div id="cs-doc-vset-wrap" style="display:none;margin-top:10px">${renderVectorSpecForm('cs-doc')}</div>
     </div>
 
     <div class="modal-actions">
@@ -712,6 +716,18 @@ function showCreateStoreModal() {
     </div>
   `);
   addCreateStoreField();
+  fillVectorSpecForm('cs-doc');
+  fillVectorSpecForm('cs-kv');
+}
+
+/** Show the vector-index settings only while semantic search is ticked. */
+function syncVectorSpecForms() {
+  const show = (wrap, cb) => {
+    const w = document.getElementById(wrap);
+    if (w) w.style.display = document.getElementById(cb)?.checked ? '' : 'none';
+  };
+  show('cs-doc-vset-wrap', 'cs-semantic-enabled');
+  show('cs-kv-vset-wrap', 'cs-kv-semantic');
 }
 
 function onCreateStoreTypeChange() {
@@ -735,6 +751,7 @@ function onKvValueTypeChange() {
   if (vt !== 'str') {
     semRow.style.opacity = '0.4';
     if (semCb) { semCb.checked = false; semCb.disabled = true; }
+    syncVectorSpecForms();
   } else {
     semRow.style.opacity = '';
     if (semCb) semCb.disabled = false;
@@ -810,6 +827,7 @@ function onEmbedFieldToggle() {
 function syncSemanticEnabled() {
   const anyChecked = document.querySelectorAll('#cs-fields .field-semantic:checked').length > 0;
   document.getElementById('cs-semantic-enabled').checked = anyChecked;
+  syncVectorSpecForms();
 }
 
 function onSemanticEnabledChange() {
@@ -817,6 +835,7 @@ function onSemanticEnabledChange() {
   if (!document.getElementById('cs-semantic-enabled').checked) {
     document.querySelectorAll('#cs-fields .field-semantic').forEach(cb => { cb.checked = false; });
   }
+  syncVectorSpecForms();
 }
 
 async function submitCreateStore() {
@@ -836,8 +855,11 @@ async function submitCreateStore() {
       btn.disabled = false; btn.textContent = 'Create Store'; return;
     }
     const payload = { namespace: ns, store_type: 'kv', key_type: keyType, value_type: valueType };
-    if (semantic) payload.semantic_search_enabled = true;
     try {
+      if (semantic) {
+        payload.semantic_search_enabled = true;
+        payload.vector_index = collectVectorSpec('cs-kv');
+      }
       await Api.createStore(payload);
       closeModal();
       toast(`KV store '${ns}' created`);
@@ -888,12 +910,12 @@ async function submitCreateStore() {
   }
 
   const payload = { namespace: ns, store_type: 'doc', key_type: keyType, indices, attributes };
-  if (semanticEnabled) {
-    payload.semantic_search_enabled = true;
-    payload.embedding_fields = embeddingFields;
-  }
-
   try {
+    if (semanticEnabled) {
+      payload.semantic_search_enabled = true;
+      payload.embedding_fields = embeddingFields;
+      payload.vector_index = collectVectorSpec('cs-doc');
+    }
     await Api.createStore(payload);
     closeModal();
     toast(`Store '${ns}' created`);
@@ -1028,12 +1050,17 @@ function showAddAttributeModal(ns) {
         <button class="btn btn-sm btn-ghost" onclick="addVectorIndexField()">+ Add Field</button>
       </div>
     </div>
+    <div class="modal-section">
+      <div class="modal-section-title">VECTOR INDEX SETTINGS</div>
+      ${renderVectorSpecForm('vec-add')}
+    </div>
     <div class="modal-actions">
       <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
       <button class="btn btn-accent" onclick="submitAddVectorIndex('${esc(ns)}')">Create Vector Index</button>
     </div>
   `);
   addVectorIndexField();
+  fillVectorSpecForm('vec-add');
 }
 
 function addVectorIndexField() {
@@ -1082,7 +1109,7 @@ async function submitAddVectorIndex(ns) {
   if (fields.length === 0) { toast('At least one field is required', 'error'); return; }
   if (new Set(fields).size !== fields.length) { toast('Duplicate field names', 'error'); return; }
   try {
-    await Api.amendSchema(ns, { op: 'enable_vector_index', fields });
+    await Api.amendSchema(ns, { op: 'enable_vector_index', fields, vector_index: collectVectorSpec('vec-add') });
     closeModal();
     toast(`Vector index created over ${fields.length} field${fields.length !== 1 ? 's' : ''}`);
     await loadStores(); renderSchemaTab();

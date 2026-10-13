@@ -1041,7 +1041,10 @@ function renderVopsSettings() {
   const srvRow = (key, val) => vrow(key, fmtV(val), '', vt(key));
   return `
     <div class="admin-card vops-wide">
-      <div class="admin-card-title" title="This store's own vector-index settings (its schema's vector_index). Values that differ from the server default for new stores are highlighted.">THIS STORE: ${esc(vops.ns)}</div>
+      <div class="admin-card-title vset-card-title" title="This store's own vector-index settings (its schema's vector_index). Values that differ from the server default for new stores are highlighted.">
+        <span>THIS STORE: ${esc(vops.ns)}</span>
+        <button class="btn btn-xs btn-accent" onclick="showEditVectorSettingsModal('${esc(vops.ns)}')">✎ Edit Search &amp; Maintenance</button>
+      </div>
       <div class="tbl-wrap"><table class="tbl vops-settings">
         <thead><tr><th title="The setting's name in the store's schema (vector_index).">Setting</th><th title="This store's value. Highlighted where it differs from the server default.">This store</th><th title="What the server gives a store when it enables semantic search ([semantic_search] defaults).">Server default</th><th title="fixed: set once for the store's life. read-only: chosen by minnal. yes: change with the update_vector_search schema amendment; per request: overridable on one search or check.">Can change?</th><th title="What the setting does.">Meaning</th></tr></thead>
         <tbody>

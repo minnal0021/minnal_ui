@@ -721,3 +721,12 @@ select { cursor: pointer; }
 .vidx-progress .progress-wrap { width: 120px; }
 .vops-decision-compact { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 16px; }
 .vops-decision-compact .vops-decision-title { font-size: 15px; margin-bottom: 2px; }
+
+/* ── Vector-index settings (Schema tab, create / edit forms) ─────────── */
+.vset-grid { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+.vset-card-title { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.vset-form { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px 14px; }
+.vset-field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--text-2); font-family: monospace; cursor: help; }
+.vset-field input, .vset-field select { font-family: inherit; }
+.vset-more { margin-top: 10px; }
+.vset-more summary { cursor: pointer; font-size: 12px; color: var(--accent); }

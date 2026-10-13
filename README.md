@@ -27,7 +27,7 @@ The interface is organised into four tabs, each mapping onto a part of the minna
 
 | Tab | Purpose |
 |---|---|
-| **Schema** | Create, view, amend, and delete document stores and KV stores; manage field indices and embedding fields. |
+| **Schema** | Create, view, amend, and delete document stores and KV stores; manage field indices and embedding fields; view a semantic-search store's vector-index settings and change its search and maintenance settings (see [Vector-index settings](#vector-index-settings)). |
 | **Documents** | Browse, get, put, and delete documents; range scans and prefix scans with pagination. |
 | **Query** | Run predicate queries against field indices, plus semantic search and filtered semantic search. |
 | **Admin** | Four sub-tabs. **Storage**: server health, storage stats, WAL/LSM/value-log inspection, GC and compaction triggers. **Ops Metrics**: engine-wide and per-store counters, including the field-index write buffer. **Field Indexes**: builds, health and repair, waste, blob and row-map stats, reindex and drop. **Vector Indexes**: every vector store, and one store in detail, including whether a partition rebuild would help (see [Vector Indexes](#vector-indexes)). |
@@ -145,6 +145,29 @@ For Docker, `build.sh` additionally honours `IMAGE_NAME` and `CONTAINER_NAME`.
 
 ---
 
+## Vector-index settings
+
+A store with semantic search has a `vector_index` block in its schema. It holds
+four groups of settings, all shown under **Schema → Vector Index Settings**:
+
+| Group | Settings | Can change? |
+|---|---|---|
+| Embedding and chunking | `embedding_model`, `embedding_dim`, `chunking.window_size`, `chunking.sliding_size` | Set when semantic search is enabled, then fixed |
+| Quantisation | `pass1_bits`, `pass2_bits`, `pass2_centre`, `rotation_seed` | Read-only; `rotation_seed` can be given at enable time |
+| Search defaults | `probe_budget_entries`, `min_probes`, `max_probes`, `first_pass_top_k`, `top_k`, `probe_budget_fraction`, `probe_budget_floor` | Any time; each search can also override them |
+| Partition maintenance | `target_posting_size`, `reassign_range`, `merge_ratio`, `skip_uncertain_moves`, `split_*` | Any time; later splits and merges use them |
+
+**Edit Search & Maintenance** changes the last two groups (it sends only the
+values you changed). When you create a store with semantic search, or add a
+vector index to an existing store, the form also takes the settings: pick the
+model (from the server's allowed models), and leave any other field empty to use
+the server's default. The server saves the filled-in values, so the schema always
+shows what is in force. The model, dimension and chunking cannot be changed
+later; to change them, drop the vector index and add it again.
+
+**Export Schema** downloads the store's full schema, `vector_index` included, and
+importing that file recreates the store with the same settings.
+
 ## Vector Indexes
 
 Under **Admin → Vector Indexes**. With no vector store selected in the sidebar,
@@ -200,7 +223,8 @@ minnal_ui/
 ├── js/
 │   ├── api.js      # Thin async wrapper over the minnal REST API
 │   ├── app.js      # UI logic, rendering, event handling
-│   └── vector_ops.js # Admin → Vector Indexes
+│   ├── vector_ops.js # Admin → Vector Indexes
+│   └── vector_settings.js # A store's vector-index settings: Schema tab, create/enable forms, edit
 ├── img/logo.svg    # மின்னல் logo
 ├── server.py       # Static file server + /stores,/kv-stores,/admin proxy
 ├── start.sh        # Run server.py with sensible env defaults
