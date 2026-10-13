@@ -3364,7 +3364,27 @@ async function adminIndexCheckpoint(btn) {
   }
 }
 
+/** Ask first: clearing cannot be undone and empties what recall checks sample. */
 async function adminClearQueryCache() {
+  const sys = await Api.systemStores().catch(() => null);
+  const n = sys?.kv_stores?.find(k => k.name === 'system_qemb_cache')?.lsm_entry_count;
+  openModal(`
+    <div class="modal-title">Clear the query-embedding cache?</div>
+    <p style="line-height:1.6;margin:0 0 10px">
+      This deletes ${n != null ? `all <strong>${fmt(n)}</strong> cached ${n === 1 ? 'entry' : 'entries'}` : 'every cached entry'},
+      for every semantic-search store. It cannot be undone.
+    </p>
+    <ul class="text-muted" style="line-height:1.6;margin:0 0 12px 18px">
+      <li>Each query is embedded again the next time it is searched, so the first searches are slower.</li>
+      <li>Recall checks sample real queries from this cache: they have fewer to sample until it refills.</li>
+    </ul>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-danger" onclick="closeModal(); doClearQueryCache()">🗑 Clear Cache</button>
+    </div>`);
+}
+
+async function doClearQueryCache() {
   const el = document.getElementById('admin-action-result');
   if (!el) return;
   el.innerHTML = '<div class="spinner"></div>';
