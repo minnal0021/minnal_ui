@@ -708,3 +708,4 @@ select { cursor: pointer; }
 .store-section-sys:hover { color: var(--text-2); }
 .store-item-sys .store-name { color: var(--text-2); font-family: monospace; font-size: 12px; }
 .tab-btn:disabled { opacity: .4; cursor: not-allowed; }
+.vops-ns-name { font-family: monospace; font-weight: 600; color: var(--text); }

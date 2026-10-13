@@ -182,9 +182,15 @@ function renderVectorOpsTab() {
       <p>No store has semantic search enabled. Enable it on a store (Schema tab) to see its vector index here.</p></div>`;
     return;
   }
+  // The store comes from the sidebar; this tab has no picker of its own.
   const sel = state.selectedStore;
-  if (sel?.semantic_search_enabled && sel.namespace !== vops.ns && vops._followSidebar !== false) vops.ns = sel.namespace;
-  if (!stores.some(s => s.namespace === vops.ns)) vops.ns = stores[0].namespace;
+  if (!sel?.semantic_search_enabled || state.selectedStoreType === 'system') {
+    el.innerHTML = `<div class="welcome"><p class="welcome-icon">🧭</p>
+      <p>${sel ? `${esc(sel.namespace)} has no vector index. ` : ''}Select a store with semantic search in the sidebar:</p>
+      <p>${stores.map(s => `<button class="btn btn-ghost btn-sm" onclick="selectStore('${esc(s.namespace)}', '${s.store_type === 'kv' ? 'kv' : 'doc'}')">${esc(s.namespace)}</button>`).join(' ')}</p></div>`;
+    return;
+  }
+  if (sel.namespace !== vops.ns) resetVopsStore(sel.namespace);
 
   const tabs = [
     ['decision', 'Rebuild decision'],
@@ -199,10 +205,7 @@ function renderVectorOpsTab() {
       <div class="section-header">
         <span class="section-title" title="Everything on this panel is for the selected store. Server-wide values are marked as such.">VECTOR INDEX OPS</span>
         <div class="vops-ns">
-          <label for="vops-ns-select" class="text-muted">Store</label>
-          <select id="vops-ns-select" onchange="onVopsNsChange()">
-            ${stores.map(s => `<option value="${esc(s.namespace)}" ${s.namespace === vops.ns ? 'selected' : ''}>${esc(s.namespace)} (${esc(s.store_type ?? 'doc')})</option>`).join('')}
-          </select>
+          <span class="vops-ns-name" title="The store selected in the sidebar">${esc(vops.ns)}</span>
           <button class="btn btn-secondary btn-sm" onclick="loadVectorOps()">↻ Refresh</button>
         </div>
       </div>
@@ -214,13 +217,16 @@ function renderVectorOpsTab() {
   loadVectorOps();
 }
 
-function onVopsNsChange() {
-  vops.ns = document.getElementById('vops-ns-select').value;
-  vops._followSidebar = false;
+/** Forget everything loaded for the previous store. */
+function resetVopsStore(ns) {
+  vops.ns = ns;
+  if (vops.rebuildPoll) { clearInterval(vops.rebuildPoll); vops.rebuildPoll = null; }
+  vops.partition = null;
+  vops.history = [];
+  vops.corruption = null;
   vops.lastCheck = null;
   vops.allPostings = null;
   vops.postings = { ...vops.postings, stack: [null], idx: 0, data: null, next: null };
-  loadVectorOps();
 }
 
 function switchVopsTab(id) {

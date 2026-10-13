@@ -28,10 +28,7 @@ const state = {
   adminTab:       'storage', // 'storage' | 'ops' | 'index' | 'vector-ops'
   adminSys:       null, // /admin/system-stores payload cached during loadStorageStats
   adminRowCounts: {}, // { [namespace]: number }
-  storageStoresTab:  'doc', // 'doc' | 'kv' | 'system' — active tab in the namespaces section
-  storageSelectedNs: { doc: null, kv: null, system: null }, // selected namespace per tab
   opsByNamespace: [],   // NamespaceOpsMetrics[] cached from the by-namespace endpoint
-  opsSelectedNs:  null, // namespace selected in the per-namespace ops panel
 
   // Progress polling: { 'ns::field': intervalId }
   progressPolls: {},
@@ -323,7 +320,8 @@ function selectStore(ns, type = 'doc') {
   // System namespaces have no schema, documents or queries of their own: they
   // open in Admin.
   if (type === 'system' && state.activeTab !== 'admin') { switchTab('admin'); return; }
-  if (state.activeTab === 'admin') return;
+  // Admin follows the sidebar: every per-store section shows this store.
+  if (state.activeTab === 'admin') { renderAdminTab(); return; }
   if (state.activeTab === 'schema') renderSchemaTab();
   else switchTab(state.activeTab);
 }
@@ -2318,12 +2316,10 @@ async function loadAdminOpsPanel() {
 
       <div class="ops-metrics-col">
         <div class="section-header" style="margin-top:4px">
-          <span class="section-title">PER-NAMESPACE</span>
-          <select id="ops-ns-select" style="max-width:320px"
-                  onchange="onOpsNsChange()"></select>
+          <span class="section-title">PER-NAMESPACE${state.selectedStore ? `: ${esc(state.selectedStore.namespace.toUpperCase())}` : ''}</span>
         </div>
         <div class="text-muted" style="font-size:12px;margin-bottom:8px">
-          Counters for the selected namespace. WAL-GC is engine-global (not attributable to a
+          Counters for the store selected in the sidebar. WAL-GC is engine-global (not attributable to a
           namespace) and is shown in the engine-wide panel beside this one.
         </div>
         <div id="admin-ops-metrics-ns"><div class="spinner"></div></div>
@@ -2352,54 +2348,23 @@ async function loadOpsMetrics() {
 
   if (nsRes.status === 'fulfilled') {
     state.opsByNamespace = nsRes.value ?? [];
-    renderOpsNsSelect();
+    renderOpsNsMetrics();
   } else if (nsArea) {
     state.opsByNamespace = [];
     nsArea.innerHTML = `<div class="alert alert-error">Failed to load per-namespace ops metrics: ${esc(nsRes.reason?.message)}</div>`;
   }
 }
 
-// Populate the namespace dropdown from the cached by-namespace data, preserving
-// the current selection where possible, then render the selected namespace.
-// Only user-facing namespaces (the user's own doc/kv stores) are listed —
-// internal/engine namespaces are filtered out.
-function renderOpsNsSelect() {
-  const sel = document.getElementById('ops-ns-select');
-  if (!sel) return;
-  const userNs = new Set([...state.stores, ...state.kvStores].map(s => s.namespace));
-  const names = state.opsByNamespace
-    .map(e => e.namespace)
-    .filter(n => userNs.has(n))
-    .sort((a, b) => a.localeCompare(b));
-  if (!names.length) {
-    sel.innerHTML = '';
-    const nsArea = document.getElementById('admin-ops-metrics-ns');
-    if (nsArea) nsArea.innerHTML = '<div class="text-muted" style="font-size:13px">No namespaces yet.</div>';
-    return;
-  }
-  if (!names.includes(state.opsSelectedNs)) {
-    state.opsSelectedNs = names[0];
-  }
-  sel.innerHTML = names.map(n =>
-    `<option value="${esc(n)}" ${n === state.opsSelectedNs ? 'selected' : ''}>${esc(n)}</option>`
-  ).join('');
-  renderOpsNsMetrics();
-}
-
-function onOpsNsChange() {
-  const sel = document.getElementById('ops-ns-select');
-  if (!sel) return;
-  state.opsSelectedNs = sel.value;
-  renderOpsNsMetrics();
-}
-
 function renderOpsNsMetrics() {
   const nsArea = document.getElementById('admin-ops-metrics-ns');
   if (!nsArea) return;
-  const entry = state.opsByNamespace.find(e => e.namespace === state.opsSelectedNs);
+  const ns = state.selectedStore?.namespace;
+  const entry = ns != null ? state.opsByNamespace.find(e => e.namespace === ns) : null;
   nsArea.innerHTML = entry
     ? renderOpsMetricsHtml(entry, { perNamespace: true })
-    : '<div class="text-muted" style="font-size:13px">Select a namespace.</div>';
+    : `<div class="text-muted" style="font-size:13px">${ns != null
+        ? `No counters for ${esc(ns)} yet.`
+        : 'Select a store in the sidebar to see its counters.'}</div>`;
 }
 
 function renderOpsMetricsHtml(m, opts = {}) {
@@ -2674,113 +2639,48 @@ async function loadStorageStats() {
         <div class="progress-label">${s.waste_ratio_pct.toFixed(1)}% garbage</div>
       </div>
 
-      <div id="storage-stores-section">${renderStorageStoresTabs()}</div>
+      ${renderStorageNsSection()}
     `;
-    renderStorageNsSelect();
+    renderStorageNsDetail();
   } catch (e) {
     area.innerHTML = `<div class="alert alert-error">Failed to load stats: ${esc(e.message)}</div>`;
   }
 }
 
-// ── Namespaces section (tabbed) ─────────────────────────────────────────────────
-// One tab per store category (Doc / KV / System). Each tab has a namespace
-// dropdown (like the per-namespace ops panel) and shows the storage metrics for
-// the single selected namespace, rather than listing every namespace at once.
-
-// Build the list of selectable namespaces for a tab. Each entry carries the
-// info its summary header needs plus a `kind` that decides which meta endpoint
-// and renderer the detail uses.
-function storageTabEntries(tab) {
-  if (tab === 'doc') {
-    return state.stores.map(s => ({ key: s.namespace, name: s.namespace, kind: 'doc', store: s }));
+// ── Namespace section ───────────────────────────────────────────────────────────
+// Storage detail for the store selected in the sidebar (a user store or a
+// system namespace). Each entry carries a `kind` that decides which meta
+// endpoint and renderer the detail uses.
+function storageSelectedEntry() {
+  const s = state.selectedStore;
+  if (!s) return null;
+  if (state.selectedStoreType === 'system') {
+    return s.sysKind === 'doc'
+      ? { key: `doc:${s.namespace}`, name: s.namespace, kind: 'sys-doc', store: s }
+      : { key: `kv:${s.namespace}`,  name: s.namespace, kind: 'sys-kv',  store: s };
   }
-  if (tab === 'kv') {
-    return state.kvStores.map(s => ({ key: s.namespace, name: s.namespace, kind: 'kv', store: s }));
-  }
-  // system: kv system stores first, then doc system stores
-  const sys = state.adminSys ?? {};
-  return [
-    ...(sys.kv_stores  ?? []).map(k => ({ key: `kv:${k.name}`,      name: k.name,      kind: 'sys-kv',  store: k })),
-    ...(sys.doc_stores ?? []).map(d => ({ key: `doc:${d.namespace}`, name: d.namespace, kind: 'sys-doc', store: d })),
-  ];
+  const kind = state.selectedStoreType === 'kv' ? 'kv' : 'doc';
+  return { key: s.namespace, name: s.namespace, kind, store: s };
 }
 
-const STORAGE_TAB_LABELS = { doc: 'DOC STORE', kv: 'KV STORE', system: 'SYSTEM' };
-
-function renderStorageStoresTabs() {
-  const sys   = state.adminSys ?? {};
-  const sysN  = (sys.kv_stores?.length ?? 0) + (sys.doc_stores?.length ?? 0);
-  const counts = { doc: state.stores.length, kv: state.kvStores.length, system: sysN };
-  const tab   = state.storageStoresTab;
-  const btn   = (t, label) => `
-    <button class="sub-tab-btn ${tab === t ? 'active' : ''}"
-            onclick="switchStorageStoresTab('${t}')">${label} (${counts[t]})</button>`;
+function renderStorageNsSection() {
+  const entry = storageSelectedEntry();
   return `
     <div class="section">
-      <div class="sub-tab-nav" style="margin-bottom:14px">
-        ${btn('doc', 'Doc Stores')}
-        ${btn('kv', 'KV Stores')}
-        ${btn('system', 'System')}
-      </div>
       <div class="section-header">
-        <span class="section-title">${STORAGE_TAB_LABELS[tab]} NAMESPACES</span>
-        <select id="storage-ns-select" style="max-width:320px"
-                onchange="onStorageNsChange()"></select>
+        <span class="section-title">NAMESPACE${entry ? `: ${esc(entry.name.toUpperCase())}` : ''}</span>
       </div>
-      <div id="storage-ns-detail"><div class="spinner"></div></div>
+      <div id="storage-ns-detail">${entry ? '<div class="spinner"></div>'
+        : '<div class="text-muted" style="padding:12px 0">Select a store in the sidebar (or a namespace under System) to see its storage detail.</div>'}</div>
     </div>
   `;
-}
-
-function switchStorageStoresTab(tab) {
-  state.storageStoresTab = tab;
-  const section = document.getElementById('storage-stores-section');
-  if (!section) return;
-  section.innerHTML = renderStorageStoresTabs();
-  renderStorageNsSelect();
-}
-
-// Populate the dropdown for the active tab, preserving the current selection
-// where possible, then render the selected namespace's detail.
-function renderStorageNsSelect() {
-  const sel = document.getElementById('storage-ns-select');
-  if (!sel) return;
-  const tab     = state.storageStoresTab;
-  const entries = storageTabEntries(tab);
-  const detail  = document.getElementById('storage-ns-detail');
-  if (!entries.length) {
-    sel.innerHTML = '';
-    sel.style.display = 'none';
-    if (detail) detail.innerHTML =
-      `<div class="text-muted" style="padding:12px 0">No ${STORAGE_TAB_LABELS[tab].toLowerCase()} namespaces found.</div>`;
-    return;
-  }
-  sel.style.display = '';
-  if (!entries.some(e => e.key === state.storageSelectedNs[tab])) {
-    state.storageSelectedNs[tab] = entries[0].key;
-  }
-  sel.innerHTML = entries.map(e =>
-    `<option value="${esc(e.key)}" ${e.key === state.storageSelectedNs[tab] ? 'selected' : ''}>${esc(e.name)}</option>`
-  ).join('');
-  renderStorageNsDetail();
-}
-
-function onStorageNsChange() {
-  const sel = document.getElementById('storage-ns-select');
-  if (!sel) return;
-  state.storageSelectedNs[state.storageStoresTab] = sel.value;
-  renderStorageNsDetail();
 }
 
 function renderStorageNsDetail() {
   const area = document.getElementById('storage-ns-detail');
   if (!area) return;
-  const tab     = state.storageStoresTab;
-  const entry   = storageTabEntries(tab).find(e => e.key === state.storageSelectedNs[tab]);
-  if (!entry) {
-    area.innerHTML = '<div class="text-muted" style="padding:12px 0">Select a namespace.</div>';
-    return;
-  }
+  const entry = storageSelectedEntry();
+  if (!entry) return;
   const needsMeta = entry.kind !== 'sys-doc';
   area.innerHTML = `
     ${renderStorageEntrySummary(entry)}
