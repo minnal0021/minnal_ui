@@ -221,78 +221,138 @@ async function loadStores() {
   const isKv = s => s.store_type === 'kv' || (s.store_type == null && s.value_type != null);
   state.stores   = all.filter(s => !isKv(s));
   state.kvStores = all.filter(isKv);
+  // System namespaces are listed in their own sidebar section. A server that
+  // does not serve the endpoint just shows none.
+  state.adminSys = await Api.systemStores().catch(() => state.adminSys);
 
   renderSidebar();
 
   if (state.selectedStore) {
-    const ns   = state.selectedStore.namespace;
-    const list = isKvStore() ? state.kvStores : state.stores;
-    const fresh = list.find(s => s.namespace === ns);
-    state.selectedStore = fresh ?? null;
+    const fresh = findStore(state.selectedStore.namespace, state.selectedStoreType);
+    state.selectedStore = fresh;
     if (!fresh) state.selectedStoreType = null;
+    updateTabLabels();
     renderActiveTab();
   }
+}
+
+/** System namespaces as sidebar entries: `namespace` set on both kinds. */
+function systemStores() {
+  const sys = state.adminSys ?? {};
+  return [
+    ...(sys.kv_stores  ?? []).map(k => ({ ...k, namespace: k.name, sysKind: 'kv' })),
+    ...(sys.doc_stores ?? []).map(d => ({ ...d, sysKind: 'doc' })),
+  ].sort((a, b) => a.namespace.localeCompare(b.namespace));
+}
+
+/** The store `ns` of kind `type` ('doc' | 'kv' | 'system'), or null. */
+function findStore(ns, type) {
+  const list = type === 'kv' ? state.kvStores
+             : type === 'system' ? systemStores()
+             : state.stores;
+  return list.find(s => s.namespace === ns) ?? null;
+}
+
+function isSystemStore() {
+  return state.selectedStoreType === 'system';
 }
 
 function renderSidebar() {
   const el = document.getElementById('store-list');
   const hasDoc = state.stores.length > 0;
   const hasKv  = state.kvStores.length > 0;
-
-  if (!hasDoc && !hasKv) {
-    el.innerHTML = '<div class="empty-sidebar">No stores yet</div>';
-    return;
-  }
+  const sys    = systemStores();
 
   const selNs   = state.selectedStore?.namespace;
   const selType = state.selectedStoreType;
   const hasBoth = hasDoc && hasKv;
 
-  const docItems = state.stores.map(s => `
-    <div class="store-item ${selType === 'doc' && selNs === s.namespace ? 'active' : ''}"
-         onclick="selectStore('${esc(s.namespace)}', 'doc')">
+  // The selected entry carries a clear button: with nothing selected, Admin
+  // shows only its all-stores views.
+  const item = (s, type, badges) => {
+    const active = selType === type && selNs === s.namespace;
+    return `
+    <div class="store-item ${active ? 'active' : ''} ${type === 'system' ? 'store-item-sys' : ''}"
+         onclick="selectStore('${esc(s.namespace)}', '${type}')">
       <span class="store-name">${esc(s.namespace)}</span>
-      ${keyTypeBadge(s.key_type)}
-    </div>
-  `).join('');
+      <span class="store-badges">${badges}${active
+        ? `<button class="store-clear" title="Clear the selection" onclick="event.stopPropagation(); clearStoreSelection()">×</button>`
+        : ''}</span>
+    </div>`;
+  };
 
-  const kvItems = state.kvStores.map(s => `
-    <div class="store-item ${selType === 'kv' && selNs === s.namespace ? 'active' : ''}"
-         onclick="selectStore('${esc(s.namespace)}', 'kv')">
-      <span class="store-name">${esc(s.namespace)}</span>
-      <span class="badge badge-kv">KV</span>
-      ${kvValueTypeBadge(s.value_type)}
-    </div>
-  `).join('');
+  const docItems = state.stores.map(s => item(s, 'doc', keyTypeBadge(s.key_type))).join('');
+  const kvItems  = state.kvStores.map(s => item(s, 'kv',
+    `<span class="badge badge-kv">KV</span>${kvValueTypeBadge(s.value_type)}`)).join('');
 
-  if (hasBoth) {
-    el.innerHTML =
-      `<div class="store-section-title">Doc</div>${docItems}` +
-      `<div class="store-section-title">KV</div>${kvItems}`;
-  } else {
-    el.innerHTML = docItems + kvItems;
+  let html = '';
+  if (!hasDoc && !hasKv) html = '<div class="empty-sidebar">No stores yet</div>';
+  else if (hasBoth) html =
+    `<div class="store-section-title">Doc</div>${docItems}` +
+    `<div class="store-section-title">KV</div>${kvItems}`;
+  else html = docItems + kvItems;
+
+  if (sys.length) {
+    // Collapsed by default: most sessions never need the engine's own namespaces.
+    // A selected system namespace keeps the section open.
+    const open = sidebarSystemOpen() || selType === 'system';
+    html += `
+      <div class="store-section-title store-section-sys" onclick="toggleSidebarSystem()"
+           title="The engine's own namespaces (embedding queue, query cache, partition history). Read-only here: they open in Admin.">
+        <span>${open ? '▾' : '▸'} System (${sys.length})</span><span>🔒</span>
+      </div>
+      ${open ? sys.map(s => item(s, 'system', '')).join('') : ''}`;
   }
+  el.innerHTML = html;
+}
+
+function sidebarSystemOpen() {
+  try { return localStorage.getItem('minnal_sidebar_system_open') === '1'; } catch { return false; }
+}
+
+function toggleSidebarSystem() {
+  try { localStorage.setItem('minnal_sidebar_system_open', sidebarSystemOpen() ? '0' : '1'); } catch { /* per-browser nicety only */ }
+  renderSidebar();
 }
 
 function selectStore(ns, type = 'doc') {
   state.selectedStoreType = type;
-  const list = type === 'kv' ? state.kvStores : state.stores;
-  state.selectedStore = list.find(s => s.namespace === ns) ?? null;
+  state.selectedStore = findStore(ns, type);
   updateTabLabels();
   renderSidebar();
+  // System namespaces have no schema, documents or queries of their own: they
+  // open in Admin.
+  if (type === 'system' && state.activeTab !== 'admin') { switchTab('admin'); return; }
   if (state.activeTab === 'admin') return;
   if (state.activeTab === 'schema') renderSchemaTab();
   else switchTab(state.activeTab);
 }
 
+function clearStoreSelection() {
+  state.selectedStore = null;
+  state.selectedStoreType = null;
+  updateTabLabels();
+  renderSidebar();
+  renderActiveTab();
+}
+
+const SYSTEM_TAB_REASON = 'System namespaces are internal: they have no schema, documents or queries here. See them in Admin.';
+
 function updateTabLabels() {
   const kv = isKvStore();
   const docsBtn = document.querySelector('.tab-btn[data-tab="documents"]');
   if (docsBtn) docsBtn.textContent = kv ? 'KV' : 'Documents';
+  const sys = isSystemStore();
+  document.querySelectorAll('.tab-btn').forEach(b => {
+    const off = sys && b.dataset.tab !== 'admin';
+    b.disabled = off;
+    b.title = off ? SYSTEM_TAB_REASON : '';
+  });
 }
 
 // ── Tab switching ─────────────────────────────────────────────────────────────
 function switchTab(name) {
+  if (isSystemStore() && name !== 'admin') return;
   state.activeTab = name;
   document.querySelectorAll('.tab-btn').forEach(b => {
     b.classList.toggle('active', b.dataset.tab === name);

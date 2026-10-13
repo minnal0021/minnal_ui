@@ -694,3 +694,17 @@ select { cursor: pointer; }
 .vops-hist-mark.target { border-color: var(--success); color: var(--success); }
 .vops-hist-mark.split { border-color: var(--error); color: var(--error); }
 .vops-hist-axis { display: flex; justify-content: space-between; font-size: 11px; color: var(--text-3); margin-top: 4px; }
+
+/* ── Sidebar: selection clear + system section ───────────────────────── */
+.store-badges { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
+.store-clear {
+  border: none; background: none; cursor: pointer;
+  color: var(--text-3); font-size: 15px; line-height: 1; padding: 0 2px;
+}
+.store-clear:hover { color: var(--text); }
+.store-section-sys {
+  display: flex; justify-content: space-between; cursor: pointer; user-select: none;
+}
+.store-section-sys:hover { color: var(--text-2); }
+.store-item-sys .store-name { color: var(--text-2); font-family: monospace; font-size: 12px; }
+.tab-btn:disabled { opacity: .4; cursor: not-allowed; }
