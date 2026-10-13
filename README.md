@@ -35,7 +35,8 @@ The interface is organised into four tabs, each mapping onto a part of the minna
 **The sidebar picks the store everywhere.** The store selected in the sidebar is
 the one every per-store section shows, including in Admin; nothing in Admin has a
 store picker of its own. With no store selected (clear it with the × on the
-selected entry), Admin shows only its all-stores views. Under **System** (collapsed
+selected entry), Admin shows its all-stores views. With one selected, Field Indexes
+and Vector Indexes show only that store, or say it has no index of that kind. Under **System** (collapsed
 by default) the sidebar also lists the engine's own namespaces: the embedding
 queue, the query-embedding cache and the partition history. A system namespace
 opens in Admin only; Schema, Documents and Query do not apply to it.
@@ -170,7 +171,7 @@ importing that file recreates the store with the same settings.
 
 ## Vector Indexes
 
-Under **Admin → Vector Indexes**. With no vector store selected in the sidebar,
+Under **Admin → Vector Indexes**. With no store selected in the sidebar,
 the tab lists every vector store (indexing progress, queue backlog, corrupt
 entries skipped) with the queue totals, the reconcile that re-enqueues documents
 missing a vector, and the browser for retried queue entries. **Open →** on a row

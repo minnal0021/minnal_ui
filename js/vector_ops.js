@@ -195,6 +195,8 @@ function renderVectorIndexesTab() {
     return;
   }
   // The store comes from the sidebar; this tab has no picker of its own.
+  const empty = indexTabEmptyHtml('vector index', s => !!s.semantic_search_enabled);
+  if (empty) { el.innerHTML = empty; return; }
   const sel = vectorDetailStore();
   if (!sel) { renderVectorLanding(el); return; }
   if (sel.namespace !== vops.ns) resetVopsStore(sel.namespace);
@@ -247,9 +249,7 @@ function resetVopsStore(ns) {
 
 // ── All vector stores ────────────────────────────────────────────────────────
 function renderVectorLanding(el) {
-  const sel = state.selectedStore;
   el.innerHTML = `
-    ${sel ? `<div class="alert alert-info">${esc(sel.namespace)} has no vector index, so every vector store is shown.</div>` : ''}
     <div class="admin-actions">
       <button class="btn btn-secondary" onclick="loadVectorLanding()">↻ Refresh</button>
       <button class="btn btn-ghost" onclick="adminVectorReconcile(this)"

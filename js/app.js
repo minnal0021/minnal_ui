@@ -2275,21 +2275,30 @@ function switchAdminTab(tab) {
   loadAdminSubTab(tab);
 }
 
-/** The namespace selected in the sidebar, if it is a user store. */
-function selectedUserNs() {
-  return state.selectedStore && !isSystemStore() ? state.selectedStore.namespace : null;
-}
-
 /** A namespace table cell that selects the store in the sidebar. */
 function nsCell(ns, type = 'doc') {
   return `<td class="text-mono ns-cell" title="Select ${esc(ns)} in the sidebar"
               onclick="selectStore('${esc(ns)}', '${type}')">${esc(ns)}</td>`;
 }
 
-/** Row attributes that highlight the sidebar's store. */
-function nsRow(ns) {
-  return ns === selectedUserNs() ? 'class="row-selected"' : '';
+/**
+ * The panel to show when the sidebar's selection has nothing for an index tab,
+ * or null when it does (or nothing is selected). `has(store)` says whether a
+ * user store has that kind of index.
+ */
+function indexTabEmptyHtml(kind, has) {
+  const s = state.selectedStore;
+  if (!s) return null;
+  if (!isSystemStore() && has(s)) return null;
+  const why = isSystemStore()
+    ? `<strong>${esc(s.namespace)}</strong> is a system namespace: it has no ${kind}.`
+    : `<strong>${esc(s.namespace)}</strong> has no ${kind}.`;
+  return `<div class="welcome"><p class="welcome-icon">∅</p><p>${why}</p>
+    <p class="text-muted">Select another store in the sidebar, or clear the selection (×) to see every store.</p></div>`;
 }
+
+/** A user doc store with at least one field index. */
+const hasFieldIndexes = (s) => state.selectedStoreType === 'doc' && (s.indices?.length ?? 0) > 0;
 
 // ── Admin storage panel ───────────────────────────────────────────────────────
 async function loadAdminStoragePanel() {
@@ -3409,13 +3418,15 @@ const vqState = {
 async function loadAdminFieldPanel() {
   const panel = document.getElementById('admin-field-panel');
   if (!panel) return;
-  const ns = selectedUserNs();
+  const empty = indexTabEmptyHtml('field indexes', hasFieldIndexes);
+  if (empty) { panel.innerHTML = empty; return; }
+  const ns = fieldScopeNs();
   panel.innerHTML = `
     <div class="admin-actions">
       <button class="btn btn-secondary" onclick="adminIndexRefresh()">↻ Refresh</button>
       <span class="text-muted" style="font-size:12px">${ns
-        ? `All stores, <strong>${esc(ns)}</strong> highlighted. Click a store name to select it.`
-        : 'All stores. Select one in the sidebar (or click its name) to highlight it.'}</span>
+        ? `Showing <strong>${esc(ns)}</strong> only. Clear the selection in the sidebar (×) to see every store.`
+        : 'All stores. Select one in the sidebar (or click its name) to see only that store.'}</span>
     </div>
     <div id="admin-index-builds"></div>
     <div id="admin-index-health"></div>
@@ -3423,6 +3434,11 @@ async function loadAdminFieldPanel() {
     <div id="admin-index-operations"></div>
   `;
   await refreshFieldIndexes();
+}
+
+/** The store the Field Indexes tab is limited to, or null for every store. */
+function fieldScopeNs() {
+  return state.selectedStore && hasFieldIndexes(state.selectedStore) ? state.selectedStore.namespace : null;
 }
 
 /** Refresh whichever index tab is open (index actions call this when they finish). */
@@ -3439,7 +3455,10 @@ async function refreshFieldIndexes() {
     Api.indicesProgress().catch(() => null),
     Api.indexWaste().catch(() => null),
   ]);
-  if (builds) builds.innerHTML = renderAttributeBuildsSection(progress?.attribute_builds ?? []);
+  const ns = fieldScopeNs();
+  const inScope = (n) => ns == null || n === ns;
+  if (builds) builds.innerHTML = renderAttributeBuildsSection((progress?.attribute_builds ?? []).filter(b => inScope(b.id?.namespace)));
+  if (wasteRes) wasteRes.namespaces = (wasteRes.namespaces ?? []).filter(n => inScope(n.namespace));
   if (waste)  waste.innerHTML  = renderIndexWasteSection(wasteRes);
   ops.innerHTML = renderFieldOpsSection();
   // Health fans out one request per indexed namespace, so it loads on its own
@@ -3457,8 +3476,9 @@ async function loadFieldIndexHealth() {
   const el = document.getElementById('admin-index-health');
   if (!el) return;
 
+  const scope = fieldScopeNs();
   const namespaces = state.stores
-    .filter(s => (s.indices?.length ?? 0) > 0)
+    .filter(s => (s.indices?.length ?? 0) > 0 && (scope == null || s.namespace === scope))
     .map(s => s.namespace);
 
   if (!namespaces.length) { el.innerHTML = ''; return; }
@@ -3550,7 +3570,7 @@ function renderFieldIndexHealthSection(results) {
       }
 
       rows.push({ degraded: !!gap, html: `
-        <tr ${nsRow(r.ns)}>
+        <tr>
           ${nsCell(r.ns)}
           <td class="text-mono">${esc(f.field_name)}</td>
           <td>${badges}</td>
@@ -3655,7 +3675,7 @@ function renderAttributeBuildsSection(builds) {
         : `<span class="badge badge-error">${esc(b.status ?? 'Unknown')}</span>`;
 
     return `
-      <tr ${nsRow(ns)}>
+      <tr>
         ${nsCell(ns)}
         <td class="text-mono">${esc(field)}</td>
         <td>${statusHtml}</td>
@@ -3719,14 +3739,15 @@ function renderVectorQueueSummarySection(summary) {
 }
 
 function renderFieldOpsSection() {
-  const stores = state.stores.filter(s => (s.indices?.length ?? 0) > 0);
+  const scope = fieldScopeNs();
+  const stores = state.stores.filter(s => (s.indices?.length ?? 0) > 0 && (scope == null || s.namespace === scope));
   const rows = stores.map(s => {
     const ns = s.namespace;
     const indicesHtml = s.indices.map(ix =>
       `<span class="badge badge-attr" style="margin-right:2px">${esc(ix.field)} <span style="opacity:.6">${esc(ix.index_type)}</span></span>`
     ).join('');
     return `
-      <tr ${nsRow(ns)}>
+      <tr>
         ${nsCell(ns)}
         <td>${indicesHtml}</td>
         <td class="ns-ops-actions gap-8">
