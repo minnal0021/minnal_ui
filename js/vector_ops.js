@@ -274,6 +274,23 @@ async function loadVectorLanding() {
   area.innerHTML = `
     ${renderVectorStoresTable(progress?.vector_progress ?? [], summary?.by_namespace ?? [], corruption ?? {})}
     ${renderVectorQueueSummarySection(summary)}`;
+  loadLandingRebuildAdvice();
+}
+
+/** Fill each row's Rebuild cell: the store's partition and history, then the decision. */
+function loadLandingRebuildAdvice() {
+  for (const s of semanticStores()) {
+    Promise.all([Api.vectorPartition(s.namespace, false), Api.vectorHistory(s.namespace, null, 1000)])
+      .then(([p, h]) => decideRebuild(p, h.records ?? [], s.vector_index))
+      .then(d => setRebuildCell(s.namespace, `
+          <span class="stat-val ${{ good: 'good', warn: 'warn', info: 'info', unknown: 'muted' }[d.level]}"
+                title="${esc(`${d.title}. ${d.text}`)}">${esc(d.short)}</span>`),
+            e => setRebuildCell(s.namespace, `<span class="text-muted" title="${esc(e.message)}">—</span>`));
+  }
+}
+function setRebuildCell(ns, html) {
+  const cell = document.querySelector(`#vidx-landing td[data-rebuild-ns="${CSS.escape(ns)}"]`);
+  if (cell) cell.innerHTML = html;
 }
 
 function renderVectorStoresTable(progress, byNs, corruption) {
@@ -305,6 +322,7 @@ function renderVectorStoresTable(progress, byNs, corruption) {
           </div>` : '<span class="text-muted">—</span>'}</td>
         <td>${queueHtml}</td>
         <td><span class="stat-val ${skipped > 0 ? 'bad' : 'good'}">${fmt(skipped)}</span></td>
+        <td data-rebuild-ns="${esc(ns)}"><span class="text-muted">…</span></td>
         <td style="text-align:right">
           <button class="btn btn-xs btn-accent" onclick="selectStore('${esc(ns)}', '${type}')"
                   title="Select ${esc(ns)} in the sidebar and open its vector index">Open →</button>
@@ -321,6 +339,7 @@ function renderVectorStoresTable(progress, byNs, corruption) {
           <th title="Documents embedded so far, as a share of the store (approximate).">Indexed</th>
           <th title="Embedding queue backlog: pending (awaiting embedding) and exhausted (gave up after max retries). 'idle' means the queue is empty.">Queue</th>
           <th title="Sparse (Pass-1) plus dense (Pass-2) entries skipped on read because their stored bytes did not decode, since server start. Should be 0.">Corrupt skipped</th>
+          <th title="Would rebuilding the store's partition help? From its last recall check at its own probe budget and its last rebuild; hover a value for the reason, open the store for the steps.">Rebuild</th>
           <th></th>
         </tr></thead>
         <tbody>${rows}</tbody>
@@ -451,50 +470,56 @@ function sameCheck(a, b) {
   return a && b && a.seed === b.seed && a.query_source === b.query_source && a.budget_entries === b.budget_entries;
 }
 
-/**
- * The decision, from the latest recall check, the last rebuild and the budget.
- * Returns { level: good|warn|info|unknown, title, text, steps[] }.
- */
+/** The decision for the store open in the detail view. */
 function vopsDecide() {
-  const p = vops.partition ?? {};
-  const settings = vopsSettings();
+  return decideRebuild(vops.partition, vops.history, vopsSettings());
+}
+
+/**
+ * The decision for one store, from its partition, its history (newest first)
+ * and its vector-index settings: the latest recall check, the last rebuild and
+ * the budget. Returns { level: good|warn|info|unknown, short, title, text, steps[] }.
+ */
+function decideRebuild(partition, history, settings) {
+  const p = partition ?? {};
+  const allChecks = history.filter(r => r.kind === 'recall_check');
   const budget = effectiveBudget(settings, p.entries ?? 0);
   // Only checks run at the store's own budget say what its searches lose; a
   // check with a budget override is a what-if and is shown apart.
-  const cs = checks().filter(c => c.data.budget_entries === budget);
+  const cs = allChecks.filter(c => c.data.budget_entries === budget);
   const latest = cs[0];
-  const rb = rebuildsDone()[0];
+  const rb = history.find(r => r.kind === 'rebuild' && r.data?.state === 'done');
   if (p.rebuild?.state === 'running') {
-    return { level: 'info', title: 'A rebuild is running',
+    return { level: 'info', short: 'Rebuilding', title: 'A rebuild is running',
       text: 'Wait for it to finish (this page refreshes itself), then run a recall check with the same seed as your last one to see what it gained.', steps: [] };
   }
   if (budget != null && budget >= (p.entries ?? 0) && (p.entries ?? 0) > 0) {
-    return { level: 'good', title: 'No rebuild needed',
+    return { level: 'good', short: 'Not needed', title: 'No rebuild needed',
       text: `Every search reads the whole store: the probe budget (${fmt(budget)} entries) is at least the store's ${fmt(p.entries)} entries. No partition can change what a search finds.`,
       steps: ['This changes once the store grows past the budget; check again then.'] };
   }
   if (!latest) {
-    return { level: 'unknown', title: 'Not measured yet',
-      text: `Searches read about ${budget && p.entries ? pct(Math.min(1, budget / p.entries), 0) : 'part'} of this store. Run a recall check (without a budget override) to see whether they miss results a full read would find.${checks().length ? ' Checks recorded so far used a budget override, so they describe a different budget.' : ''}`,
+    return { level: 'unknown', short: 'Not measured', title: 'Not measured yet',
+      text: `Searches read about ${budget && p.entries ? pct(Math.min(1, budget / p.entries), 0) : 'part'} of this store. Run a recall check (without a budget override) to see whether they miss results a full read would find.${allChecks.length ? ' Checks recorded so far used a budget override, so they describe a different budget.' : ''}`,
       steps: ['Run a recall check (below).', 'If its verdict is below_target, rebuild, then run the check again with the same seed.'] };
   }
   const d = latest.data;
   const o = ov10(d);
   if (rb && rb.recorded_at_ms > latest.recorded_at_ms) {
-    return { level: 'info', title: 'Rebuild finished: measure what it gained',
+    return { level: 'info', short: 'Re-check', title: 'Rebuild finished: measure what it gained',
       text: `The last check (overlap@10 ${pct(o)}) ran before the rebuild ${ago(rb.recorded_at_ms)}. Run the same check again to compare.`,
       steps: [`Run the recall check with seed ${d.seed ?? '(same)'}, no budget override (budget ${fmt(d.budget_entries)}).`,
         'Keep the rebuild if overlap rose; if it did not, raise probe_budget_entries instead.'] };
   }
   if (d.verdict === 'read_in_full') {
-    return { level: 'good', title: 'No rebuild needed',
+    return { level: 'good', short: 'Not needed', title: 'No rebuild needed',
       text: 'Every sampled search already read every posting, so no partition can change its results.', steps: [] };
   }
   if (d.verdict === 'empty') {
-    return { level: 'unknown', title: 'Nothing stored yet', text: 'The store has no vectors to check.', steps: [] };
+    return { level: 'unknown', short: 'Empty', title: 'Nothing stored yet', text: 'The store has no vectors to check.', steps: [] };
   }
   if (d.verdict === 'ok') {
-    return { level: 'good', title: 'No rebuild needed',
+    return { level: 'good', short: 'Not needed', title: 'No rebuild needed',
       text: `Searches find ${pct(o)} of a full read's top 10 (threshold ${pct(d.min_overlap, 0)}), reading ${pct(d.read_share)} of the store.`, steps: [] };
   }
   // below_target
@@ -503,19 +528,19 @@ function vopsDecide() {
     if (before) {
       const delta = (o - ov10(before.data)) * 100;
       if (delta >= 1) {
-        return { level: 'warn', title: `The last rebuild helped (+${delta.toFixed(1)} points); keep it`,
+        return { level: 'warn', short: 'Raise budget', title: `The last rebuild helped (+${delta.toFixed(1)} points); keep it`,
           text: `Overlap@10 rose from ${pct(ov10(before.data))} to ${pct(o)}, still below ${pct(d.min_overlap, 0)}. The rest of the gap is the probe budget, which no partition fixes.`,
           steps: [`Raise probe_budget_entries (now ${fmt(d.budget_entries)}) if you need more recall, and check again with a budget override first.`] };
       }
-      return { level: 'warn', title: 'A rebuild did not help: raise the budget instead',
+      return { level: 'warn', short: 'Raise budget', title: 'A rebuild did not help: raise the budget instead',
         text: `Overlap@10 moved ${delta >= 0 ? '+' : ''}${delta.toFixed(1)} points across the last rebuild (${pct(ov10(before.data))} → ${pct(o)}). The partition is not what loses results; the probe budget is.`,
         steps: [`Try the check with a larger probe_budget_entries override (now ${fmt(d.budget_entries)}); if it reaches the target, raise the store's budget.`] };
     }
-    return { level: 'warn', title: 'Below target; cannot compare across the last rebuild',
+    return { level: 'warn', short: 'Below target', title: 'Below target; cannot compare across the last rebuild',
       text: `Overlap@10 is ${pct(o)}. No check from before the last rebuild used the same seed, query source and budget, so its effect is unknown.`,
       steps: ['Run a check now (seed below), rebuild, and run the same check again.'] };
   }
-  return { level: 'warn', title: 'Maybe: try a rebuild',
+  return { level: 'warn', short: 'Try a rebuild', title: 'Maybe: try a rebuild',
     text: `Searches find ${pct(o)} of a full read's top 10 (below ${pct(d.min_overlap, 0)}), reading ${pct(d.read_share)} of the store. A better-fitted partition may recover some of it; a too-small probe budget looks the same, so measure.`,
     steps: [`Rebuild (below).`, `When it is done, run the recall check again with seed ${d.seed ?? '(same)'} and the same budget.`,
       'Keep the rebuild if overlap rose; if it did not, raise probe_budget_entries instead.'] };

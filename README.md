@@ -173,7 +173,8 @@ importing that file recreates the store with the same settings.
 
 Under **Admin → Vector Indexes**. With no store selected in the sidebar,
 the tab lists every vector store (indexing progress, queue backlog, corrupt
-entries skipped) with the queue totals, the reconcile that re-enqueues documents
+entries skipped, and the rebuild verdict in a word — hover it for the reason)
+with the queue totals, the reconcile that re-enqueues documents
 missing a vector, and the browser for retried queue entries. **Open →** on a row
 (or selecting the store in the sidebar) shows that store; *All vector stores*
 goes back.

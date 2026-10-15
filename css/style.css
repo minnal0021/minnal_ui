@@ -498,6 +498,8 @@ select { cursor: pointer; }
 .stat-val.good { color: var(--success); }
 .stat-val.warn { color: var(--warning); }
 .stat-val.bad  { color: var(--error); }
+.stat-val.info { color: var(--info); }
+.stat-val.muted { color: var(--text-2); }
 .admin-actions { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 20px; }
 
 /* ── System stores list ────────────────────────────────────────────────── */
