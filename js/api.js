@@ -151,6 +151,7 @@ const Api = (() => {
   const opsMetricsByNamespace = () => req('GET', '/admin/storage/ops-metrics/by-namespace');
   const indexWaste   = ()  => req('GET',  '/admin/storage/index-waste');
   const wal          = ()  => req('GET',  '/admin/storage/wal');
+  const vectorIndexWal = ()  => req('GET',  '/admin/storage/vector-index-wal');
   const lsm          = ()  => req('GET',  '/admin/storage/lsm');
   const valueLog     = ()  => req('GET',  '/admin/storage/value-log');
   const namespaces   = ()  => req('GET',  '/admin/storage/namespaces');
@@ -285,7 +286,7 @@ const Api = (() => {
     // kv semantic
     kvSemanticSearch,
     // admin storage
-    health, stats, opsMetrics, opsMetricsByNamespace, indexWaste, wal, lsm, valueLog, namespaces, physicalNamespaces,
+    health, stats, opsMetrics, opsMetricsByNamespace, indexWaste, wal, vectorIndexWal, lsm, valueLog, namespaces, physicalNamespaces,
     systemStores, systemStoreMeta, storeKvMeta,
     triggerGc, triggerWalGc, compact, indexCheckpoint,
     // admin indices — cache / reconcile

@@ -2390,7 +2390,7 @@ async function loadAdminOpsPanel() {
           <span class="section-title">ENGINE-WIDE</span>
         </div>
         <div class="text-muted" style="font-size:12px;margin-bottom:8px">
-          Sum of every namespace plus engine-global WAL-GC and retired-namespace totals.
+          Sum of every namespace plus engine-global WAL-GC, vector index WAL and retired-namespace totals.
         </div>
         <div id="admin-ops-metrics"><div class="spinner"></div></div>
       </div>
@@ -2400,8 +2400,8 @@ async function loadAdminOpsPanel() {
           <span class="section-title">PER-NAMESPACE${state.selectedStore ? `: ${esc(state.selectedStore.namespace.toUpperCase())}` : ''}</span>
         </div>
         <div class="text-muted" style="font-size:12px;margin-bottom:8px">
-          Counters for the store selected in the sidebar. WAL-GC is engine-global (not attributable to a
-          namespace) and is shown in the engine-wide panel beside this one.
+          Counters for the store selected in the sidebar. WAL-GC and the vector index WAL are engine-global
+          (not attributable to a namespace) and are shown in the engine-wide panel beside this one.
         </div>
         <div id="admin-ops-metrics-ns"><div class="spinner"></div></div>
       </div>
@@ -2500,8 +2500,8 @@ function renderOpsMetricsHtml(m, opts = {}) {
         <div class="admin-card-title" title="Write path throughput and durability cost. In-memory, reset on restart.">WRITES</div>
         ${row('Puts', fmt(w.puts), '', 'WAL-backed upserts applied.')}
         ${row('Deletes', fmt(w.deletes), '', 'WAL-backed deletes applied.')}
-        ${row('No-WAL Puts', fmt(w.no_wal_puts), '', 'Upserts written bypassing the WAL (skip_wal path — e.g. vector payloads, query-embedding cache).')}
-        ${row('No-WAL Deletes', fmt(w.no_wal_deletes), '', 'Deletes written bypassing the WAL (skip_wal path — e.g. query-embedding cache populate/clear).')}
+        ${row('No-WAL Puts', fmt(w.no_wal_puts), '', 'Upserts written bypassing every log (skip_wal — the query-embedding cache). Vector payloads and partition-maintenance copies are not counted here: they go to the vector index WAL.')}
+        ${row('No-WAL Deletes', fmt(w.no_wal_deletes), '', 'Deletes written bypassing the WAL (delete_no_wal callers).')}
         ${row('WAL Appended', fmtBytes(w.wal_bytes_appended), '', 'Total bytes appended to the WAL.')}
         ${row('WAL Fsyncs', fmt(w.wal_fsyncs), '', 'WAL fsyncs — one per WAL-backed write. The durability cost of writes.')}
         ${row('Apply Failures', fmt(w.apply_failures), apFailCls, 'In-memory applies that failed after retry. Data is still durable in the WAL.')}
@@ -2530,6 +2530,8 @@ function renderOpsMetricsHtml(m, opts = {}) {
         ${row('WAL Segments Deleted', fmt(g.wal_segments_deleted), '', 'WAL segments reclaimed by GC.')}`}
       </div>
 
+      ${renderVectorIndexWalMetricsCard(m.vector_index_wal, row, perNs)}
+
       ${perNs ? '' : renderIndexWriteBufferCard(m.index_overlay, row)}
 
       ${perNs ? '' : `<div class="admin-card">
@@ -2538,6 +2540,33 @@ function renderOpsMetricsHtml(m, opts = {}) {
       </div>`}
     </div>
   `;
+}
+
+// Vector index WAL counters (`vector_index_wal`). The vector worker logs its
+// chunk and whole-document codes there and makes each batch durable with one
+// fsync, so Appends per Fsync is the batch size. The counters are engine-global:
+// a per-namespace body reports zeros, so that column shows a pointer instead.
+// Absent on a server without the log — the card is then hidden.
+function renderVectorIndexWalMetricsCard(v, row, perNs) {
+  if (!v) return '';
+  const title = `<div class="admin-card-title" title="The log the vector worker writes its codes to; one fsync per batch makes them durable. In-memory, reset on restart.">VECTOR INDEX WAL</div>`;
+  if (perNs) {
+    return `<div class="admin-card">${title}
+      <div class="stat-row text-muted" style="font-size:12px"><span>The vector index WAL is engine-global — see the engine-wide panel.</span></div>
+    </div>`;
+  }
+  const apf = v.appends_per_fsync == null ? '—' : v.appends_per_fsync.toFixed(1);
+  return `<div class="admin-card">${title}
+    ${row('Appends', fmt(v.appends), '', 'Records appended to the vector index WAL.')}
+    ${row('Bytes Appended', fmtBytes(v.bytes_appended), '', 'Bytes appended to it, frames included.')}
+    ${row('Fsyncs', fmt(v.fsyncs), '', 'Its fsyncs: one per batch of vector writes made durable.')}
+    ${row('Appends per Fsync', apf, '', 'Appends / Fsyncs: records made durable per fsync. Blank before the first fsync.')}
+    ${row('GC Runs', fmt(v.gc_runs), '', 'Its GC passes: WAL GC ticks that found a segment wholly below the retired cut to delete.')}
+    ${row('Segments Deleted', fmt(v.segments_deleted), '', 'Its segments deleted by GC.')}
+    ${row('Pin Flushes', fmt(v.pin_flushes), '', 'Flushes of an idle namespace that held the retired cut back.')}
+    ${row('Records Replayed', fmt(v.records_replayed), '', 'Records replayed into memtables when the server started.')}
+    ${row('Records Skipped', fmt(v.records_skipped), '', 'Records skipped when the server started because their namespace had been dropped.')}
+  </div>`;
 }
 
 // Field-index write buffers (engine-wide `index_overlay`). Every field index
@@ -2597,15 +2626,28 @@ function writeAmpClass(x) {
   return x >= 1 ? 'bad' : x >= 0.5 ? 'warn' : 'good';
 }
 
-// The WAL is a sequence of segment files. Expandable, like value-log shards: each
-// row is one segment file and its entry backlog. Pending entries are what a restart
-// would replay, so a segment carrying pending entries is one the LSM has not caught
-// up with yet; fully-persisted segments below the live window are what WAL GC unlinks.
-function renderWalSegments(segments) {
+// A log's segment files as an expandable list, like value-log shards: `rowFn`
+// renders one segment's row, `id` names the collapsible panel.
+function renderSegmentList(id, title, segments, rowFn) {
   segments = segments ?? [];
   if (!segments.length) return '';
+  return `
+    <div style="margin-top:8px">
+      <div class="vlog-shard-head" onclick="toggleVlogShard('${id}', this)" title="${esc(title)}">
+        <span class="vlog-caret">▸</span>
+        <span class="stat-key">Segments</span>
+        <span class="stat-val">${fmt(segments.length)} file${segments.length === 1 ? '' : 's'}</span>
+      </div>
+      <div class="vlog-seg-list" id="${id}" style="display:none">${segments.map(rowFn).join('')}</div>
+    </div>`;
+}
 
-  const rows = segments.map(s => {
+// The WAL is a sequence of segment files; each row is one file and its entry
+// backlog. Pending entries are what a restart would replay, so a segment carrying
+// pending entries is one the LSM has not caught up with yet; fully-persisted
+// segments below the live window are what WAL GC unlinks.
+function renderWalSegments(segments) {
+  return renderSegmentList('wal-segs', 'Every WAL segment file currently tracked.', segments, s => {
     const pc = s.pending_entries > 0 ? 'warn' : 'good';
     return `
       <div class="vlog-seg" title="${fmt(s.total_entries)} entries — ${fmt(s.persisted_entries)} persisted to the LSM, ${fmt(s.pending_entries)} would be replayed on the next open">
@@ -2614,27 +2656,65 @@ function renderWalSegments(segments) {
         <span class="stat-val good">${fmt(s.persisted_entries)} persisted</span>
         <span class="stat-val ${pc}">${fmt(s.pending_entries)} pending</span>
       </div>`;
-  }).join('');
+  });
+}
 
+// A vector index WAL position, `{segment_id, byte}`.
+function fmtVwalPos(p) {
+  return p ? `seg ${fmt(p.segment_id)} @ ${fmt(p.byte)}` : '—';
+}
+
+// The vector index WAL (`GET /admin/storage/vector-index-wal`): one log per
+// database where the vector worker writes its codes. A record is retired once
+// the memtable holding its write is flushed; restart replays only records at or
+// above the retired cut, and GC deletes segments wholly below it. Namespaces
+// holding the cut have records no flush has covered yet; the WAL GC tick
+// flushes them. Null (older server) hides the card.
+function renderVectorIndexWalCard(v) {
+  if (!v) return '';
+  const cutSeg = v.retired_cut?.segment_id ?? 0;
+  const holding = v.holding_cut ?? [];
+  const holdingHtml = holding.length
+    ? holding.map(h => `<span title="Replay for this namespace starts at ${esc(fmtVwalPos(h.safe_offset))}">${esc(h.namespace)}</span>`).join(', ')
+    : '—';
+  const segs = renderSegmentList('vwal-segs', 'Every vector index WAL segment file, oldest first.', v.segments, s => {
+    const retired = s.segment_id < cutSeg;
+    return `
+      <div class="vlog-seg" title="${retired ? 'Wholly below the retired cut: GC will delete it.' : 'Holds records at or above the retired cut: a restart would replay them.'}">
+        <span class="vlog-seg-id">seg ${fmt(s.segment_id)}</span>
+        <span class="stat-val">${fmtBytes(s.bytes)}</span>
+        <span class="stat-val ${retired ? 'good' : ''}">${retired ? 'retired, GC will delete' : 'live'}</span>
+      </div>`;
+  });
   return `
-    <div style="margin-top:8px">
-      <div class="vlog-shard-head" onclick="toggleVlogShard('wal-segs', this)"
-           title="Every WAL segment file currently tracked.">
-        <span class="vlog-caret">▸</span>
-        <span class="stat-key">Segments</span>
-        <span class="stat-val">${fmt(segments.length)} file${segments.length === 1 ? '' : 's'}</span>
-      </div>
-      <div class="vlog-seg-list" id="wal-segs" style="display:none">${rows}</div>
-    </div>`;
+        <div class="admin-card">
+          <div class="admin-card-title" title="The log the vector worker writes its chunk and whole-document codes to; one fsync per batch makes them durable. One log per database. Read from on-disk state — survives restart.">VECTOR INDEX WAL</div>
+          <div class="stat-row"><span class="stat-key" title="Segment files of the vector index WAL.">Segment Files</span>
+            <span class="stat-val">${fmt(v.segment_count)}</span></div>
+          <div class="stat-row"><span class="stat-key" title="Total size of those segment files.">On-disk</span>
+            <span class="stat-val">${fmtBytes(v.disk_bytes)}</span></div>
+          <div class="stat-row"><span class="stat-key" title="Bytes at or above the retired cut (segment headers excluded): what a restart would replay.">Unretired</span>
+            <span class="stat-val">${fmtBytes(v.unretired_bytes)}</span></div>
+          <div class="stat-row"><span class="stat-key" title="Records below the retired cut are in SSTables; the tail is where the next record goes.">Retired Cut → Tail</span>
+            <span class="stat-val" style="font-size:11px">${fmtVwalPos(v.retired_cut)} → ${fmtVwalPos(v.tail)}</span></div>
+          <div class="stat-row"><span class="stat-key" title="Everything below it is fsynced.">Durable Tail</span>
+            <span class="stat-val" style="font-size:11px">${fmtVwalPos(v.durable_tail)}</span></div>
+          <div class="stat-row"><span class="stat-key" title="Highest write sequence of any record in the log.">Last Sequence</span>
+            <span class="stat-val">${fmt(v.last_sequence)}</span></div>
+          <div class="stat-row"><span class="stat-key" title="Namespaces with records no flush has covered yet, so the retired cut cannot pass them. The WAL GC tick flushes them. Hover a name for where its replay starts.">Holding Cut</span>
+            <span class="stat-val" style="font-size:12px">${holdingHtml}</span></div>
+          ${segs}
+        </div>`;
 }
 
 async function loadStorageStats() {
   const area = document.getElementById('admin-storage-stats');
   if (!area) return;
   try {
-    const [h, s, w, sys, lsmArr, vlogArr] = await Promise.all([
+    const [h, s, w, sys, lsmArr, vlogArr, vwal] = await Promise.all([
       Api.health(), Api.stats(), Api.wal(), Api.systemStores(), Api.lsm(),
       Api.valueLog().catch(() => null),
+      Api.vectorIndexWal().catch(() => null),
     ]);
     state.adminStats = s; state.adminWal = w;
     state.adminLsm  = Object.fromEntries((lsmArr  ?? []).map(x => [x.namespace, x]));
@@ -2708,6 +2788,7 @@ async function loadStorageStats() {
             <span class="stat-val" style="font-size:11px">${fmt(w.head)} → ${fmt(w.tail)}</span></div>
           ${renderWalSegments(w.segments)}
         </div>
+        ${renderVectorIndexWalCard(vwal)}
       </div>
 
       <div class="section">
