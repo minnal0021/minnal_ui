@@ -2689,6 +2689,11 @@ function renderVectorIndexWalCard(v) {
   return `
         <div class="admin-card">
           <div class="admin-card-title" title="The log the vector worker writes its chunk and whole-document codes to; one fsync per batch makes them durable. One log per database. Read from on-disk state — survives restart.">VECTOR INDEX WAL</div>
+          ${'stopped' in v ? `
+          <div class="stat-row"><span class="stat-key" title="${esc(v.stopped
+            ? `An fsync of the log failed: ${v.stopped}. The log refuses appends and syncs until the server restarts, so vector indexing has stopped (documents stay queued).`
+            : 'The log accepts writes. It stops after a failed fsync, until the server restarts.')}">Status</span>
+            <span class="stat-val ${v.stopped ? 'bad' : 'good'}">${v.stopped ? 'stopped — restart needed' : 'ok'}</span></div>` : ''}
           <div class="stat-row"><span class="stat-key" title="Segment files of the vector index WAL.">Segment Files</span>
             <span class="stat-val">${fmt(v.segment_count)}</span></div>
           <div class="stat-row"><span class="stat-key" title="Total size of those segment files.">On-disk</span>
@@ -2699,9 +2704,9 @@ function renderVectorIndexWalCard(v) {
             <span class="stat-val" style="font-size:11px">${fmtVwalPos(v.retired_cut)} → ${fmtVwalPos(v.tail)}</span></div>
           <div class="stat-row"><span class="stat-key" title="Everything below it is fsynced.">Durable Tail</span>
             <span class="stat-val" style="font-size:11px">${fmtVwalPos(v.durable_tail)}</span></div>
-          <div class="stat-row"><span class="stat-key" title="Highest write sequence of any record in the log.">Last Sequence</span>
+          <div class="stat-row"><span class="stat-key" title="Highest write sequence of a record appended since the server started, or found then at or above the retired cut.">Last Sequence</span>
             <span class="stat-val">${fmt(v.last_sequence)}</span></div>
-          <div class="stat-row"><span class="stat-key" title="Namespaces with records no flush has covered yet, so the retired cut cannot pass them. The WAL GC tick flushes them. Hover a name for where its replay starts.">Holding Cut</span>
+          <div class="stat-row"><span class="stat-key" title="Namespaces with records no flush has covered yet, so the retired cut cannot pass them. The WAL GC tick flushes them (sealing even an empty memtable), which releases them. Hover a name for where its replay starts.">Holding Cut</span>
             <span class="stat-val" style="font-size:12px">${holdingHtml}</span></div>
           ${segs}
         </div>`;
