@@ -27,10 +27,19 @@ The interface is organised into four tabs, each mapping onto a part of the minna
 
 | Tab | Purpose |
 |---|---|
-| **Schema** | Create, view, amend, and delete document stores and KV stores; manage field indices and embedding fields. |
+| **Schema** | Create, view, amend, and delete document stores and KV stores; manage field indices and embedding fields; view a semantic-search store's vector-index settings and change its search and maintenance settings (see [Vector-index settings](#vector-index-settings)). |
 | **Documents** | Browse, get, put, and delete documents; range scans and prefix scans with pagination. |
 | **Query** | Run predicate queries against field indices, plus semantic search and filtered semantic search. |
-| **Admin** | Server health and uptime, storage stats, ops metrics (including the field-index write buffer), WAL/LSM/value-log inspection, GC and compaction triggers, field-index health, blob and row-map stats, and vector index queue management. |
+| **Admin** | Five sub-tabs. **Storage**: server health, storage stats, WAL/LSM/value-log inspection, schema import. **Ops Metrics**: engine-wide and per-store counters, including the field-index write buffer. **Field Indexes**: builds, health and repair, waste, blob and row-map stats, reindex and drop. **Vector Indexes**: every vector store, and one store in detail, including whether a partition rebuild would help (see [Vector Indexes](#vector-indexes)). **System Maintenance**: the server-wide actions — value-log GC, WAL GC, LSM compaction, index checkpoint and clearing the query-embedding cache — each with what it does; they cover every namespace, whatever the sidebar selects. |
+
+**The sidebar picks the store everywhere.** The store selected in the sidebar is
+the one every per-store section shows, including in Admin; nothing in Admin has a
+store picker of its own. With no store selected (clear it with the × on the
+selected entry), Admin shows its all-stores views. With one selected, Field Indexes
+and Vector Indexes show only that store, or say it has no index of that kind. Under **System** (collapsed
+by default) the sidebar also lists the engine's own namespaces: the embedding
+queue, the query-embedding cache and the partition history. A system namespace
+opens in Admin only; Schema, Documents and Query do not apply to it.
 
 ---
 
@@ -137,6 +146,76 @@ For Docker, `build.sh` additionally honours `IMAGE_NAME` and `CONTAINER_NAME`.
 
 ---
 
+## Vector-index settings
+
+A store with semantic search has a `vector_index` block in its schema. It holds
+four groups of settings, all shown under **Schema → Vector Index Settings**:
+
+| Group | Settings | Can change? |
+|---|---|---|
+| Embedding and chunking | `embedding_model`, `embedding_dim`, `chunking.window_size`, `chunking.sliding_size` | Set when semantic search is enabled, then fixed |
+| Quantisation | `pass1_bits`, `pass2_bits`, `pass2_centre`, `rotation_seed` | Read-only; `rotation_seed` can be given at enable time |
+| Search defaults | `probe_budget_entries`, `min_probes`, `max_probes`, `first_pass_top_k`, `top_k`, `probe_budget_fraction`, `probe_budget_floor` | Any time; each search can also override them |
+| Partition maintenance | `target_posting_size`, `reassign_range`, `merge_ratio`, `skip_uncertain_moves`, `split_*` | Any time; later splits and merges use them |
+
+**Edit Search & Maintenance** changes the last two groups (it sends only the
+values you changed). When you create a store with semantic search, or add a
+vector index to an existing store, the form also takes the settings: pick the
+model (from the server's allowed models), and leave any other field empty to use
+the server's default. The server saves the filled-in values, so the schema always
+shows what is in force. The model, dimension and chunking cannot be changed
+later; to change them, drop the vector index and add it again.
+
+**Export Schema** downloads the store's full schema, `vector_index` included, and
+importing that file recreates the store with the same settings.
+
+## Vector Indexes
+
+Under **Admin → Vector Indexes**. With no store selected in the sidebar,
+the tab lists every vector store (indexing progress, queue backlog, corrupt
+entries skipped, and the rebuild verdict in a word — hover it for the reason)
+with the queue totals, the reconcile that re-enqueues documents
+missing a vector, and the browser for retried queue entries. **Open →** on a row
+(or selecting the store in the sidebar) shows that store; *All vector stores*
+goes back.
+
+A store with semantic search keeps its vectors in **postings** (clusters) that
+split and merge as data arrives. The store view answers one question above all:
+**would rebuilding its partition help, and did the last one?**
+
+- **Overview** — the rebuild verdict in one line, the store's embedding queue,
+  indexing progress and corruption counters, its actions (reindex one document or
+  all, retry exhausted entries, drop the vector index) and its queue entries.
+- **Rebuild decision** — a plain-language verdict and the evidence behind it,
+  plus the two actions:
+  - *Recall check*: searches sampled real queries (from the query-embedding
+    cache, so no embedding calls) twice, with the store's probe budget and
+    reading every posting, and reports how much of the full read the normal
+    search found (overlap@10 … @100).
+  - *Rebuild*: re-fits the postings on everything stored. The verdict tells you
+    to check again with the same seed afterwards, and compares the two.
+  A store whose searches already read every entry needs no rebuild; the verdict
+  says so without a check.
+- **Partition** — postings, entries, chunks, size percentiles against the split
+  and merge limits (with a histogram), maintenance counters, corruption counters
+  and the last rebuild.
+- **Code metrics** — centre drift, foreign and zero-centre share, error band and
+  the re-encode candidates, with what each means. Drift measures code precision
+  and calls for re-embedding (vector reindex-all), never for a rebuild; a rebuild
+  raises it.
+- **Postings** — every posting, sortable, with its code metrics on request.
+- **History** — recall checks and rebuilds as a timeline, with the change in
+  overlap@10 between comparable checks (same seed, query source and budget).
+- **Settings** — the store's `vector_index` settings beside the server's
+  defaults (differences highlighted), and the server-wide `[semantic_search]`
+  values.
+
+Every label has a tooltip. The store view needs a minnal server built from its
+`dynamic-rabitq-index` branch (the partition, recall-check, rebuild, history and
+settings endpoints).
+
+---
+
 ## Project layout
 
 ```
@@ -145,7 +224,9 @@ minnal_ui/
 ├── css/style.css   # Styles
 ├── js/
 │   ├── api.js      # Thin async wrapper over the minnal REST API
-│   └── app.js      # UI logic, rendering, event handling
+│   ├── app.js      # UI logic, rendering, event handling
+│   ├── vector_ops.js # Admin → Vector Indexes
+│   └── vector_settings.js # A store's vector-index settings: Schema tab, create/enable forms, edit
 ├── img/logo.svg    # மின்னல் logo
 ├── server.py       # Static file server + /stores,/kv-stores,/admin proxy
 ├── start.sh        # Run server.py with sensible env defaults

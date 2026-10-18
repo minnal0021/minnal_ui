@@ -25,13 +25,10 @@ const state = {
   adminWal:       null,
   adminLsm:       null,
   adminVlog:      null,
-  adminTab:       'storage', // 'storage' | 'ops' | 'index'
+  adminTab:       'storage', // 'storage' | 'ops' | 'field' | 'vector'
   adminSys:       null, // /admin/system-stores payload cached during loadStorageStats
   adminRowCounts: {}, // { [namespace]: number }
-  storageStoresTab:  'doc', // 'doc' | 'kv' | 'system' — active tab in the namespaces section
-  storageSelectedNs: { doc: null, kv: null, system: null }, // selected namespace per tab
   opsByNamespace: [],   // NamespaceOpsMetrics[] cached from the by-namespace endpoint
-  opsSelectedNs:  null, // namespace selected in the per-namespace ops panel
 
   // Progress polling: { 'ns::field': intervalId }
   progressPolls: {},
@@ -221,78 +218,139 @@ async function loadStores() {
   const isKv = s => s.store_type === 'kv' || (s.store_type == null && s.value_type != null);
   state.stores   = all.filter(s => !isKv(s));
   state.kvStores = all.filter(isKv);
+  // System namespaces are listed in their own sidebar section. A server that
+  // does not serve the endpoint just shows none.
+  state.adminSys = await Api.systemStores().catch(() => state.adminSys);
 
   renderSidebar();
 
   if (state.selectedStore) {
-    const ns   = state.selectedStore.namespace;
-    const list = isKvStore() ? state.kvStores : state.stores;
-    const fresh = list.find(s => s.namespace === ns);
-    state.selectedStore = fresh ?? null;
+    const fresh = findStore(state.selectedStore.namespace, state.selectedStoreType);
+    state.selectedStore = fresh;
     if (!fresh) state.selectedStoreType = null;
+    updateTabLabels();
     renderActiveTab();
   }
+}
+
+/** System namespaces as sidebar entries: `namespace` set on both kinds. */
+function systemStores() {
+  const sys = state.adminSys ?? {};
+  return [
+    ...(sys.kv_stores  ?? []).map(k => ({ ...k, namespace: k.name, sysKind: 'kv' })),
+    ...(sys.doc_stores ?? []).map(d => ({ ...d, sysKind: 'doc' })),
+  ].sort((a, b) => a.namespace.localeCompare(b.namespace));
+}
+
+/** The store `ns` of kind `type` ('doc' | 'kv' | 'system'), or null. */
+function findStore(ns, type) {
+  const list = type === 'kv' ? state.kvStores
+             : type === 'system' ? systemStores()
+             : state.stores;
+  return list.find(s => s.namespace === ns) ?? null;
+}
+
+function isSystemStore() {
+  return state.selectedStoreType === 'system';
 }
 
 function renderSidebar() {
   const el = document.getElementById('store-list');
   const hasDoc = state.stores.length > 0;
   const hasKv  = state.kvStores.length > 0;
-
-  if (!hasDoc && !hasKv) {
-    el.innerHTML = '<div class="empty-sidebar">No stores yet</div>';
-    return;
-  }
+  const sys    = systemStores();
 
   const selNs   = state.selectedStore?.namespace;
   const selType = state.selectedStoreType;
   const hasBoth = hasDoc && hasKv;
 
-  const docItems = state.stores.map(s => `
-    <div class="store-item ${selType === 'doc' && selNs === s.namespace ? 'active' : ''}"
-         onclick="selectStore('${esc(s.namespace)}', 'doc')">
+  // The selected entry carries a clear button: with nothing selected, Admin
+  // shows only its all-stores views.
+  const item = (s, type, badges) => {
+    const active = selType === type && selNs === s.namespace;
+    return `
+    <div class="store-item ${active ? 'active' : ''} ${type === 'system' ? 'store-item-sys' : ''}"
+         onclick="selectStore('${esc(s.namespace)}', '${type}')">
       <span class="store-name">${esc(s.namespace)}</span>
-      ${keyTypeBadge(s.key_type)}
-    </div>
-  `).join('');
+      <span class="store-badges">${badges}${active
+        ? `<button class="store-clear" title="Clear the selection" onclick="event.stopPropagation(); clearStoreSelection()">×</button>`
+        : ''}</span>
+    </div>`;
+  };
 
-  const kvItems = state.kvStores.map(s => `
-    <div class="store-item ${selType === 'kv' && selNs === s.namespace ? 'active' : ''}"
-         onclick="selectStore('${esc(s.namespace)}', 'kv')">
-      <span class="store-name">${esc(s.namespace)}</span>
-      <span class="badge badge-kv">KV</span>
-      ${kvValueTypeBadge(s.value_type)}
-    </div>
-  `).join('');
+  const docItems = state.stores.map(s => item(s, 'doc', keyTypeBadge(s.key_type))).join('');
+  const kvItems  = state.kvStores.map(s => item(s, 'kv',
+    `<span class="badge badge-kv">KV</span>${kvValueTypeBadge(s.value_type)}`)).join('');
 
-  if (hasBoth) {
-    el.innerHTML =
-      `<div class="store-section-title">Doc</div>${docItems}` +
-      `<div class="store-section-title">KV</div>${kvItems}`;
-  } else {
-    el.innerHTML = docItems + kvItems;
+  let html = '';
+  if (!hasDoc && !hasKv) html = '<div class="empty-sidebar">No stores yet</div>';
+  else if (hasBoth) html =
+    `<div class="store-section-title">Doc</div>${docItems}` +
+    `<div class="store-section-title">KV</div>${kvItems}`;
+  else html = docItems + kvItems;
+
+  if (sys.length) {
+    // Collapsed by default: most sessions never need the engine's own namespaces.
+    // A selected system namespace keeps the section open.
+    const open = sidebarSystemOpen() || selType === 'system';
+    html += `
+      <div class="store-section-title store-section-sys" onclick="toggleSidebarSystem()"
+           title="The engine's own namespaces (embedding queue, query cache, partition history). Read-only here: they open in Admin.">
+        <span>${open ? '▾' : '▸'} System (${sys.length})</span><span>🔒</span>
+      </div>
+      ${open ? sys.map(s => item(s, 'system', '')).join('') : ''}`;
   }
+  el.innerHTML = html;
+}
+
+function sidebarSystemOpen() {
+  try { return localStorage.getItem('minnal_sidebar_system_open') === '1'; } catch { return false; }
+}
+
+function toggleSidebarSystem() {
+  try { localStorage.setItem('minnal_sidebar_system_open', sidebarSystemOpen() ? '0' : '1'); } catch { /* per-browser nicety only */ }
+  renderSidebar();
 }
 
 function selectStore(ns, type = 'doc') {
   state.selectedStoreType = type;
-  const list = type === 'kv' ? state.kvStores : state.stores;
-  state.selectedStore = list.find(s => s.namespace === ns) ?? null;
+  state.selectedStore = findStore(ns, type);
   updateTabLabels();
   renderSidebar();
-  if (state.activeTab === 'admin') return;
+  // System namespaces have no schema, documents or queries of their own: they
+  // open in Admin.
+  if (type === 'system' && state.activeTab !== 'admin') { switchTab('admin'); return; }
+  // Admin follows the sidebar: every per-store section shows this store.
+  if (state.activeTab === 'admin') { renderAdminTab(); return; }
   if (state.activeTab === 'schema') renderSchemaTab();
   else switchTab(state.activeTab);
 }
+
+function clearStoreSelection() {
+  state.selectedStore = null;
+  state.selectedStoreType = null;
+  updateTabLabels();
+  renderSidebar();
+  renderActiveTab();
+}
+
+const SYSTEM_TAB_REASON = 'System namespaces are internal: they have no schema, documents or queries here. See them in Admin.';
 
 function updateTabLabels() {
   const kv = isKvStore();
   const docsBtn = document.querySelector('.tab-btn[data-tab="documents"]');
   if (docsBtn) docsBtn.textContent = kv ? 'KV' : 'Documents';
+  const sys = isSystemStore();
+  document.querySelectorAll('.tab-btn').forEach(b => {
+    const off = sys && b.dataset.tab !== 'admin';
+    b.disabled = off;
+    b.title = off ? SYSTEM_TAB_REASON : '';
+  });
 }
 
 // ── Tab switching ─────────────────────────────────────────────────────────────
 function switchTab(name) {
+  if (isSystemStore() && name !== 'admin') return;
   state.activeTab = name;
   document.querySelectorAll('.tab-btn').forEach(b => {
     b.classList.toggle('active', b.dataset.tab === name);
@@ -415,7 +473,8 @@ function renderSchemaTab() {
           <tbody>${attrRows}</tbody>
         </table>
       </div>
-    </div>`;
+    </div>
+    ${renderVectorSettingsSection(s)}`;
 }
 
 function renderKvSchemaTab(el, s) {
@@ -471,7 +530,8 @@ function renderKvSchemaTab(el, s) {
           </p>
         </div>
       </div>
-    </div>`;
+    </div>
+    ${renderVectorSettingsSection(s)}`;
 }
 
 // ── Index progress polling ─────────────────────────────────────────────────────
@@ -613,9 +673,10 @@ function showCreateStoreModal() {
         </div>
         <div id="cs-kv-semantic-row" class="form-group">
           <label class="radio-group" style="gap:8px">
-            <input type="checkbox" id="cs-kv-semantic" />
+            <input type="checkbox" id="cs-kv-semantic" onchange="syncVectorSpecForms()" />
             Enable semantic search <span class="text-muted">(str value type only)</span>
           </label>
+          <div id="cs-kv-vset-wrap" style="display:none;margin-top:10px">${renderVectorSpecForm('cs-kv')}</div>
         </div>
       </div>
     </div>
@@ -646,6 +707,7 @@ function showCreateStoreModal() {
           Enable semantic search — check one or more <strong>Embed</strong> fields above (str type only)
         </label>
       </div>
+      <div id="cs-doc-vset-wrap" style="display:none;margin-top:10px">${renderVectorSpecForm('cs-doc')}</div>
     </div>
 
     <div class="modal-actions">
@@ -654,6 +716,18 @@ function showCreateStoreModal() {
     </div>
   `);
   addCreateStoreField();
+  fillVectorSpecForm('cs-doc');
+  fillVectorSpecForm('cs-kv');
+}
+
+/** Show the vector-index settings only while semantic search is ticked. */
+function syncVectorSpecForms() {
+  const show = (wrap, cb) => {
+    const w = document.getElementById(wrap);
+    if (w) w.style.display = document.getElementById(cb)?.checked ? '' : 'none';
+  };
+  show('cs-doc-vset-wrap', 'cs-semantic-enabled');
+  show('cs-kv-vset-wrap', 'cs-kv-semantic');
 }
 
 function onCreateStoreTypeChange() {
@@ -677,6 +751,7 @@ function onKvValueTypeChange() {
   if (vt !== 'str') {
     semRow.style.opacity = '0.4';
     if (semCb) { semCb.checked = false; semCb.disabled = true; }
+    syncVectorSpecForms();
   } else {
     semRow.style.opacity = '';
     if (semCb) semCb.disabled = false;
@@ -752,6 +827,7 @@ function onEmbedFieldToggle() {
 function syncSemanticEnabled() {
   const anyChecked = document.querySelectorAll('#cs-fields .field-semantic:checked').length > 0;
   document.getElementById('cs-semantic-enabled').checked = anyChecked;
+  syncVectorSpecForms();
 }
 
 function onSemanticEnabledChange() {
@@ -759,6 +835,7 @@ function onSemanticEnabledChange() {
   if (!document.getElementById('cs-semantic-enabled').checked) {
     document.querySelectorAll('#cs-fields .field-semantic').forEach(cb => { cb.checked = false; });
   }
+  syncVectorSpecForms();
 }
 
 async function submitCreateStore() {
@@ -778,8 +855,11 @@ async function submitCreateStore() {
       btn.disabled = false; btn.textContent = 'Create Store'; return;
     }
     const payload = { namespace: ns, store_type: 'kv', key_type: keyType, value_type: valueType };
-    if (semantic) payload.semantic_search_enabled = true;
     try {
+      if (semantic) {
+        payload.semantic_search_enabled = true;
+        payload.vector_index = collectVectorSpec('cs-kv');
+      }
       await Api.createStore(payload);
       closeModal();
       toast(`KV store '${ns}' created`);
@@ -830,12 +910,12 @@ async function submitCreateStore() {
   }
 
   const payload = { namespace: ns, store_type: 'doc', key_type: keyType, indices, attributes };
-  if (semanticEnabled) {
-    payload.semantic_search_enabled = true;
-    payload.embedding_fields = embeddingFields;
-  }
-
   try {
+    if (semanticEnabled) {
+      payload.semantic_search_enabled = true;
+      payload.embedding_fields = embeddingFields;
+      payload.vector_index = collectVectorSpec('cs-doc');
+    }
     await Api.createStore(payload);
     closeModal();
     toast(`Store '${ns}' created`);
@@ -970,12 +1050,17 @@ function showAddAttributeModal(ns) {
         <button class="btn btn-sm btn-ghost" onclick="addVectorIndexField()">+ Add Field</button>
       </div>
     </div>
+    <div class="modal-section">
+      <div class="modal-section-title">VECTOR INDEX SETTINGS</div>
+      ${renderVectorSpecForm('vec-add')}
+    </div>
     <div class="modal-actions">
       <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
       <button class="btn btn-accent" onclick="submitAddVectorIndex('${esc(ns)}')">Create Vector Index</button>
     </div>
   `);
   addVectorIndexField();
+  fillVectorSpecForm('vec-add');
 }
 
 function addVectorIndexField() {
@@ -1024,7 +1109,7 @@ async function submitAddVectorIndex(ns) {
   if (fields.length === 0) { toast('At least one field is required', 'error'); return; }
   if (new Set(fields).size !== fields.length) { toast('Duplicate field names', 'error'); return; }
   try {
-    await Api.amendSchema(ns, { op: 'enable_vector_index', fields });
+    await Api.amendSchema(ns, { op: 'enable_vector_index', fields, vector_index: collectVectorSpec('vec-add') });
     closeModal();
     toast(`Vector index created over ${fields.length} field${fields.length !== 1 ? 's' : ''}`);
     await loadStores(); renderSchemaTab();
@@ -1983,7 +2068,7 @@ function renderDegradedBanner(data) {
       ${fields.length === 1 ? 'The index for' : 'The indices for'} ${list}
       ${fields.length === 1 ? 'is' : 'are'} either still being built or known to be missing
       updates, so matching documents may be absent from this answer.
-      A build fills in by itself (see <strong>Admin → Index Management → Active Index Builds</strong>);
+      A build fills in by itself (see <strong>Admin → Field Indexes → Active Index Builds</strong>);
       a gap is repaired from <strong>Field Index Health</strong> on the same page. Then re-run the query.
     </div>`;
 }
@@ -2145,30 +2230,40 @@ function showSemanticResultPayload(idx) {
 }
 
 // ── Admin tab ─────────────────────────────────────────────────────────────────
+// One sub-tab per concern. Index work is split by index kind: Field Indexes and
+// Vector Indexes each hold the all-stores view and the selected store's detail.
+const ADMIN_TABS = [
+  ['storage', 'Storage',        null],
+  ['ops',     'Ops Metrics',    null],
+  ['field',   'Field Indexes',  'Field-index builds, health, waste and per-store operations'],
+  ['vector',  'Vector Indexes', 'All vector stores, and the selected store in detail: queue, rebuild decision, partition, code metrics, postings, history and settings'],
+  ['maintenance', 'System Maintenance', 'Server-wide maintenance actions: GC, WAL GC, LSM compaction, index checkpoint, query-cache clear'],
+];
+
+function loadAdminSubTab(tab) {
+  if (tab === 'storage')     return loadAdminStoragePanel();
+  if (tab === 'ops')         return loadAdminOpsPanel();
+  if (tab === 'field')       return loadAdminFieldPanel();
+  if (tab === 'maintenance') return loadAdminMaintenancePanel();
+  return renderVectorIndexesTab();
+}
+
 async function renderAdminTab() {
+  if (!ADMIN_TABS.some(([id]) => id === state.adminTab)) state.adminTab = 'storage';
   const el = document.getElementById('tab-admin');
   el.innerHTML = `
     <div class="sub-tab-nav admin-inner-nav">
-      <button class="sub-tab-btn ${state.adminTab === 'storage' ? 'active' : ''}"
-              data-admin-tab="storage" onclick="switchAdminTab('storage')">Storage</button>
-      <button class="sub-tab-btn ${state.adminTab === 'ops' ? 'active' : ''}"
-              data-admin-tab="ops" onclick="switchAdminTab('ops')">Ops Metrics</button>
-      <button class="sub-tab-btn ${state.adminTab === 'index' ? 'active' : ''}"
-              data-admin-tab="index" onclick="switchAdminTab('index')">Index Management</button>
+      ${ADMIN_TABS.map(([id, label, title]) => `
+        <button class="sub-tab-btn ${state.adminTab === id ? 'active' : ''}"
+                data-admin-tab="${id}" onclick="switchAdminTab('${id}')"
+                ${title ? `title="${esc(title)}"` : ''}>${label}</button>`).join('')}
     </div>
-    <div id="admin-storage-panel" class="sub-panel ${state.adminTab === 'storage' ? 'active' : ''}">
-      <div class="spinner"></div>
-    </div>
-    <div id="admin-ops-panel" class="sub-panel ${state.adminTab === 'ops' ? 'active' : ''}">
-      <div class="spinner"></div>
-    </div>
-    <div id="admin-index-panel" class="sub-panel ${state.adminTab === 'index' ? 'active' : ''}">
-      <div class="spinner"></div>
-    </div>
+    ${ADMIN_TABS.map(([id]) => `
+      <div id="admin-${id}-panel" class="sub-panel ${state.adminTab === id ? 'active' : ''}">
+        <div class="spinner"></div>
+      </div>`).join('')}
   `;
-  if (state.adminTab === 'storage')   await loadAdminStoragePanel();
-  else if (state.adminTab === 'ops')  await loadAdminOpsPanel();
-  else                                await loadAdminIndexPanel();
+  await loadAdminSubTab(state.adminTab);
 }
 
 function switchAdminTab(tab) {
@@ -2176,16 +2271,36 @@ function switchAdminTab(tab) {
   document.querySelectorAll('[data-admin-tab]').forEach(b => {
     b.classList.toggle('active', b.dataset.adminTab === tab);
   });
-  const storagePanel = document.getElementById('admin-storage-panel');
-  const opsPanel     = document.getElementById('admin-ops-panel');
-  const indexPanel   = document.getElementById('admin-index-panel');
-  if (storagePanel) storagePanel.classList.toggle('active', tab === 'storage');
-  if (opsPanel)     opsPanel.classList.toggle('active', tab === 'ops');
-  if (indexPanel)   indexPanel.classList.toggle('active', tab === 'index');
-  if (tab === 'storage')  loadAdminStoragePanel();
-  else if (tab === 'ops') loadAdminOpsPanel();
-  else                    loadAdminIndexPanel();
+  ADMIN_TABS.forEach(([id]) => {
+    document.getElementById(`admin-${id}-panel`)?.classList.toggle('active', id === tab);
+  });
+  loadAdminSubTab(tab);
 }
+
+/** A namespace table cell that selects the store in the sidebar. */
+function nsCell(ns, type = 'doc') {
+  return `<td class="text-mono ns-cell" title="Select ${esc(ns)} in the sidebar"
+              onclick="selectStore('${esc(ns)}', '${type}')">${esc(ns)}</td>`;
+}
+
+/**
+ * The panel to show when the sidebar's selection has nothing for an index tab,
+ * or null when it does (or nothing is selected). `has(store)` says whether a
+ * user store has that kind of index.
+ */
+function indexTabEmptyHtml(kind, has) {
+  const s = state.selectedStore;
+  if (!s) return null;
+  if (!isSystemStore() && has(s)) return null;
+  const why = isSystemStore()
+    ? `<strong>${esc(s.namespace)}</strong> is a system namespace: it has no ${kind}.`
+    : `<strong>${esc(s.namespace)}</strong> has no ${kind}.`;
+  return `<div class="welcome"><p class="welcome-icon">∅</p><p>${why}</p>
+    <p class="text-muted">Select another store in the sidebar, or clear the selection (×) to see every store.</p></div>`;
+}
+
+/** A user doc store with at least one field index. */
+const hasFieldIndexes = (s) => state.selectedStoreType === 'doc' && (s.indices?.length ?? 0) > 0;
 
 // ── Admin storage panel ───────────────────────────────────────────────────────
 async function loadAdminStoragePanel() {
@@ -2199,23 +2314,57 @@ async function loadAdminStoragePanel() {
       </div>
       <input type="file" id="admin-import-file" accept=".json,application/json" style="display:none"
              onchange="adminImportSchemaFile(this)">
+      <div id="admin-import-result"></div>
     </div>
-    <div class="section">
-      <div class="section-header"><span class="section-title">ACTIONS</span></div>
-      <div class="admin-actions">
-        <button class="btn btn-ghost" onclick="adminTriggerGc()">⚡ Trigger GC</button>
-        <button class="btn btn-ghost" onclick="adminTriggerWalGc()">⚡ Trigger WAL GC</button>
-        <button class="btn btn-ghost" onclick="adminCompact()">⚡ Compact LSM</button>
-        <button class="btn btn-ghost" onclick="adminIndexCheckpoint(this)"
-                title="Flush and compact field indices in the background — only one run at a time">⚡ Index Checkpoint</button>
-        <button class="btn btn-danger" onclick="adminClearQueryCache()">🗑 Clear Query Cache</button>
-        <button class="btn btn-secondary" style="margin-left:auto" onclick="adminRefresh()">↻ Refresh Stats</button>
-      </div>
-      <div id="admin-action-result"></div>
+    <div class="admin-actions">
+      <button class="btn btn-secondary" style="margin-left:auto" onclick="adminRefresh()">↻ Refresh Stats</button>
     </div>
     <div id="admin-storage-stats"><div class="spinner"></div></div>
   `;
   await loadStorageStats();
+}
+
+// ── Admin system-maintenance panel ──────────────────────────────────────────────
+// Actions that act on the whole server, every namespace at once. The background
+// workers run each of them on their own schedule; these run one now.
+const MAINTENANCE_ACTIONS = [
+  { label: '⚡ Trigger GC', fn: 'adminTriggerGc()', title: 'Value-log GC',
+    tip: 'POST /admin/storage/gc — reclaim value-log garbage in every namespace now. The GC worker does this every value_log_gc_interval_secs for namespaces over value_log_waste_threshold.',
+    text: 'Rewrites every value-log segment whose garbage is over segment_gc_threshold, in every namespace, without waiting for a namespace to reach its GC trigger. Waits for the result and reports what each namespace reclaimed.' },
+  { label: '⚡ Trigger WAL GC', fn: 'adminTriggerWalGc()', title: 'WAL GC',
+    tip: 'POST /admin/storage/gc/wal — delete WAL segments that are no longer needed for recovery. The WAL GC worker does this every wal_gc_interval_secs.',
+    text: 'Deletes write-ahead-log segments every namespace has persisted and every field index has checkpointed past.' },
+  { label: '⚡ Compact LSM', fn: 'adminCompact()', title: 'LSM compaction',
+    tip: 'POST /admin/storage/compact — merge pending LSM files in every namespace now. The compaction worker does this whenever a memtable fills, and every lsm_compaction_interval_secs.',
+    text: 'Flushes sealed memtables and merges level-0 files into level 1, in every namespace.' },
+  { label: '⚡ Index Checkpoint', fn: 'adminIndexCheckpoint(this)', title: 'Index checkpoint',
+    tip: 'POST /admin/storage/index-checkpoint — make every field index durable now and compact bitmap stores over index_blob_waste_threshold. The checkpoint worker does this every index_checkpoint_interval_ms.',
+    text: 'Writes every field index and row map to disk, and compacts any field-index bitmap store over the waste threshold. Runs in the background, one run at a time; progress is in the server log.' },
+  { label: '🗑 Clear Query Cache', fn: 'adminClearQueryCache()', title: 'Clear query-embedding cache', danger: true,
+    tip: 'DELETE /admin/indices/vector/query-cache — delete every cached query embedding, for all stores. Cannot be undone; entries otherwise expire after query_embedding_cache_ttl_secs.',
+    text: 'Removes every cached query embedding (shared by all semantic-search stores). Later searches re-embed their query once, so the first searches are slower, and recall checks have fewer cached queries to sample until they refill.' },
+];
+
+function loadAdminMaintenancePanel() {
+  const panel = document.getElementById('admin-maintenance-panel');
+  if (!panel) return;
+  panel.innerHTML = `
+    <div class="section">
+      <div class="section-header"><span class="section-title">SYSTEM MAINTENANCE</span></div>
+      <div class="text-muted" style="font-size:12px;margin-bottom:12px">
+        Each action covers the whole server, not the store selected in the sidebar. The
+        background workers already run them on a schedule; use these to run one now.
+      </div>
+      <div class="maint-list">
+        ${MAINTENANCE_ACTIONS.map(a => `
+          <div class="maint-row">
+            <div><div class="maint-title">${esc(a.title)}</div>
+              <div class="text-muted maint-text">${esc(a.text)}</div></div>
+            <button class="btn ${a.danger ? 'btn-danger' : 'btn-ghost'}" onclick="${a.fn}" title="${esc(a.tip)}">${a.label}</button>
+          </div>`).join('')}
+      </div>
+      <div id="admin-action-result"></div>
+    </div>`;
 }
 
 // ── Admin ops-metrics panel ─────────────────────────────────────────────────────
@@ -2241,20 +2390,18 @@ async function loadAdminOpsPanel() {
           <span class="section-title">ENGINE-WIDE</span>
         </div>
         <div class="text-muted" style="font-size:12px;margin-bottom:8px">
-          Sum of every namespace plus engine-global WAL-GC and retired-namespace totals.
+          Sum of every namespace plus engine-global WAL-GC, vector index WAL and retired-namespace totals.
         </div>
         <div id="admin-ops-metrics"><div class="spinner"></div></div>
       </div>
 
       <div class="ops-metrics-col">
         <div class="section-header" style="margin-top:4px">
-          <span class="section-title">PER-NAMESPACE</span>
-          <select id="ops-ns-select" style="max-width:320px"
-                  onchange="onOpsNsChange()"></select>
+          <span class="section-title">PER-NAMESPACE${state.selectedStore ? `: ${esc(state.selectedStore.namespace.toUpperCase())}` : ''}</span>
         </div>
         <div class="text-muted" style="font-size:12px;margin-bottom:8px">
-          Counters for the selected namespace. WAL-GC is engine-global (not attributable to a
-          namespace) and is shown in the engine-wide panel beside this one.
+          Counters for the store selected in the sidebar. WAL-GC and the vector index WAL are engine-global
+          (not attributable to a namespace) and are shown in the engine-wide panel beside this one.
         </div>
         <div id="admin-ops-metrics-ns"><div class="spinner"></div></div>
       </div>
@@ -2282,54 +2429,23 @@ async function loadOpsMetrics() {
 
   if (nsRes.status === 'fulfilled') {
     state.opsByNamespace = nsRes.value ?? [];
-    renderOpsNsSelect();
+    renderOpsNsMetrics();
   } else if (nsArea) {
     state.opsByNamespace = [];
     nsArea.innerHTML = `<div class="alert alert-error">Failed to load per-namespace ops metrics: ${esc(nsRes.reason?.message)}</div>`;
   }
 }
 
-// Populate the namespace dropdown from the cached by-namespace data, preserving
-// the current selection where possible, then render the selected namespace.
-// Only user-facing namespaces (the user's own doc/kv stores) are listed —
-// internal/engine namespaces are filtered out.
-function renderOpsNsSelect() {
-  const sel = document.getElementById('ops-ns-select');
-  if (!sel) return;
-  const userNs = new Set([...state.stores, ...state.kvStores].map(s => s.namespace));
-  const names = state.opsByNamespace
-    .map(e => e.namespace)
-    .filter(n => userNs.has(n))
-    .sort((a, b) => a.localeCompare(b));
-  if (!names.length) {
-    sel.innerHTML = '';
-    const nsArea = document.getElementById('admin-ops-metrics-ns');
-    if (nsArea) nsArea.innerHTML = '<div class="text-muted" style="font-size:13px">No namespaces yet.</div>';
-    return;
-  }
-  if (!names.includes(state.opsSelectedNs)) {
-    state.opsSelectedNs = names[0];
-  }
-  sel.innerHTML = names.map(n =>
-    `<option value="${esc(n)}" ${n === state.opsSelectedNs ? 'selected' : ''}>${esc(n)}</option>`
-  ).join('');
-  renderOpsNsMetrics();
-}
-
-function onOpsNsChange() {
-  const sel = document.getElementById('ops-ns-select');
-  if (!sel) return;
-  state.opsSelectedNs = sel.value;
-  renderOpsNsMetrics();
-}
-
 function renderOpsNsMetrics() {
   const nsArea = document.getElementById('admin-ops-metrics-ns');
   if (!nsArea) return;
-  const entry = state.opsByNamespace.find(e => e.namespace === state.opsSelectedNs);
+  const ns = state.selectedStore?.namespace;
+  const entry = ns != null ? state.opsByNamespace.find(e => e.namespace === ns) : null;
   nsArea.innerHTML = entry
     ? renderOpsMetricsHtml(entry, { perNamespace: true })
-    : '<div class="text-muted" style="font-size:13px">Select a namespace.</div>';
+    : `<div class="text-muted" style="font-size:13px">${ns != null
+        ? `No counters for ${esc(ns)} yet.`
+        : 'Select a store in the sidebar to see its counters.'}</div>`;
 }
 
 function renderOpsMetricsHtml(m, opts = {}) {
@@ -2384,8 +2500,8 @@ function renderOpsMetricsHtml(m, opts = {}) {
         <div class="admin-card-title" title="Write path throughput and durability cost. In-memory, reset on restart.">WRITES</div>
         ${row('Puts', fmt(w.puts), '', 'WAL-backed upserts applied.')}
         ${row('Deletes', fmt(w.deletes), '', 'WAL-backed deletes applied.')}
-        ${row('No-WAL Puts', fmt(w.no_wal_puts), '', 'Upserts written bypassing the WAL (skip_wal path — e.g. vector payloads, query-embedding cache).')}
-        ${row('No-WAL Deletes', fmt(w.no_wal_deletes), '', 'Deletes written bypassing the WAL (skip_wal path — e.g. query-embedding cache populate/clear).')}
+        ${row('No-WAL Puts', fmt(w.no_wal_puts), '', 'Upserts written bypassing every log (skip_wal — the query-embedding cache). Vector payloads and partition-maintenance copies are not counted here: they go to the vector index WAL.')}
+        ${row('No-WAL Deletes', fmt(w.no_wal_deletes), '', 'Deletes written bypassing the WAL (delete_no_wal callers).')}
         ${row('WAL Appended', fmtBytes(w.wal_bytes_appended), '', 'Total bytes appended to the WAL.')}
         ${row('WAL Fsyncs', fmt(w.wal_fsyncs), '', 'WAL fsyncs — one per WAL-backed write. The durability cost of writes.')}
         ${row('Apply Failures', fmt(w.apply_failures), apFailCls, 'In-memory applies that failed after retry. Data is still durable in the WAL.')}
@@ -2414,6 +2530,8 @@ function renderOpsMetricsHtml(m, opts = {}) {
         ${row('WAL Segments Deleted', fmt(g.wal_segments_deleted), '', 'WAL segments reclaimed by GC.')}`}
       </div>
 
+      ${renderVectorIndexWalMetricsCard(m.vector_index_wal, row, perNs)}
+
       ${perNs ? '' : renderIndexWriteBufferCard(m.index_overlay, row)}
 
       ${perNs ? '' : `<div class="admin-card">
@@ -2422,6 +2540,33 @@ function renderOpsMetricsHtml(m, opts = {}) {
       </div>`}
     </div>
   `;
+}
+
+// Vector index WAL counters (`vector_index_wal`). The vector worker logs its
+// chunk and whole-document codes there and makes each batch durable with one
+// fsync, so Appends per Fsync is the batch size. The counters are engine-global:
+// a per-namespace body reports zeros, so that column shows a pointer instead.
+// Absent on a server without the log — the card is then hidden.
+function renderVectorIndexWalMetricsCard(v, row, perNs) {
+  if (!v) return '';
+  const title = `<div class="admin-card-title" title="The log the vector worker writes its codes to; one fsync per batch makes them durable. In-memory, reset on restart.">VECTOR INDEX WAL</div>`;
+  if (perNs) {
+    return `<div class="admin-card">${title}
+      <div class="stat-row text-muted" style="font-size:12px"><span>The vector index WAL is engine-global — see the engine-wide panel.</span></div>
+    </div>`;
+  }
+  const apf = v.appends_per_fsync == null ? '—' : v.appends_per_fsync.toFixed(1);
+  return `<div class="admin-card">${title}
+    ${row('Appends', fmt(v.appends), '', 'Records appended to the vector index WAL.')}
+    ${row('Bytes Appended', fmtBytes(v.bytes_appended), '', 'Bytes appended to it, frames included.')}
+    ${row('Fsyncs', fmt(v.fsyncs), '', 'Its fsyncs: one per batch of vector writes made durable.')}
+    ${row('Appends per Fsync', apf, '', 'Appends / Fsyncs: records made durable per fsync. Blank before the first fsync.')}
+    ${row('GC Runs', fmt(v.gc_runs), '', 'Its GC passes: WAL GC ticks that found a segment wholly below the retired cut to delete.')}
+    ${row('Segments Deleted', fmt(v.segments_deleted), '', 'Its segments deleted by GC.')}
+    ${row('Pin Flushes', fmt(v.pin_flushes), '', 'Flushes of an idle namespace that held the retired cut back.')}
+    ${row('Records Replayed', fmt(v.records_replayed), '', 'Records replayed into memtables when the server started.')}
+    ${row('Records Skipped', fmt(v.records_skipped), '', 'Records skipped when the server started because their namespace had been dropped.')}
+  </div>`;
 }
 
 // Field-index write buffers (engine-wide `index_overlay`). Every field index
@@ -2481,15 +2626,28 @@ function writeAmpClass(x) {
   return x >= 1 ? 'bad' : x >= 0.5 ? 'warn' : 'good';
 }
 
-// The WAL is a sequence of segment files. Expandable, like value-log shards: each
-// row is one segment file and its entry backlog. Pending entries are what a restart
-// would replay, so a segment carrying pending entries is one the LSM has not caught
-// up with yet; fully-persisted segments below the live window are what WAL GC unlinks.
-function renderWalSegments(segments) {
+// A log's segment files as an expandable list, like value-log shards: `rowFn`
+// renders one segment's row, `id` names the collapsible panel.
+function renderSegmentList(id, title, segments, rowFn) {
   segments = segments ?? [];
   if (!segments.length) return '';
+  return `
+    <div style="margin-top:8px">
+      <div class="vlog-shard-head" onclick="toggleVlogShard('${id}', this)" title="${esc(title)}">
+        <span class="vlog-caret">▸</span>
+        <span class="stat-key">Segments</span>
+        <span class="stat-val">${fmt(segments.length)} file${segments.length === 1 ? '' : 's'}</span>
+      </div>
+      <div class="vlog-seg-list" id="${id}" style="display:none">${segments.map(rowFn).join('')}</div>
+    </div>`;
+}
 
-  const rows = segments.map(s => {
+// The WAL is a sequence of segment files; each row is one file and its entry
+// backlog. Pending entries are what a restart would replay, so a segment carrying
+// pending entries is one the LSM has not caught up with yet; fully-persisted
+// segments below the live window are what WAL GC unlinks.
+function renderWalSegments(segments) {
+  return renderSegmentList('wal-segs', 'Every WAL segment file currently tracked.', segments, s => {
     const pc = s.pending_entries > 0 ? 'warn' : 'good';
     return `
       <div class="vlog-seg" title="${fmt(s.total_entries)} entries — ${fmt(s.persisted_entries)} persisted to the LSM, ${fmt(s.pending_entries)} would be replayed on the next open">
@@ -2498,27 +2656,70 @@ function renderWalSegments(segments) {
         <span class="stat-val good">${fmt(s.persisted_entries)} persisted</span>
         <span class="stat-val ${pc}">${fmt(s.pending_entries)} pending</span>
       </div>`;
-  }).join('');
+  });
+}
 
+// A vector index WAL position, `{segment_id, byte}`.
+function fmtVwalPos(p) {
+  return p ? `seg ${fmt(p.segment_id)} @ ${fmt(p.byte)}` : '—';
+}
+
+// The vector index WAL (`GET /admin/storage/vector-index-wal`): one log per
+// database where the vector worker writes its codes. A record is retired once
+// the memtable holding its write is flushed; restart replays only records at or
+// above the retired cut, and GC deletes segments wholly below it. Namespaces
+// holding the cut have records no flush has covered yet; the WAL GC tick
+// flushes them. Null (older server) hides the card.
+function renderVectorIndexWalCard(v) {
+  if (!v) return '';
+  const cutSeg = v.retired_cut?.segment_id ?? 0;
+  const holding = v.holding_cut ?? [];
+  const holdingHtml = holding.length
+    ? holding.map(h => `<span title="Replay for this namespace starts at ${esc(fmtVwalPos(h.safe_offset))}">${esc(h.namespace)}</span>`).join(', ')
+    : '—';
+  const segs = renderSegmentList('vwal-segs', 'Every vector index WAL segment file, oldest first.', v.segments, s => {
+    const retired = s.segment_id < cutSeg;
+    return `
+      <div class="vlog-seg" title="${retired ? 'Wholly below the retired cut: GC will delete it.' : 'Holds records at or above the retired cut: a restart would replay them.'}">
+        <span class="vlog-seg-id">seg ${fmt(s.segment_id)}</span>
+        <span class="stat-val">${fmtBytes(s.bytes)}</span>
+        <span class="stat-val ${retired ? 'good' : ''}">${retired ? 'retired, GC will delete' : 'live'}</span>
+      </div>`;
+  });
   return `
-    <div style="margin-top:8px">
-      <div class="vlog-shard-head" onclick="toggleVlogShard('wal-segs', this)"
-           title="Every WAL segment file currently tracked.">
-        <span class="vlog-caret">▸</span>
-        <span class="stat-key">Segments</span>
-        <span class="stat-val">${fmt(segments.length)} file${segments.length === 1 ? '' : 's'}</span>
-      </div>
-      <div class="vlog-seg-list" id="wal-segs" style="display:none">${rows}</div>
-    </div>`;
+        <div class="admin-card">
+          <div class="admin-card-title" title="The log the vector worker writes its chunk and whole-document codes to; one fsync per batch makes them durable. One log per database. Read from on-disk state — survives restart.">VECTOR INDEX WAL</div>
+          ${'stopped' in v ? `
+          <div class="stat-row"><span class="stat-key" title="${esc(v.stopped
+            ? `An fsync of the log failed: ${v.stopped}. The log refuses appends and syncs until the server restarts, so vector indexing has stopped (documents stay queued).`
+            : 'The log accepts writes. It stops after a failed fsync, until the server restarts.')}">Status</span>
+            <span class="stat-val ${v.stopped ? 'bad' : 'good'}">${v.stopped ? 'stopped — restart needed' : 'ok'}</span></div>` : ''}
+          <div class="stat-row"><span class="stat-key" title="Segment files of the vector index WAL.">Segment Files</span>
+            <span class="stat-val">${fmt(v.segment_count)}</span></div>
+          <div class="stat-row"><span class="stat-key" title="Total size of those segment files.">On-disk</span>
+            <span class="stat-val">${fmtBytes(v.disk_bytes)}</span></div>
+          <div class="stat-row"><span class="stat-key" title="Bytes at or above the retired cut (segment headers excluded): what a restart would replay.">Unretired</span>
+            <span class="stat-val">${fmtBytes(v.unretired_bytes)}</span></div>
+          <div class="stat-row"><span class="stat-key" title="Records below the retired cut are in SSTables; the tail is where the next record goes.">Retired Cut → Tail</span>
+            <span class="stat-val" style="font-size:11px">${fmtVwalPos(v.retired_cut)} → ${fmtVwalPos(v.tail)}</span></div>
+          <div class="stat-row"><span class="stat-key" title="Everything below it is fsynced.">Durable Tail</span>
+            <span class="stat-val" style="font-size:11px">${fmtVwalPos(v.durable_tail)}</span></div>
+          <div class="stat-row"><span class="stat-key" title="Highest write sequence of a record appended since the server started, or found then at or above the retired cut.">Last Sequence</span>
+            <span class="stat-val">${fmt(v.last_sequence)}</span></div>
+          <div class="stat-row"><span class="stat-key" title="Namespaces with records no flush has covered yet, so the retired cut cannot pass them. The WAL GC tick flushes them (sealing even an empty memtable), which releases them. Hover a name for where its replay starts.">Holding Cut</span>
+            <span class="stat-val" style="font-size:12px">${holdingHtml}</span></div>
+          ${segs}
+        </div>`;
 }
 
 async function loadStorageStats() {
   const area = document.getElementById('admin-storage-stats');
   if (!area) return;
   try {
-    const [h, s, w, sys, lsmArr, vlogArr] = await Promise.all([
+    const [h, s, w, sys, lsmArr, vlogArr, vwal] = await Promise.all([
       Api.health(), Api.stats(), Api.wal(), Api.systemStores(), Api.lsm(),
       Api.valueLog().catch(() => null),
+      Api.vectorIndexWal().catch(() => null),
     ]);
     state.adminStats = s; state.adminWal = w;
     state.adminLsm  = Object.fromEntries((lsmArr  ?? []).map(x => [x.namespace, x]));
@@ -2592,6 +2793,7 @@ async function loadStorageStats() {
             <span class="stat-val" style="font-size:11px">${fmt(w.head)} → ${fmt(w.tail)}</span></div>
           ${renderWalSegments(w.segments)}
         </div>
+        ${renderVectorIndexWalCard(vwal)}
       </div>
 
       <div class="section">
@@ -2604,113 +2806,48 @@ async function loadStorageStats() {
         <div class="progress-label">${s.waste_ratio_pct.toFixed(1)}% garbage</div>
       </div>
 
-      <div id="storage-stores-section">${renderStorageStoresTabs()}</div>
+      ${renderStorageNsSection()}
     `;
-    renderStorageNsSelect();
+    renderStorageNsDetail();
   } catch (e) {
     area.innerHTML = `<div class="alert alert-error">Failed to load stats: ${esc(e.message)}</div>`;
   }
 }
 
-// ── Namespaces section (tabbed) ─────────────────────────────────────────────────
-// One tab per store category (Doc / KV / System). Each tab has a namespace
-// dropdown (like the per-namespace ops panel) and shows the storage metrics for
-// the single selected namespace, rather than listing every namespace at once.
-
-// Build the list of selectable namespaces for a tab. Each entry carries the
-// info its summary header needs plus a `kind` that decides which meta endpoint
-// and renderer the detail uses.
-function storageTabEntries(tab) {
-  if (tab === 'doc') {
-    return state.stores.map(s => ({ key: s.namespace, name: s.namespace, kind: 'doc', store: s }));
+// ── Namespace section ───────────────────────────────────────────────────────────
+// Storage detail for the store selected in the sidebar (a user store or a
+// system namespace). Each entry carries a `kind` that decides which meta
+// endpoint and renderer the detail uses.
+function storageSelectedEntry() {
+  const s = state.selectedStore;
+  if (!s) return null;
+  if (state.selectedStoreType === 'system') {
+    return s.sysKind === 'doc'
+      ? { key: `doc:${s.namespace}`, name: s.namespace, kind: 'sys-doc', store: s }
+      : { key: `kv:${s.namespace}`,  name: s.namespace, kind: 'sys-kv',  store: s };
   }
-  if (tab === 'kv') {
-    return state.kvStores.map(s => ({ key: s.namespace, name: s.namespace, kind: 'kv', store: s }));
-  }
-  // system: kv system stores first, then doc system stores
-  const sys = state.adminSys ?? {};
-  return [
-    ...(sys.kv_stores  ?? []).map(k => ({ key: `kv:${k.name}`,      name: k.name,      kind: 'sys-kv',  store: k })),
-    ...(sys.doc_stores ?? []).map(d => ({ key: `doc:${d.namespace}`, name: d.namespace, kind: 'sys-doc', store: d })),
-  ];
+  const kind = state.selectedStoreType === 'kv' ? 'kv' : 'doc';
+  return { key: s.namespace, name: s.namespace, kind, store: s };
 }
 
-const STORAGE_TAB_LABELS = { doc: 'DOC STORE', kv: 'KV STORE', system: 'SYSTEM' };
-
-function renderStorageStoresTabs() {
-  const sys   = state.adminSys ?? {};
-  const sysN  = (sys.kv_stores?.length ?? 0) + (sys.doc_stores?.length ?? 0);
-  const counts = { doc: state.stores.length, kv: state.kvStores.length, system: sysN };
-  const tab   = state.storageStoresTab;
-  const btn   = (t, label) => `
-    <button class="sub-tab-btn ${tab === t ? 'active' : ''}"
-            onclick="switchStorageStoresTab('${t}')">${label} (${counts[t]})</button>`;
+function renderStorageNsSection() {
+  const entry = storageSelectedEntry();
   return `
     <div class="section">
-      <div class="sub-tab-nav" style="margin-bottom:14px">
-        ${btn('doc', 'Doc Stores')}
-        ${btn('kv', 'KV Stores')}
-        ${btn('system', 'System')}
-      </div>
       <div class="section-header">
-        <span class="section-title">${STORAGE_TAB_LABELS[tab]} NAMESPACES</span>
-        <select id="storage-ns-select" style="max-width:320px"
-                onchange="onStorageNsChange()"></select>
+        <span class="section-title">NAMESPACE${entry ? `: ${esc(entry.name.toUpperCase())}` : ''}</span>
       </div>
-      <div id="storage-ns-detail"><div class="spinner"></div></div>
+      <div id="storage-ns-detail">${entry ? '<div class="spinner"></div>'
+        : '<div class="text-muted" style="padding:12px 0">Select a store in the sidebar (or a namespace under System) to see its storage detail.</div>'}</div>
     </div>
   `;
-}
-
-function switchStorageStoresTab(tab) {
-  state.storageStoresTab = tab;
-  const section = document.getElementById('storage-stores-section');
-  if (!section) return;
-  section.innerHTML = renderStorageStoresTabs();
-  renderStorageNsSelect();
-}
-
-// Populate the dropdown for the active tab, preserving the current selection
-// where possible, then render the selected namespace's detail.
-function renderStorageNsSelect() {
-  const sel = document.getElementById('storage-ns-select');
-  if (!sel) return;
-  const tab     = state.storageStoresTab;
-  const entries = storageTabEntries(tab);
-  const detail  = document.getElementById('storage-ns-detail');
-  if (!entries.length) {
-    sel.innerHTML = '';
-    sel.style.display = 'none';
-    if (detail) detail.innerHTML =
-      `<div class="text-muted" style="padding:12px 0">No ${STORAGE_TAB_LABELS[tab].toLowerCase()} namespaces found.</div>`;
-    return;
-  }
-  sel.style.display = '';
-  if (!entries.some(e => e.key === state.storageSelectedNs[tab])) {
-    state.storageSelectedNs[tab] = entries[0].key;
-  }
-  sel.innerHTML = entries.map(e =>
-    `<option value="${esc(e.key)}" ${e.key === state.storageSelectedNs[tab] ? 'selected' : ''}>${esc(e.name)}</option>`
-  ).join('');
-  renderStorageNsDetail();
-}
-
-function onStorageNsChange() {
-  const sel = document.getElementById('storage-ns-select');
-  if (!sel) return;
-  state.storageSelectedNs[state.storageStoresTab] = sel.value;
-  renderStorageNsDetail();
 }
 
 function renderStorageNsDetail() {
   const area = document.getElementById('storage-ns-detail');
   if (!area) return;
-  const tab     = state.storageStoresTab;
-  const entry   = storageTabEntries(tab).find(e => e.key === state.storageSelectedNs[tab]);
-  if (!entry) {
-    area.innerHTML = '<div class="text-muted" style="padding:12px 0">Select a namespace.</div>';
-    return;
-  }
+  const entry = storageSelectedEntry();
+  if (!entry) return;
   const needsMeta = entry.kind !== 'sys-doc';
   area.innerHTML = `
     ${renderStorageEntrySummary(entry)}
@@ -2908,7 +3045,7 @@ function renderIndexWasteSection(waste) {
         <span class="text-muted" style="font-size:12px">
           fleet-wide ratios · compaction threshold ${thresholdPct}%${overCount
             ? ` · <span class="stat-val bad">${overCount} field${overCount !== 1 ? 's' : ''} over threshold</span> — run Index Checkpoint`
-            : ' · all fields healthy'} · per-field byte detail in Index Management → Blob Stats
+            : ' · all fields healthy'} · per-field byte detail in Field Index Operations → Blob Stats
         </span>
       </div>
       <div class="sys-stores-list">
@@ -3313,7 +3450,27 @@ async function adminIndexCheckpoint(btn) {
   }
 }
 
+/** Ask first: clearing cannot be undone and empties what recall checks sample. */
 async function adminClearQueryCache() {
+  const sys = await Api.systemStores().catch(() => null);
+  const n = sys?.kv_stores?.find(k => k.name === 'system_qemb_cache')?.lsm_entry_count;
+  openModal(`
+    <div class="modal-title">Clear the query-embedding cache?</div>
+    <p style="line-height:1.6;margin:0 0 10px">
+      This deletes ${n != null ? `all <strong>${fmt(n)}</strong> cached ${n === 1 ? 'entry' : 'entries'}` : 'every cached entry'},
+      for every semantic-search store. It cannot be undone.
+    </p>
+    <ul class="text-muted" style="line-height:1.6;margin:0 0 12px 18px">
+      <li>Each query is embedded again the next time it is searched, so the first searches are slower.</li>
+      <li>Recall checks sample real queries from this cache: they have fewer to sample until it refills.</li>
+    </ul>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-danger" onclick="closeModal(); doClearQueryCache()">🗑 Clear Cache</button>
+    </div>`);
+}
+
+async function doClearQueryCache() {
   const el = document.getElementById('admin-action-result');
   if (!el) return;
   el.innerHTML = '<div class="spinner"></div>';
@@ -3352,7 +3509,7 @@ function adminImportSchema() {
 async function adminImportSchemaFile(input) {
   const file = input.files[0];
   if (!file) return;
-  const el = document.getElementById('admin-action-result');
+  const el = document.getElementById('admin-import-result');
   if (el) el.innerHTML = '<div class="spinner"></div>';
   try {
     const text = await file.text();
@@ -3400,62 +3557,52 @@ const vqState = {
   maxRetries:      0,
 };
 
-async function loadAdminIndexPanel() {
-  const panel = document.getElementById('admin-index-panel');
+async function loadAdminFieldPanel() {
+  const panel = document.getElementById('admin-field-panel');
   if (!panel) return;
+  const empty = indexTabEmptyHtml('field indexes', hasFieldIndexes);
+  if (empty) { panel.innerHTML = empty; return; }
+  const ns = fieldScopeNs();
   panel.innerHTML = `
     <div class="admin-actions">
       <button class="btn btn-secondary" onclick="adminIndexRefresh()">↻ Refresh</button>
-      <button class="btn btn-ghost" onclick="adminVectorReconcile(this)"
-              title="Scan all vector-indexed namespaces and re-enqueue any documents missing a vector entry">⚡ Reconcile Vector Index</button>
+      <span class="text-muted" style="font-size:12px">${ns
+        ? `Showing <strong>${esc(ns)}</strong> only. Clear the selection in the sidebar (×) to see every store.`
+        : 'All stores. Select one in the sidebar (or click its name) to see only that store.'}</span>
     </div>
-    <div id="admin-index-action-result"></div>
     <div id="admin-index-builds"></div>
     <div id="admin-index-health"></div>
-    <div class="index-frame">
-      <div class="index-frame-title">VECTOR INDEX</div>
-      <div id="admin-index-vector-stats"><div class="spinner"></div></div>
-      <div id="admin-index-queue-browser">
-        ${renderVqBrowserHtml()}
-      </div>
-    </div>
     <div id="admin-index-waste"></div>
     <div id="admin-index-operations"></div>
   `;
-  await adminIndexRefresh();
+  await refreshFieldIndexes();
 }
 
-async function adminIndexRefresh() {
-  const builds  = document.getElementById('admin-index-builds');
-  const vstats  = document.getElementById('admin-index-vector-stats');
-  const waste   = document.getElementById('admin-index-waste');
-  const ops     = document.getElementById('admin-index-operations');
-  if (!vstats) return;
-  vstats.innerHTML = '<div class="spinner"></div>';
-  try {
-    const [progress, summary, corruption, wasteRes] = await Promise.all([
-      Api.indicesProgress(),
-      Api.vectorQueueSummary(),
-      Api.vectorCorruptionMetrics().catch(() => null),
-      Api.indexWaste().catch(() => null),
-    ]);
-    vqState.maxRetries = summary?.max_retries_configured ?? 0;
-    // Attribute (field) builds sit above the frame; vector stats fill the
-    // frame; field-index waste and index operations go below. The queue
-    // browser is a persistent child of the frame and is not re-rendered
-    // here so its results survive.
-    if (builds) builds.innerHTML = renderAttributeBuildsSection(progress?.attribute_builds ?? []);
-    vstats.innerHTML = `
-      ${renderVectorProgressSection(progress?.vector_progress ?? [])}
-      ${renderVectorQueueSummarySection(summary)}
-      ${renderVectorCorruptionSection(corruption)}
-    `;
-    if (waste) waste.innerHTML = renderIndexWasteSection(wasteRes);
-    if (ops) ops.innerHTML = renderNamespaceControlsSection(summary?.by_namespace ?? []);
-    refreshVqNsSelect(summary?.by_namespace ?? []);
-  } catch (e) {
-    vstats.innerHTML = `<div class="alert alert-error">Failed to load index data: ${esc(e.message)}</div>`;
-  }
+/** The store the Field Indexes tab is limited to, or null for every store. */
+function fieldScopeNs() {
+  return state.selectedStore && hasFieldIndexes(state.selectedStore) ? state.selectedStore.namespace : null;
+}
+
+/** Refresh whichever index tab is open (index actions call this when they finish). */
+function adminIndexRefresh() {
+  return state.adminTab === 'vector' ? refreshVectorIndexes() : refreshFieldIndexes();
+}
+
+async function refreshFieldIndexes() {
+  const builds = document.getElementById('admin-index-builds');
+  const waste  = document.getElementById('admin-index-waste');
+  const ops    = document.getElementById('admin-index-operations');
+  if (!ops) return;
+  const [progress, wasteRes] = await Promise.all([
+    Api.indicesProgress().catch(() => null),
+    Api.indexWaste().catch(() => null),
+  ]);
+  const ns = fieldScopeNs();
+  const inScope = (n) => ns == null || n === ns;
+  if (builds) builds.innerHTML = renderAttributeBuildsSection((progress?.attribute_builds ?? []).filter(b => inScope(b.id?.namespace)));
+  if (wasteRes) wasteRes.namespaces = (wasteRes.namespaces ?? []).filter(n => inScope(n.namespace));
+  if (waste)  waste.innerHTML  = renderIndexWasteSection(wasteRes);
+  ops.innerHTML = renderFieldOpsSection();
   // Health fans out one request per indexed namespace, so it loads on its own
   // and a failure there never blanks the rest of the panel.
   loadFieldIndexHealth();
@@ -3471,8 +3618,9 @@ async function loadFieldIndexHealth() {
   const el = document.getElementById('admin-index-health');
   if (!el) return;
 
+  const scope = fieldScopeNs();
   const namespaces = state.stores
-    .filter(s => (s.indices?.length ?? 0) > 0)
+    .filter(s => (s.indices?.length ?? 0) > 0 && (scope == null || s.namespace === scope))
     .map(s => s.namespace);
 
   if (!namespaces.length) { el.innerHTML = ''; return; }
@@ -3565,7 +3713,7 @@ function renderFieldIndexHealthSection(results) {
 
       rows.push({ degraded: !!gap, html: `
         <tr>
-          <td class="text-mono">${esc(r.ns)}</td>
+          ${nsCell(r.ns)}
           <td class="text-mono">${esc(f.field_name)}</td>
           <td>${badges}</td>
           <td style="text-align:right">${checkpoint}</td>
@@ -3670,7 +3818,7 @@ function renderAttributeBuildsSection(builds) {
 
     return `
       <tr>
-        <td class="text-mono">${esc(ns)}</td>
+        ${nsCell(ns)}
         <td class="text-mono">${esc(field)}</td>
         <td>${statusHtml}</td>
         <td style="text-align:right">${fmt(b.indexed)} / ${fmt(b.total)}</td>
@@ -3694,39 +3842,6 @@ function renderAttributeBuildsSection(builds) {
             </tr></thead>
             <tbody>${rows}</tbody>
           </table></div>`}
-    </div>
-  `;
-}
-
-function renderVectorProgressSection(vectorProgress) {
-  if (vectorProgress.length === 0) return '';
-
-  const rows = vectorProgress.map(p => {
-    const pct   = Math.min(p.progress_pct ?? 0, 100);
-    const color = pct >= 90 ? 'var(--success)' : pct >= 50 ? 'var(--warning)' : 'var(--error)';
-    const exhaustedNote = p.exhausted > 0
-      ? ` / <span style="color:var(--error)">${fmt(p.exhausted)} exhausted</span>`
-      : '';
-    return `
-      <div class="vq-progress-row">
-        <div class="vq-progress-ns">
-          <span>${esc(p.namespace)}</span>
-          <span style="color:var(--text-2)">
-            ${pct.toFixed(1)}% &mdash; ${fmt(p.indexed_approx)} indexed / ${fmt(p.pending)} pending${exhaustedNote}
-          </span>
-        </div>
-        <div class="progress-wrap">
-          <div class="progress-bar" style="width:${pct}%;background:${color}"></div>
-        </div>
-      </div>`;
-  }).join('');
-
-  return `
-    <div class="section">
-      <div class="section-header">
-        <span class="section-title">VECTOR INDEXING PROGRESS</span>
-      </div>
-      <div style="padding:4px 0">${rows}</div>
     </div>
   `;
 }
@@ -3765,267 +3880,80 @@ function renderVectorQueueSummarySection(summary) {
   `;
 }
 
-// ── Vector index corruption metrics ──────────────────────────────────────────
-// Process-wide, monotonic since startup. A non-zero/rising value means stored
-// vectors are corrupt and are being skipped at query time — reindex to repair.
-// Shape: { "<namespace>": { sparse, dense, total }, ... } (per-namespace snapshot).
-function renderVectorCorruptionSection(metrics) {
-  if (!metrics) return '';
-
-  // Sort by total skipped (worst first), then namespace name.
-  const entries = Object.entries(metrics)
-    .map(([ns, m]) => ({
-      ns,
-      sparse: m?.sparse ?? 0,
-      dense:  m?.dense  ?? 0,
-      total:  m?.total  ?? 0,
-    }))
-    .sort((a, b) => b.total - a.total || a.ns.localeCompare(b.ns));
-
-  const grandTotal  = entries.reduce((n, e) => n + e.total,  0);
-  const grandSparse = entries.reduce((n, e) => n + e.sparse, 0);
-  const grandDense  = entries.reduce((n, e) => n + e.dense,  0);
-
-  const rows = entries.length
-    ? entries.map(e => `
-        <tr>
-          <td class="text-mono">${esc(e.ns)}</td>
-          <td><span class="stat-val ${e.sparse > 0 ? 'warn' : ''}">${fmt(e.sparse)}</span></td>
-          <td><span class="stat-val ${e.dense  > 0 ? 'warn' : ''}">${fmt(e.dense)}</span></td>
-          <td><span class="stat-val ${e.total  > 0 ? 'bad'  : 'good'}">${fmt(e.total)}</span></td>
-        </tr>`).join('')
-    : `<tr><td colspan="4" class="text-muted" style="padding:14px 12px">No namespaces with vector indices</td></tr>`;
+function renderFieldOpsSection() {
+  const scope = fieldScopeNs();
+  const stores = state.stores.filter(s => (s.indices?.length ?? 0) > 0 && (scope == null || s.namespace === scope));
+  const rows = stores.map(s => {
+    const ns = s.namespace;
+    const indicesHtml = s.indices.map(ix =>
+      `<span class="badge badge-attr" style="margin-right:2px">${esc(ix.field)} <span style="opacity:.6">${esc(ix.index_type)}</span></span>`
+    ).join('');
+    return `
+      <tr>
+        ${nsCell(ns)}
+        <td>${indicesHtml}</td>
+        <td class="ns-ops-actions gap-8">
+          <button class="btn btn-xs btn-ghost" onclick="toggleFieldBlobStats('${esc(ns)}',this)"
+                  title="On-disk blob growth/waste per field (the per-field detail of Field Index Waste above)">Blob Stats ▾</button>
+          <button class="btn btn-xs btn-ghost" onclick="toggleRowMapStats('${esc(ns)}',this)"
+                  title="Row IDs held by deleted documents — what Reindex All would free (counts documents with a key scan)">Row Map ▾</button>
+          <button class="btn btn-xs btn-ghost" onclick="showReindexDocFieldModal('${esc(ns)}')"
+                  title="Reindex one field of a single document (synchronous)">Reindex Doc…</button>
+          <button class="btn btn-xs btn-ghost" onclick="adminAttrReindexAll('${esc(ns)}',this)"
+                  title="Drop and rebuild all field indices (async 202)">Reindex All</button>
+          <button class="btn btn-xs btn-danger" onclick="adminAttrDropAll('${esc(ns)}',this)"
+                  title="Drop all field indices without rebuilding (async 202)">Drop All</button>
+        </td>
+      </tr>
+      <tr id="blob-row-${esc(ns)}" style="display:none">
+        <td colspan="3" id="blob-cell-${esc(ns)}" style="padding:0"></td>
+      </tr>
+      <tr id="rowmap-row-${esc(ns)}" style="display:none">
+        <td colspan="3" id="rowmap-cell-${esc(ns)}" style="padding:0"></td>
+      </tr>`;
+  }).join('');
 
   return `
     <div class="section">
-      <div class="section-header">
-        <span class="section-title">VECTOR INDEX CORRUPTION METRICS</span>
-        <span class="text-muted" style="font-size:12px">
-          entries skipped on read since startup${grandTotal > 0
-            ? ' · <span class="stat-val bad">corrupt vectors present</span> — reindex affected namespaces'
-            : ' · no corruption detected'}
-        </span>
-      </div>
+      <div class="section-header"><span class="section-title">FIELD INDEX OPERATIONS (${stores.length})</span></div>
       <div class="tbl-wrap">
         <table class="tbl ns-ops-tbl">
-          <colgroup><col class="ns-ops-col-ns"><col><col><col></colgroup>
+          <colgroup>
+            <col class="ns-ops-col-ns"><col><col class="ns-ops-col-actions">
+          </colgroup>
           <thead><tr>
-            <th>Namespace</th>
-            <th title="Sparse-vector entries (search Pass 1) skipped because their stored bytes failed to deserialize.">Sparse (Pass-1)</th>
-            <th title="Dense-vector entries (search Pass 2) skipped because their stored bytes failed to deserialize.">Dense (Pass-2)</th>
-            <th title="Total entries skipped on read since startup (in-memory, resets on restart). Rising = stored vectors are corrupt and queries are silently degraded — run a validating Reconcile.">Total Skipped</th>
+            <th>Namespace</th><th>Indexed Fields</th><th>Operations</th>
           </tr></thead>
-          <tbody>${rows}</tbody>
-          ${entries.length > 1 ? `
-          <tfoot><tr>
-            <td class="text-mono"><strong>All namespaces</strong></td>
-            <td><span class="stat-val ${grandSparse > 0 ? 'warn' : ''}">${fmt(grandSparse)}</span></td>
-            <td><span class="stat-val ${grandDense  > 0 ? 'warn' : ''}">${fmt(grandDense)}</span></td>
-            <td><span class="stat-val ${grandTotal  > 0 ? 'bad'  : 'good'}">${fmt(grandTotal)}</span></td>
-          </tr></tfoot>` : ''}
+          <tbody>${rows || '<tr><td colspan="3" class="text-muted" style="padding:14px 12px">No stores with field indices</td></tr>'}</tbody>
         </table>
       </div>
     </div>
   `;
 }
 
-function renderNamespaceControlsSection(byNs) {
-  const byNsMap = Object.fromEntries(byNs.map(x => [x.namespace, x]));
-
-  const relevantStores = [
-    ...state.stores.map(s => ({ ...s, storeType: 'doc' })),
-    ...state.kvStores.map(s => ({ ...s, storeType: 'kv' })),
-  ].filter(s => {
-    const hasIndices = s.storeType === 'doc' && (s.indices?.length ?? 0) > 0;
-    return hasIndices || s.semantic_search_enabled;
-  });
-
-  if (relevantStores.length === 0) return `
-    <div class="section">
-      <div class="section-header"><span class="section-title">INDEX OPERATIONS</span></div>
-      <div class="text-muted" style="padding:8px 0">No stores with field indices or semantic search</div>
-    </div>
-  `;
-
-  // Split by index type so each sub-tab holds a homogeneous, well-aligned table.
-  const fieldRows = [];
-  const vectorRows = [];
-
-  relevantStores.forEach(s => {
-    const ns         = s.namespace;
-    const qStats     = byNsMap[ns];
-    const hasIndices = s.storeType === 'doc' && (s.indices?.length ?? 0) > 0;
-    const hasVector  = !!s.semantic_search_enabled;
-    const pending    = qStats?.pending   ?? 0;
-    const exhausted  = qStats?.exhausted ?? 0;
-
-    if (hasIndices) {
-      const indicesHtml = s.indices.map(ix =>
-        `<span class="badge badge-attr" style="margin-right:2px">${esc(ix.field)} <span style="opacity:.6">${esc(ix.index_type)}</span></span>`
-      ).join('');
-      fieldRows.push(`
-        <tr>
-          <td class="text-mono">${esc(ns)}</td>
-          <td>${indicesHtml}</td>
-          <td class="ns-ops-actions gap-8">
-            <button class="btn btn-xs btn-ghost" onclick="toggleFieldBlobStats('${esc(ns)}',this)"
-                    title="On-disk blob growth/waste per field (complements fleet-wide Field Index Waste)">Blob Stats ▾</button>
-            <button class="btn btn-xs btn-ghost" onclick="toggleRowMapStats('${esc(ns)}',this)"
-                    title="Row IDs held by deleted documents — what Reindex All would free (counts documents with a key scan)">Row Map ▾</button>
-            <button class="btn btn-xs btn-ghost" onclick="showReindexDocFieldModal('${esc(ns)}')"
-                    title="Reindex one field of a single document (synchronous)">Reindex Doc…</button>
-            <button class="btn btn-xs btn-ghost" onclick="adminAttrReindexAll('${esc(ns)}',this)"
-                    title="Drop and rebuild all field indices (async 202)">Reindex All</button>
-            <button class="btn btn-xs btn-danger" onclick="adminAttrDropAll('${esc(ns)}',this)"
-                    title="Drop all field indices without rebuilding (async 202)">Drop All</button>
-          </td>
-        </tr>
-        <tr id="blob-row-${esc(ns)}" style="display:none">
-          <td colspan="3" id="blob-cell-${esc(ns)}" style="padding:0"></td>
-        </tr>
-        <tr id="rowmap-row-${esc(ns)}" style="display:none">
-          <td colspan="3" id="rowmap-cell-${esc(ns)}" style="padding:0"></td>
-        </tr>`);
-    }
-
-    if (hasVector) {
-      const queueDepthHtml = pending === 0 && exhausted === 0
-        ? '<span class="text-muted">idle</span>'
-        : [
-            pending   > 0 ? `<span class="stat-val warn" style="font-size:11px">${fmt(pending)} pending</span>`     : '',
-            exhausted > 0 ? `<span class="stat-val bad"  style="font-size:11px">${fmt(exhausted)} exhausted</span>` : '',
-          ].filter(Boolean).join(' ');
-      vectorRows.push(`
-        <tr>
-          <td class="text-mono">${esc(ns)}</td>
-          <td>${queueDepthHtml}</td>
-          <td class="ns-ops-actions gap-8">
-            <button class="btn btn-xs btn-ghost" onclick="showReindexDocVectorModal('${esc(ns)}')"
-                    title="Re-enqueue a single document for embedding">Reindex Doc…</button>
-            <button class="btn btn-xs btn-ghost" onclick="adminVectorReindexAll('${esc(ns)}',this)"
-                    title="Re-enqueue all documents for embedding (async 202)">Reindex All</button>
-            ${exhausted > 0 ? `
-              <button class="btn btn-xs btn-accent" onclick="adminVectorReindexFailed('${esc(ns)}',this)"
-                      title="Reset exhausted entries so they can be retried">Retry Failed (${exhausted})</button>
-            ` : ''}
-            <button class="btn btn-xs btn-danger" onclick="adminVectorDropAll('${esc(ns)}',this)"
-                    title="Disable semantic search and clear all vector data (async 202)">Drop All</button>
-          </td>
-        </tr>`);
-    }
-  });
-
-  const activeTab = state.nsOpsTab === 'vector' && vectorRows.length ? 'vector'
-                  : state.nsOpsTab === 'field'  && fieldRows.length  ? 'field'
-                  : fieldRows.length ? 'field' : 'vector';
-
-  const emptyRow = (cols, msg) =>
-    `<tr><td colspan="${cols}" class="text-muted" style="padding:14px 12px">${msg}</td></tr>`;
-
-  const fieldTable = `
-    <div class="tbl-wrap">
-      <table class="tbl ns-ops-tbl">
-        <colgroup>
-          <col class="ns-ops-col-ns"><col><col class="ns-ops-col-actions">
-        </colgroup>
-        <thead><tr>
-          <th>Namespace</th><th>Indexed Fields</th><th>Operations</th>
-        </tr></thead>
-        <tbody>${fieldRows.join('') || emptyRow(3, 'No stores with field indices')}</tbody>
-      </table>
-    </div>`;
-
-  const vectorTable = `
-    <div class="tbl-wrap">
-      <table class="tbl ns-ops-tbl">
-        <colgroup>
-          <col class="ns-ops-col-ns"><col><col class="ns-ops-col-actions">
-        </colgroup>
-        <thead><tr>
-          <th>Namespace</th>
-          <th title="Embedding queue backlog for this namespace — pending (awaiting embedding) and exhausted (gave up after max retries) counts. 'idle' means the queue is empty.">Queue Depth</th>
-          <th>Operations</th>
-        </tr></thead>
-        <tbody>${vectorRows.join('') || emptyRow(3, 'No stores with semantic search enabled')}</tbody>
-      </table>
-    </div>`;
-
-  return `
-    <div class="section">
-      <div class="section-header">
-        <span class="section-title">INDEX OPERATIONS (${relevantStores.length})</span>
-      </div>
-      <div class="sub-tab-nav">
-        <button class="sub-tab-btn ${activeTab === 'field' ? 'active' : ''}"
-                data-nsops-tab="field" onclick="switchNsOpsTab('field')">Field Indices (${fieldRows.length})</button>
-        <button class="sub-tab-btn ${activeTab === 'vector' ? 'active' : ''}"
-                data-nsops-tab="vector" onclick="switchNsOpsTab('vector')">Vector Semantic (${vectorRows.length})</button>
-      </div>
-      <div id="nsops-field-panel" class="sub-panel ${activeTab === 'field' ? 'active' : ''}">${fieldTable}</div>
-      <div id="nsops-vector-panel" class="sub-panel ${activeTab === 'vector' ? 'active' : ''}">${vectorTable}</div>
-    </div>
-  `;
-}
-
-function switchNsOpsTab(tab) {
-  state.nsOpsTab = tab;
-  document.querySelectorAll('[data-nsops-tab]').forEach(b =>
-    b.classList.toggle('active', b.dataset.nsopsTab === tab));
-  ['field', 'vector'].forEach(t => {
-    const p = document.getElementById(`nsops-${t}-panel`);
-    if (p) p.classList.toggle('active', t === tab);
-  });
-}
-
-function renderVqBrowserHtml() {
-  const allNs = [...new Set([
-    ...state.stores.map(s => s.namespace),
-    ...state.kvStores.filter(s => s.semantic_search_enabled).map(s => s.namespace),
-  ])].sort();
-
-  const nsOptions = allNs.map(ns =>
-    `<option value="${esc(ns)}">${esc(ns)}</option>`
-  ).join('');
-
+/**
+ * The embedding-queue browser: every retried entry across stores (no `ns`), or
+ * one store's entries.
+ */
+function renderVqBrowserHtml(ns) {
   return `
     <div class="section">
       <div class="section-header">
         <span class="section-title">QUEUE BROWSER</span>
       </div>
       <div class="vq-browser-bar">
-        <button class="btn btn-ghost" onclick="vqLoadRetried(1)">All Retried Entries</button>
-        <span style="color:var(--text-3);font-size:12px">or browse by namespace:</span>
-        <select id="vq-ns-select">
-          <option value="">— select namespace —</option>
-          ${nsOptions}
-        </select>
-        <select id="vq-ns-mode">
-          <option value="all">All entries</option>
-          <option value="retried">Retried only</option>
-        </select>
-        <button class="btn btn-ghost" onclick="vqBrowseNs(1)">Browse</button>
+        ${ns ? `
+          <select id="vq-ns-mode">
+            <option value="all">All entries</option>
+            <option value="retried">Retried only</option>
+          </select>
+          <button class="btn btn-ghost" onclick="vqBrowseNs(1)">Browse ${esc(ns)}</button>`
+        : `<button class="btn btn-ghost" onclick="vqLoadRetried(1)">All Retried Entries</button>
+           <span style="color:var(--text-3);font-size:12px">Open a store to browse all of its entries.</span>`}
       </div>
       <div id="vq-browser-result"></div>
     </div>
   `;
-}
-
-function refreshVqNsSelect(byNs = []) {
-  const sel = document.getElementById('vq-ns-select');
-  if (!sel) return;
-  const queueNsSet = new Set(byNs.map(n => n.namespace));
-  const allNs = [...new Set([
-    ...byNs.map(n => n.namespace),
-    ...state.stores.map(s => s.namespace),
-    ...state.kvStores.filter(s => s.semantic_search_enabled).map(s => s.namespace),
-  ])].sort();
-  const prevVal = sel.value;
-  sel.innerHTML = `<option value="">— select namespace —</option>` +
-    allNs.map(ns =>
-      `<option value="${esc(ns)}" ${ns === prevVal ? 'selected' : ''}>
-        ${esc(ns)}${queueNsSet.has(ns) ? '' : ' (no pending)'}
-      </option>`
-    ).join('');
 }
 
 // ── Global vector reconcile ───────────────────────────────────────────────────
@@ -4319,7 +4247,7 @@ function renderBlobStatsDetail(results) {
     <div style="padding:8px 12px;background:var(--bg-2);border-top:1px solid var(--border)">
       <div class="text-muted" style="font-size:11px;margin-bottom:6px">
         On-disk blob growth — <strong>live / logical</strong> bytes and waste ratio per field.
-        Complements the fleet-wide <strong>Field Index Waste</strong> overview in the Storage tab;
+        The per-field detail of the <strong>Field Index Waste</strong> section above;
         a large high-waste bitmap is the signal to run an Index Checkpoint${thPct}.
       </div>
       <table class="tbl" style="width:100%">
@@ -4349,11 +4277,10 @@ async function vqLoadRetried(page) {
 }
 
 async function vqBrowseNs(page) {
-  const nsSelect   = document.getElementById('vq-ns-select');
   const modeSelect = document.getElementById('vq-ns-mode');
-  const ns   = nsSelect?.value;
-  const mode = modeSelect?.value ?? 'all';
-  if (!ns) { toast('Select a namespace first', 'error'); return; }
+  const ns   = vops.ns;
+  const mode = modeSelect?.value ?? vqState.nsMode;
+  if (!ns) return;
 
   vqState.selectedNs = ns;
   vqState.nsMode     = mode;
