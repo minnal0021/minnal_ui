@@ -254,7 +254,7 @@ const Api = (() => {
   };
   const vectorRecallCheck = (ns, opts = {}) => {
     const p = new URLSearchParams();
-    for (const k of ['sample', 'seed', 'min_overlap', 'probe_budget_entries', 'min_probes', 'max_probes'])
+    for (const k of ['sample', 'seed', 'min_overlap', 'min_probes', 'max_probes'])
       if (opts[k] != null && opts[k] !== '') p.set(k, opts[k]);
     return req('GET', `/admin/indices/${enc(ns)}/vector/recall-check?${p}`);
   };

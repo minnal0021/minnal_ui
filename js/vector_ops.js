@@ -47,10 +47,10 @@ const vops = {
 // label in the tab says what it measures and what to do about it.
 const VTIP = {
   // partition shape
-  postings: 'Live postings (IVF clusters) a search can probe. Each holds the chunks nearest its centre. Searches walk the nearest postings until the probe budget is spent.',
+  postings: 'Live postings (IVF clusters) a search can probe. Each holds the chunks nearest its centre. Each search reads its max_probes nearest postings (every posting when there are fewer).',
   retired: 'Postings emptied by a split, merge or rebuild. Kept only as small records (for the split/merge lineage); never searched, hold no keys.',
   centres: 'Centres stored, including those of retired postings. A chunk code keeps the centre it was encoded against until the document is re-embedded, so old centres stay.',
-  entries: 'One per (document, posting) pair: a document whose chunks fall in 3 postings counts 3. The probe budget is counted in entries.',
+  entries: 'One per (document, posting) pair: a document whose chunks fall in 3 postings counts 3.',
   chunks: 'Sentence-window chunks indexed for Pass 1 (one 1-bit code each), across live postings.',
   sizes: 'Chunks per live posting: 10th, 50th and 90th percentile, and the largest. A posting splits above the split limit and merges at or below the merge limit.',
   target: 'target_posting_size: the posting size maintenance aims for, in chunks.',
@@ -90,12 +90,12 @@ const VTIP = {
   reencode: 'The (up to) 20 postings with the highest mean drift: where re-embedding would restore the most code precision. NOT a reason to rebuild.',
   // recall check
   verdict: 'read_in_full: every search already reads every posting, so no partition can change its results. ok: overlap@10 ≥ the threshold. below_target: searches miss part of what a full read finds. empty: nothing stored.',
-  overlap: 'Overlap@k: of the top k documents a full read (every posting) returns, the share the normal search also returns within its probe budget. 1.0 = the budget loses nothing. Compare a check before and after a change (same seed), not against a fixed bar: the level differs by data.',
+  overlap: 'Overlap@k: of the top k documents a full read (every posting) returns, the share the normal search also returns from the postings it reads (max_probes). 1.0 = reading fewer postings loses nothing. Compare a check before and after a change (same seed), not against a fixed bar: the level differs by data.',
   overlap_p10: '10th percentile of overlap@10 over the sampled queries: how bad the worst tenth of queries are.',
   query_source: 'cached_queries: real recent queries from the query-embedding cache (the reliable signal). stored_chunks: fewer than 20 queries were cached, so stored chunks were used as queries; they can miss what a rebuild does for real queries.',
   seed: 'The sample\'s seed. Re-run with the same seed to search the same queries, e.g. before and after a rebuild.',
   sampled: 'Queries searched (each twice: normal search and full read).',
-  budget: 'The probe budget (entries) the normal search used: the store\'s, or this check\'s override.',
+  max_probes_used: 'Postings (clusters) the normal search read at most (max_probes): the store\'s, or this check\'s override.',
   read_share: 'Mean share of the store\'s entries one normal search read. Near 1.0, a rebuild cannot change results.',
   probes_mean: 'Mean postings one normal search probed.',
   reference_full: 'Whether the reference search read every posting. Above 500,000 entries it reads the nearest postings up to that many instead (memory bound), so the reference is not a full read.',
@@ -113,13 +113,10 @@ const VTIP = {
   pass2_bits: 'Bits per dimension of whole-document (Pass-2) codes. Read-only.',
   pass2_centre: 'Centre whole-document codes are encoded against ("zero": no partition centre, so they never drift).',
   rotation_seed: 'Seed of the random rotation codes and queries are computed in. Read-only.',
-  probe_budget_entries: 'Entries Pass 1 reads per query (the probe budget). Changeable; overridable per request. Raising it is the remedy when a rebuild does not raise overlap.',
-  min_probes: 'Postings always probed, whatever the budget.',
-  max_probes: 'Postings never exceeded, whatever the budget.',
+  min_probes: 'Floor on the postings (clusters) a search reads, for overrides that lower max_probes.',
+  max_probes: 'Postings (clusters) each search reads: its nearest this many, or every posting when the store has fewer. Changeable; overridable per request. Raising it is the remedy when a rebuild does not raise overlap.',
   first_pass_top_k: 'Candidates Pass 1 hands to Pass 2 for re-ranking.',
   top_k: 'Results returned by default.',
-  probe_budget_fraction: 'Scaled budget: clamp(fraction × entries, floor, probe_budget_entries). 0 / empty = the absolute budget.',
-  probe_budget_floor: 'Smallest scaled budget, so a small store is still read in full (used only with probe_budget_fraction).',
   target_posting_size: 'Target posting size in chunks; split above 2 × target.',
   reassign_range: 'Nearest postings re-checked after a split (LIRE reassignment).',
   merge_ratio: 'Merge limit as a share of the split limit.',
@@ -142,7 +139,7 @@ const VTIP = {
   min_cached_queries: 'Fewer cached queries than this and the check uses stored chunks instead.',
   max_reference_entries: 'Most entries the check\'s reference search reads (its memory bound).',
   default_min_overlap: 'Default overlap@10 threshold of the recall check.',
-  effective_probe_budget: 'The budget a search on this store uses now: probe_budget_entries, or the scaled form clamp(fraction × entries, floor, probe_budget_entries) when probe_budget_fraction is set.',
+  clusters_read_per_search: 'Postings a search on this store reads now: max_probes, or every live posting when there are fewer.',
 };
 
 const vt = (k) => VTIP[k] ?? '';
@@ -170,13 +167,11 @@ function semanticStores() {
 function vopsStore() { return semanticStores().find(s => s.namespace === vops.ns) ?? null; }
 function vopsSettings() { return vopsStore()?.vector_index ?? null; }
 
-/** The budget a search uses on this store now (the scaled form when set). */
-function effectiveBudget(settings, entries) {
+/** Postings a search reads on this store now: max_probes, or all of them when fewer. */
+function effectiveProbes(settings, postings) {
   const s = settings?.search;
   if (!s) return null;
-  const f = s.probe_budget_fraction ?? 0;
-  if (f > 0) return Math.min(Math.max(Math.round(f * entries), s.probe_budget_floor ?? 0), s.probe_budget_entries);
-  return s.probe_budget_entries;
+  return Math.min(Math.max(s.max_probes, s.min_probes ?? 1), postings);
 }
 
 // ── Tab entry ────────────────────────────────────────────────────────────────
@@ -339,7 +334,7 @@ function renderVectorStoresTable(progress, byNs, corruption) {
           <th title="Documents embedded so far, as a share of the store (approximate).">Indexed</th>
           <th title="Embedding queue backlog: pending (awaiting embedding) and exhausted (gave up after max retries). 'idle' means the queue is empty.">Queue</th>
           <th title="Sparse (Pass-1) plus dense (Pass-2) entries skipped on read because their stored bytes did not decode, since server start. Should be 0.">Corrupt skipped</th>
-          <th title="Would rebuilding the store's partition help? From its last recall check at its own probe budget and its last rebuild; hover a value for the reason, open the store for the steps.">Rebuild</th>
+          <th title="Would rebuilding the store's partition help? From its last recall check at its own max_probes and its last rebuild; hover a value for the reason, open the store for the steps.">Rebuild</th>
           <th></th>
         </tr></thead>
         <tbody>${rows}</tbody>
@@ -465,9 +460,9 @@ const rebuildsDone = () => vops.history.filter(r => r.kind === 'rebuild' && r.da
 const codeRecords = () => vops.history.filter(r => r.kind === 'codes');
 const ov10 = (d) => d?.overlap?.find(o => o.k === 10)?.mean;
 
-/** Two checks comparable across a rebuild: same seed, query source and budget. */
+/** Two checks comparable across a rebuild: same seed, query source and max_probes. */
 function sameCheck(a, b) {
-  return a && b && a.seed === b.seed && a.query_source === b.query_source && a.budget_entries === b.budget_entries;
+  return a && b && a.max_probes != null && a.seed === b.seed && a.query_source === b.query_source && a.max_probes === b.max_probes;
 }
 
 /** The decision for the store open in the detail view. */
@@ -478,29 +473,30 @@ function vopsDecide() {
 /**
  * The decision for one store, from its partition, its history (newest first)
  * and its vector-index settings: the latest recall check, the last rebuild and
- * the budget. Returns { level: good|warn|info|unknown, short, title, text, steps[] }.
+ * the postings a search reads. Returns { level: good|warn|info|unknown, short, title, text, steps[] }.
  */
 function decideRebuild(partition, history, settings) {
   const p = partition ?? {};
   const allChecks = history.filter(r => r.kind === 'recall_check');
-  const budget = effectiveBudget(settings, p.entries ?? 0);
-  // Only checks run at the store's own budget say what its searches lose; a
-  // check with a budget override is a what-if and is shown apart.
-  const cs = allChecks.filter(c => c.data.budget_entries === budget);
+  const maxProbes = settings?.search?.max_probes;
+  const probes = effectiveProbes(settings, p.postings ?? 0);
+  // Only checks run at the store's own max_probes say what its searches lose;
+  // a check with an override is a what-if and is shown apart.
+  const cs = allChecks.filter(c => c.data.max_probes != null && c.data.max_probes === maxProbes);
   const latest = cs[0];
   const rb = history.find(r => r.kind === 'rebuild' && r.data?.state === 'done');
   if (p.rebuild?.state === 'running') {
     return { level: 'info', short: 'Rebuilding', title: 'A rebuild is running',
       text: 'Wait for it to finish (this page refreshes itself), then run a recall check with the same seed as your last one to see what it gained.', steps: [] };
   }
-  if (budget != null && budget >= (p.entries ?? 0) && (p.entries ?? 0) > 0) {
+  if (maxProbes != null && maxProbes >= (p.postings ?? 0) && (p.postings ?? 0) > 0) {
     return { level: 'good', short: 'Not needed', title: 'No rebuild needed',
-      text: `Every search reads the whole store: the probe budget (${fmt(budget)} entries) is at least the store's ${fmt(p.entries)} entries. No partition can change what a search finds.`,
-      steps: ['This changes once the store grows past the budget; check again then.'] };
+      text: `Every search reads the whole store: max_probes (${fmt(maxProbes)}) is at least the store's ${fmt(p.postings)} postings. No partition can change what a search finds.`,
+      steps: ['This changes once the store has more postings than max_probes; check again then.'] };
   }
   if (!latest) {
     return { level: 'unknown', short: 'Not measured', title: 'Not measured yet',
-      text: `Searches read about ${budget && p.entries ? pct(Math.min(1, budget / p.entries), 0) : 'part'} of this store. Run a recall check (without a budget override) to see whether they miss results a full read would find.${allChecks.length ? ' Checks recorded so far used a budget override, so they describe a different budget.' : ''}`,
+      text: `Searches read ${probes && p.postings ? `${fmt(probes)} of this store's ${fmt(p.postings)} postings` : 'part of this store'}. Run a recall check (without a max_probes override) to see whether they miss results a full read would find.${allChecks.length ? ' Checks recorded so far used another max_probes, so they describe a different setting.' : ''}`,
       steps: ['Run a recall check (below).', 'If its verdict is below_target, rebuild, then run the check again with the same seed.'] };
   }
   const d = latest.data;
@@ -508,8 +504,8 @@ function decideRebuild(partition, history, settings) {
   if (rb && rb.recorded_at_ms > latest.recorded_at_ms) {
     return { level: 'info', short: 'Re-check', title: 'Rebuild finished: measure what it gained',
       text: `The last check (overlap@10 ${pct(o)}) ran before the rebuild ${ago(rb.recorded_at_ms)}. Run the same check again to compare.`,
-      steps: [`Run the recall check with seed ${d.seed ?? '(same)'}, no budget override (budget ${fmt(d.budget_entries)}).`,
-        'Keep the rebuild if overlap rose; if it did not, raise probe_budget_entries instead.'] };
+      steps: [`Run the recall check with seed ${d.seed ?? '(same)'}, no max_probes override (max_probes ${fmt(d.max_probes)}).`,
+        'Keep the rebuild if overlap rose; if it did not, raise max_probes instead.'] };
   }
   if (d.verdict === 'read_in_full') {
     return { level: 'good', short: 'Not needed', title: 'No rebuild needed',
@@ -528,22 +524,22 @@ function decideRebuild(partition, history, settings) {
     if (before) {
       const delta = (o - ov10(before.data)) * 100;
       if (delta >= 1) {
-        return { level: 'warn', short: 'Raise budget', title: `The last rebuild helped (+${delta.toFixed(1)} points); keep it`,
-          text: `Overlap@10 rose from ${pct(ov10(before.data))} to ${pct(o)}, still below ${pct(d.min_overlap, 0)}. The rest of the gap is the probe budget, which no partition fixes.`,
-          steps: [`Raise probe_budget_entries (now ${fmt(d.budget_entries)}) if you need more recall, and check again with a budget override first.`] };
+        return { level: 'warn', short: 'Raise max_probes', title: `The last rebuild helped (+${delta.toFixed(1)} points); keep it`,
+          text: `Overlap@10 rose from ${pct(ov10(before.data))} to ${pct(o)}, still below ${pct(d.min_overlap, 0)}. The rest of the gap is how few postings a search reads, which no partition fixes.`,
+          steps: [`Raise max_probes (now ${fmt(d.max_probes)}) if you need more recall, and check again with a max_probes override first.`] };
       }
-      return { level: 'warn', short: 'Raise budget', title: 'A rebuild did not help: raise the budget instead',
-        text: `Overlap@10 moved ${delta >= 0 ? '+' : ''}${delta.toFixed(1)} points across the last rebuild (${pct(ov10(before.data))} → ${pct(o)}). The partition is not what loses results; the probe budget is.`,
-        steps: [`Try the check with a larger probe_budget_entries override (now ${fmt(d.budget_entries)}); if it reaches the target, raise the store's budget.`] };
+      return { level: 'warn', short: 'Raise max_probes', title: 'A rebuild did not help: raise max_probes instead',
+        text: `Overlap@10 moved ${delta >= 0 ? '+' : ''}${delta.toFixed(1)} points across the last rebuild (${pct(ov10(before.data))} → ${pct(o)}). The partition is not what loses results; reading too few postings is.`,
+        steps: [`Try the check with a larger max_probes override (now ${fmt(d.max_probes)}); if it reaches the target, raise the store's max_probes.`] };
     }
     return { level: 'warn', short: 'Below target', title: 'Below target; cannot compare across the last rebuild',
-      text: `Overlap@10 is ${pct(o)}. No check from before the last rebuild used the same seed, query source and budget, so its effect is unknown.`,
+      text: `Overlap@10 is ${pct(o)}. No check from before the last rebuild used the same seed, query source and max_probes, so its effect is unknown.`,
       steps: ['Run a check now (seed below), rebuild, and run the same check again.'] };
   }
   return { level: 'warn', short: 'Try a rebuild', title: 'Maybe: try a rebuild',
-    text: `Searches find ${pct(o)} of a full read's top 10 (below ${pct(d.min_overlap, 0)}), reading ${pct(d.read_share)} of the store. A better-fitted partition may recover some of it; a too-small probe budget looks the same, so measure.`,
-    steps: [`Rebuild (below).`, `When it is done, run the recall check again with seed ${d.seed ?? '(same)'} and the same budget.`,
-      'Keep the rebuild if overlap rose; if it did not, raise probe_budget_entries instead.'] };
+    text: `Searches find ${pct(o)} of a full read's top 10 (below ${pct(d.min_overlap, 0)}), reading ${pct(d.read_share)} of the store. A better-fitted partition may recover some of it; a too-small max_probes looks the same, so measure.`,
+    steps: [`Rebuild (below).`, `When it is done, run the recall check again with seed ${d.seed ?? '(same)'} and the same max_probes.`,
+      'Keep the rebuild if overlap rose; if it did not, raise max_probes instead.'] };
 }
 
 // ── Decision sub-tab ─────────────────────────────────────────────────────────
@@ -552,10 +548,11 @@ function renderVopsDecision() {
   const dec = vopsDecide();
   const levelCls = { good: 'vops-good', warn: 'vops-warn', info: 'vops-info', unknown: 'vops-unknown' }[dec.level];
   const settings = vopsSettings();
-  const budget = effectiveBudget(settings, p.entries ?? 0);
+  const maxProbes = settings?.search?.max_probes;
+  const probes = effectiveProbes(settings, p.postings ?? 0);
   const latest = checks()[0];
-  const atBudget = checks().find(c => c.data.budget_entries === budget);
-  const whatIf = latest && latest !== atBudget ? latest : null;
+  const atSetting = checks().find(c => c.data.max_probes != null && c.data.max_probes === maxProbes);
+  const whatIf = latest && latest !== atSetting ? latest : null;
   const shown = vops.lastCheck ?? latest?.data;
   const rb = p.rebuild;
   const seed = latest?.data?.seed ?? 24301; // the server's default seed (0x5eed)
@@ -565,22 +562,21 @@ function renderVopsDecision() {
       <div class="vops-decision-text">${esc(dec.text)}</div>
       ${dec.steps.length ? `<ol class="vops-steps">${dec.steps.map(s => `<li>${esc(s)}</li>`).join('')}</ol>` : ''}
       <div class="vops-evidence">
-        <span title="${esc(vt('read_share'))}">Budget ${fmt(budget)} of ${fmt(p.entries)} entries
-          (${budget && p.entries ? pct(Math.min(1, budget / p.entries), 0) : '—'} of the store per search)</span>
-        <span title="${esc(vt('overlap'))} Only checks at the store's own budget count here.">Last check at this budget: ${atBudget ? `${esc(atBudget.data.verdict)}, overlap@10 ${pct(ov10(atBudget.data))}, ${ago(atBudget.recorded_at_ms)}` : 'none'}</span>
-        ${whatIf ? `<span title="A check run with a budget override: what searches would lose at that budget. It does not describe the store as configured.">Last what-if: budget ${fmt(whatIf.data.budget_entries)}, overlap@10 ${pct(ov10(whatIf.data))}, ${ago(whatIf.recorded_at_ms)}</span>` : ''}
+        <span title="${esc(vt('clusters_read_per_search'))}">Reads ${fmt(probes)} of ${fmt(p.postings)} postings per search
+          (max_probes ${fmt(maxProbes)})</span>
+        <span title="${esc(vt('overlap'))} Only checks at the store's own max_probes count here.">Last check at this setting: ${atSetting ? `${esc(atSetting.data.verdict)}, overlap@10 ${pct(ov10(atSetting.data))}, ${ago(atSetting.recorded_at_ms)}` : 'none'}</span>
+        ${whatIf ? `<span title="A check run with another max_probes: what searches would lose reading that many postings. It does not describe the store as configured.">Last what-if: max_probes ${fmt(whatIf.data.max_probes)}, overlap@10 ${pct(ov10(whatIf.data))}, ${ago(whatIf.recorded_at_ms)}</span>` : ''}
         <span title="${esc(vt('rb_state'))}">Last rebuild: ${rebuildsDone()[0] ? ago(rebuildsDone()[0].recorded_at_ms) : 'none recorded'}</span>
       </div>
     </div>
 
     <div class="admin-grid">
       <div class="admin-card">
-        <div class="admin-card-title" title="Searches sampled queries twice: with this store's probe budget, and reading every posting. No embedding calls. Costs about sample × (search + full read), one query at a time.">RUN A RECALL CHECK</div>
+        <div class="admin-card-title" title="Searches sampled queries twice: with this store's max_probes, and reading every posting. No embedding calls. Costs about sample × (search + full read), one query at a time.">RUN A RECALL CHECK</div>
         <div class="vops-form">
           <label title="${esc(vt('sampled'))}">Queries <input id="vops-sample" type="number" min="1" max="${vops.server?.recall_check?.max_sample ?? 1000}" value="100"></label>
           <label title="${esc(vt('seed'))}">Seed <input id="vops-seed" type="number" min="0" value="${seed}"></label>
           <label title="${esc(vt('min_overlap'))}">Threshold <input id="vops-min-overlap" type="number" min="0" max="1" step="0.01" value="${vops.server?.recall_check?.default_min_overlap ?? 0.95}"></label>
-          <label title="Check a different probe budget without changing the store (entries). Empty: the store's budget.">Budget override <input id="vops-budget" type="number" min="1" placeholder="${fmt(settings?.search?.probe_budget_entries)}"></label>
           <label title="${esc(vt('min_probes'))} Empty: the store's.">Min probes <input id="vops-minp" type="number" min="1" placeholder="${settings?.search?.min_probes ?? ''}"></label>
           <label title="${esc(vt('max_probes'))} Empty: the store's.">Max probes <input id="vops-maxp" type="number" min="1" placeholder="${settings?.search?.max_probes ?? ''}"></label>
         </div>
@@ -604,7 +600,7 @@ function renderVopsDecision() {
       </div>
     </div>
 
-    ${shown ? renderCheckResult(shown, `${vops.lastCheck ? 'Result of the check just run' : `Last recorded check (${ago(latest.recorded_at_ms)})`}${shown.budget_entries !== budget ? ` — what-if at budget ${fmt(shown.budget_entries)}` : ''}`) : ''}
+    ${shown ? renderCheckResult(shown, `${vops.lastCheck ? 'Result of the check just run' : `Last recorded check (${ago(latest.recorded_at_ms)})`}${shown.max_probes !== maxProbes ? ` — what-if at max_probes ${fmt(shown.max_probes)}` : ''}`) : ''}
   `;
 }
 
@@ -663,7 +659,7 @@ function renderCheckResult(d, title) {
         ${vrow('Queries', fmt(d.sampled), '', vt('sampled'))}
         ${vrow('Threshold', pct(d.min_overlap, 0), '', vt('min_overlap'))}
         ${vrow('Overlap@10, worst tenth', pct(d.overlap_at_10_p10, 0), '', vt('overlap_p10'))}
-        ${vrow('Probe budget', fmt(d.budget_entries), '', vt('budget'))}
+        ${vrow('Max probes', fmt(d.max_probes), '', vt('max_probes_used'))}
         ${vrow('Read per search', pct(d.read_share), '', vt('read_share'))}
         ${vrow('Postings probed', d.probes_mean?.toFixed(1) ?? '—', '', vt('probes_mean'))}
         ${vrow('Store', `${fmt(d.entries)} entries, ${fmt(d.postings)} postings`, '', 'The store when the check ran.')}
@@ -682,7 +678,7 @@ async function runVopsCheck() {
   renderVopsBody();
   try {
     const opts = { sample: v('vops-sample'), seed: v('vops-seed'), min_overlap: v('vops-min-overlap'),
-      probe_budget_entries: v('vops-budget'), min_probes: v('vops-minp'), max_probes: v('vops-maxp') };
+      min_probes: v('vops-minp'), max_probes: v('vops-maxp') };
     const ns = vops.ns;
     vops._form = opts;
     const r = await Api.vectorRecallCheck(ns, opts);
@@ -705,7 +701,7 @@ function restoreVopsForm() {
   if (!f) return;
   const set = (id, val) => { const el = document.getElementById(id); if (el && val) el.value = val; };
   set('vops-sample', f.sample); set('vops-seed', f.seed); set('vops-min-overlap', f.min_overlap);
-  set('vops-budget', f.probe_budget_entries); set('vops-minp', f.min_probes); set('vops-maxp', f.max_probes);
+  set('vops-minp', f.min_probes); set('vops-maxp', f.max_probes);
 }
 
 function confirmVopsRebuild() {
@@ -718,7 +714,7 @@ function confirmVopsRebuild() {
       <li>k-means fits ${want ? fmt(Number(want)) : `${fmt(p.postings)} (as now)`} postings on all ${fmt(p.chunks)} stored chunks, then every chunk moves to its nearest new posting.</li>
       <li>No embedding calls and no re-encoding: centre drift will <b>rise</b>.</li>
       <li>Searches and writes continue. Measured: about 7 s for 23k chunks, 150 s for 173k, on 2 threads.</li>
-      <li>${lc ? `Your last recall check used seed ${lc.data.seed ?? '—'} and budget ${fmt(lc.data.budget_entries)}: run it again with the same values afterwards to see what the rebuild gained.`
+      <li>${lc ? `Your last recall check used seed ${lc.data.seed ?? '—'} and max_probes ${fmt(lc.data.max_probes)}: run it again with the same values afterwards to see what the rebuild gained.`
               : 'Run a recall check first, so you can compare before and after.'}</li>
     </ul>
     <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
@@ -999,12 +995,12 @@ function renderVopsHistory() {
   const codesN = codeRecords().length;
   const cs = checks();
   const deltaFor = (r) => {
-    // Overlap@10 change against the previous comparable check (same seed, source, budget).
+    // Overlap@10 change against the previous comparable check (same seed, source, max_probes).
     const i = cs.indexOf(r);
     const prev = cs.slice(i + 1).find(c => sameCheck(c.data, r.data));
     if (!prev) return '';
     const dl = (ov10(r.data) - ov10(prev.data)) * 100;
-    return `<span class="${dl >= 1 ? 'vops-up' : dl <= -1 ? 'vops-down' : 'text-muted'}" title="Change in overlap@10 against the previous check with the same seed, query source and budget.">${dl >= 0 ? '+' : ''}${dl.toFixed(1)}</span>`;
+    return `<span class="${dl >= 1 ? 'vops-up' : dl <= -1 ? 'vops-down' : 'text-muted'}" title="Change in overlap@10 against the previous check with the same seed, query source and max_probes.">${dl >= 0 ? '+' : ''}${dl.toFixed(1)}</span>`;
   };
   return `
     <div class="text-muted vops-note">Recorded recall checks and rebuilds, newest first. Records are kept ${ttl ? fmtDuration(ttl) : '30 days'}
@@ -1015,12 +1011,12 @@ function renderVopsHistory() {
         <th title="When the check ran or the rebuild finished (your local time).">When</th><th title="A recall check, or a rebuild (its row summarises what it did).">Event</th>
         <th title="${esc(vt('verdict'))}">Verdict</th>
         ${[10, 20, 30, 40, 50, 100].map(k => `<th title="${esc(`Overlap@${k}: of the top ${k} a full read returns, the share the normal search also returned. ${vt('overlap')}`)}">@${k}</th>`).join('')}
-        <th title="Change in overlap@10 against the previous check with the same seed, query source and budget: what changed in between (e.g. a rebuild) gained or lost.">Δ@10</th>
+        <th title="Change in overlap@10 against the previous check with the same seed, query source and max_probes: what changed in between (e.g. a rebuild) gained or lost.">Δ@10</th>
         <th title="${esc(vt('overlap_p10'))}">p10@10</th>
         <th title="${esc(vt('query_source'))}">Source</th>
         <th title="${esc(vt('seed'))}">Seed</th>
         <th title="${esc(vt('sampled'))}">Queries</th>
-        <th title="${esc(vt('budget'))}">Budget</th>
+        <th title="${esc(vt('max_probes_used'))}">Max probes</th>
         <th title="${esc(vt('read_share'))}">Read</th>
         <th title="${esc(vt('reference_full'))}">Ref</th>
         <th title="${esc(vt('elapsed_ms'))}">Took</th>
@@ -1040,7 +1036,7 @@ function renderVopsHistory() {
           <td><b>${o(10)}</b></td><td>${o(20)}</td><td>${o(30)}</td><td>${o(40)}</td><td>${o(50)}</td><td>${o(100)}</td>
           <td>${deltaFor(r)}</td><td>${pct(d.overlap_at_10_p10, 0)}</td>
           <td class="${d.query_source === 'stored_chunks' ? 'vops-warn-text' : ''}">${esc(d.query_source === 'cached_queries' ? 'queries' : d.query_source === 'stored_chunks' ? 'chunks' : '—')}</td>
-          <td>${d.seed ?? '—'}</td><td>${fmt(d.sampled)}</td><td>${fmt(d.budget_entries)}</td><td>${pct(d.read_share, 0)}</td>
+          <td>${d.seed ?? '—'}</td><td>${fmt(d.sampled)}</td><td>${fmt(d.max_probes)}</td><td>${pct(d.read_share, 0)}</td>
           <td>${d.reference_is_full_read ? 'full' : 'capped'}</td><td>${durMs(d.elapsed_ms)}</td></tr>`;
       }).join('')}</tbody>
     </table></div>` : '<div class="text-muted vops-note">No recall checks or rebuilds recorded yet.</div>'}`;
@@ -1084,13 +1080,10 @@ function renderVopsSettings() {
             row('pass2_centre', q.pass2_centre, undefined, 'read-only'),
             row('rotation_seed', q.rotation_seed, undefined, 'read-only')])}
           ${group('Search', [
-            row('probe_budget_entries', se.probe_budget_entries, ds.probe_budget_entries, 'yes; per request'),
             row('min_probes', se.min_probes, ds.min_probes, 'yes; per request'),
             row('max_probes', se.max_probes, ds.max_probes, 'yes; per request'),
             row('first_pass_top_k', se.first_pass_top_k, ds.first_pass_top_k, 'yes; per request'),
-            row('top_k', se.top_k, ds.top_k, 'yes; per request'),
-            row('probe_budget_fraction', se.probe_budget_fraction, ds.probe_budget_fraction ?? 0, 'yes'),
-            row('probe_budget_floor', se.probe_budget_floor, ds.probe_budget_floor, 'yes')])}
+            row('top_k', se.top_k, ds.top_k, 'yes; per request')])}
           ${group('Partition maintenance', [
             row('target_posting_size', mt.target_posting_size, dm.target_posting_size, 'yes'),
             row('split_limit', p.split_limit, dm.split_limit, 'derived (2 × target)'),
@@ -1103,7 +1096,7 @@ function renderVopsSettings() {
             row('split_max_iters', mt.split_max_iters, dm.split_max_iters, 'yes'),
             row('split_lambda_factor', mt.split_lambda_factor, dm.split_lambda_factor, 'yes')])}
           ${group('Derived now', [
-            row('effective_probe_budget', effectiveBudget(s, p.entries ?? 0), undefined, 'derived')])}
+            row('clusters_read_per_search', effectiveProbes(s, p.postings ?? 0), undefined, 'derived')])}
         </tbody>
       </table></div>
     </div>

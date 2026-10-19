@@ -155,7 +155,7 @@ four groups of settings, all shown under **Schema → Vector Index Settings**:
 |---|---|---|
 | Embedding and chunking | `embedding_model`, `embedding_dim`, `chunking.window_size`, `chunking.sliding_size` | Set when semantic search is enabled, then fixed |
 | Quantisation | `pass1_bits`, `pass2_bits`, `pass2_centre`, `rotation_seed` | Read-only; `rotation_seed` can be given at enable time |
-| Search defaults | `probe_budget_entries`, `min_probes`, `max_probes`, `first_pass_top_k`, `top_k`, `probe_budget_fraction`, `probe_budget_floor` | Any time; each search can also override them |
+| Search defaults | `max_probes` (postings, or clusters, each search reads: its nearest this many), `min_probes` (a floor for overrides), `first_pass_top_k`, `top_k` | Any time; each search can also override them |
 | Partition maintenance | `target_posting_size`, `reassign_range`, `merge_ratio`, `skip_uncertain_moves`, `split_*` | Any time; later splits and merges use them |
 
 **Edit Search & Maintenance** changes the last two groups (it sends only the
@@ -189,13 +189,13 @@ split and merge as data arrives. The store view answers one question above all:
 - **Rebuild decision** — a plain-language verdict and the evidence behind it,
   plus the two actions:
   - *Recall check*: searches sampled real queries (from the query-embedding
-    cache, so no embedding calls) twice, with the store's probe budget and
-    reading every posting, and reports how much of the full read the normal
+    cache, so no embedding calls) twice, reading the store's `max_probes`
+    nearest postings and reading every posting, and reports how much of the full read the normal
     search found (overlap@10 … @100).
   - *Rebuild*: re-fits the postings on everything stored. The verdict tells you
     to check again with the same seed afterwards, and compares the two.
-  A store whose searches already read every entry needs no rebuild; the verdict
-  says so without a check.
+  A store with no more postings than `max_probes` is read in full by every
+  search and needs no rebuild; the verdict says so without a check.
 - **Partition** — postings, entries, chunks, size percentiles against the split
   and merge limits (with a histogram), maintenance counters, corruption counters
   and the last rebuild.
@@ -205,7 +205,7 @@ split and merge as data arrives. The store view answers one question above all:
   raises it.
 - **Postings** — every posting, sortable, with its code metrics on request.
 - **History** — recall checks and rebuilds as a timeline, with the change in
-  overlap@10 between comparable checks (same seed, query source and budget).
+  overlap@10 between comparable checks (same seed, query source and `max_probes`).
 - **Settings** — the store's `vector_index` settings beside the server's
   defaults (differences highlighted), and the server-wide `[semantic_search]`
   values.
