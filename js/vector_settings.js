@@ -42,13 +42,10 @@ const VSET_GROUPS = [
     id: 'search', title: 'Search defaults', rule: 'editable',
     ruleTip: 'Change any time; each search can also override them.',
     fields: [
-      { key: 'probe_budget_entries',  path: ['search', 'probe_budget_entries'],  type: 'int' },
       { key: 'min_probes',            path: ['search', 'min_probes'],            type: 'int' },
       { key: 'max_probes',            path: ['search', 'max_probes'],            type: 'int' },
       { key: 'first_pass_top_k',      path: ['search', 'first_pass_top_k'],      type: 'int' },
       { key: 'top_k',                 path: ['search', 'top_k'],                 type: 'int' },
-      { key: 'probe_budget_fraction', path: ['search', 'probe_budget_fraction'], type: 'ratio', zeroIsOff: true },
-      { key: 'probe_budget_floor',    path: ['search', 'probe_budget_floor'],    type: 'int' },
     ],
   },
   {
@@ -197,7 +194,6 @@ function showEditVectorSettingsModal(ns) {
         <div class="modal-section-title">${esc(g.title.toUpperCase())}</div>
         <div class="vset-form">${g.fields.map(f => vsetFieldRow('vset-edit', f, vsetGet(vi, f.path))).join('')}</div>
       </div>`).join('')}
-    <div class="text-muted" style="font-size:12px">probe_budget_fraction 0 turns budget scaling off.</div>
     <div id="vset-edit-error"></div>
     <div class="modal-actions">
       <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
