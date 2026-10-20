@@ -2237,7 +2237,7 @@ const ADMIN_TABS = [
   ['ops',     'Ops Metrics',    null],
   ['field',   'Field Indexes',  'Field-index builds, health, waste and per-store operations'],
   ['vector',  'Vector Indexes', 'All vector stores, and the selected store in detail: queue, rebuild decision, partition, code metrics, postings, history and settings'],
-  ['maintenance', 'System Maintenance', 'Server-wide maintenance actions: GC, WAL GC, LSM compaction, index checkpoint, query-cache clear'],
+  ['maintenance', 'System Maintenance', 'Server-wide maintenance actions: GC, WAL GC, LSM compaction, field index checkpoint, query-cache clear'],
 ];
 
 function loadAdminSubTab(tab) {
@@ -2248,15 +2248,24 @@ function loadAdminSubTab(tab) {
   return renderVectorIndexesTab();
 }
 
+const SYSTEM_FIELD_TAB_REASON = 'System namespaces have no field indexes. Clear the selection (×) or select a user store to see field indexes.';
+
+/** Field indexes do not apply to a selected system namespace. */
+const adminSubTabOff = (id) => id === 'field' && isSystemStore();
+
 async function renderAdminTab() {
-  if (!ADMIN_TABS.some(([id]) => id === state.adminTab)) state.adminTab = 'storage';
+  if (!ADMIN_TABS.some(([id]) => id === state.adminTab) || adminSubTabOff(state.adminTab)) state.adminTab = 'storage';
   const el = document.getElementById('tab-admin');
   el.innerHTML = `
     <div class="sub-tab-nav admin-inner-nav">
-      ${ADMIN_TABS.map(([id, label, title]) => `
+      ${ADMIN_TABS.map(([id, label, title]) => {
+        const off = adminSubTabOff(id);
+        const tip = off ? SYSTEM_FIELD_TAB_REASON : title;
+        return `
         <button class="sub-tab-btn ${state.adminTab === id ? 'active' : ''}"
                 data-admin-tab="${id}" onclick="switchAdminTab('${id}')"
-                ${title ? `title="${esc(title)}"` : ''}>${label}</button>`).join('')}
+                ${off ? 'disabled' : ''} ${tip ? `title="${esc(tip)}"` : ''}>${label}</button>`;
+      }).join('')}
     </div>
     ${ADMIN_TABS.map(([id]) => `
       <div id="admin-${id}-panel" class="sub-panel ${state.adminTab === id ? 'active' : ''}">
@@ -2267,6 +2276,7 @@ async function renderAdminTab() {
 }
 
 function switchAdminTab(tab) {
+  if (adminSubTabOff(tab)) return;
   state.adminTab = tab;
   document.querySelectorAll('[data-admin-tab]').forEach(b => {
     b.classList.toggle('active', b.dataset.adminTab === tab);
@@ -2337,7 +2347,7 @@ const MAINTENANCE_ACTIONS = [
   { label: '⚡ Compact LSM', fn: 'adminCompact()', title: 'LSM compaction',
     tip: 'POST /admin/storage/compact — merge pending LSM files in every namespace now. The compaction worker does this whenever a memtable fills, and every lsm_compaction_interval_secs.',
     text: 'Flushes sealed memtables and merges level-0 files into level 1, in every namespace.' },
-  { label: '⚡ Index Checkpoint', fn: 'adminIndexCheckpoint(this)', title: 'Index checkpoint',
+  { label: '⚡ Field Index Checkpoint', fn: 'adminIndexCheckpoint(this)', title: 'Field index checkpoint',
     tip: 'POST /admin/storage/index-checkpoint — make every field index durable now and compact bitmap stores over index_blob_waste_threshold. The checkpoint worker does this every index_checkpoint_interval_ms.',
     text: 'Writes every field index and row map to disk, and compacts any field-index bitmap store over the waste threshold. Runs in the background, one run at a time; progress is in the server log.' },
   { label: '🗑 Clear Query Cache', fn: 'adminClearQueryCache()', title: 'Clear query-embedding cache', danger: true,
@@ -2992,7 +3002,7 @@ async function loadStorageEntryMeta(entry) {
 
 // ── Field-index waste ───────────────────────────────────────────────────────────
 // Per-field reclaimable dead space in the field-index bitmap/keymap stores.
-// Use it to decide whether to force an Index Checkpoint.
+// Use it to decide whether to force a Field Index Checkpoint.
 function renderIndexWasteSection(waste) {
   if (!waste) return '';
   const namespaces = (waste.namespaces ?? []).filter(n => (n.fields ?? []).length);
@@ -3044,7 +3054,7 @@ function renderIndexWasteSection(waste) {
         <span class="section-title">FIELD INDEX WASTE</span>
         <span class="text-muted" style="font-size:12px">
           fleet-wide ratios · compaction threshold ${thresholdPct}%${overCount
-            ? ` · <span class="stat-val bad">${overCount} field${overCount !== 1 ? 's' : ''} over threshold</span> — run Index Checkpoint`
+            ? ` · <span class="stat-val bad">${overCount} field${overCount !== 1 ? 's' : ''} over threshold</span> — run Field Index Checkpoint`
             : ' · all fields healthy'} · per-field byte detail in Field Index Operations → Blob Stats
         </span>
       </div>
@@ -3437,14 +3447,14 @@ async function adminIndexCheckpoint(btn) {
   el.innerHTML = '<div class="spinner"></div>';
   try {
     await Api.indexCheckpoint();
-    const msg = 'Index checkpoint started — the flush and compaction run in the background. '
+    const msg = 'Field index checkpoint started — the flush and compaction run in the background. '
       + 'Check the server log file for progress and the checkpointed field count.';
     el.innerHTML = `<div class="alert alert-success">${msg}</div>`;
-    toast('Index checkpoint started — see log for progress');
+    toast('Field index checkpoint started — see log for progress');
     loadStorageStats();
   } catch (e) {
     el.innerHTML = `<div class="alert alert-error">${esc(e.message)}</div>`;
-    toast(`Index checkpoint failed: ${e.message}`, 'error');
+    toast(`Field index checkpoint failed: ${e.message}`, 'error');
   } finally {
     if (btn) btn.disabled = false;
   }
@@ -4248,7 +4258,7 @@ function renderBlobStatsDetail(results) {
       <div class="text-muted" style="font-size:11px;margin-bottom:6px">
         On-disk blob growth — <strong>live / logical</strong> bytes and waste ratio per field.
         The per-field detail of the <strong>Field Index Waste</strong> section above;
-        a large high-waste bitmap is the signal to run an Index Checkpoint${thPct}.
+        a large high-waste bitmap is the signal to run a Field Index Checkpoint${thPct}.
       </div>
       <table class="tbl" style="width:100%">
         <thead><tr>

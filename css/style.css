@@ -328,7 +328,8 @@ select { cursor: pointer; }
   color: var(--text-2); font-size: 13px; cursor: pointer;
   transition: all .15s;
 }
-.sub-tab-btn:hover   { background: var(--bg-hover); color: var(--text); }
+.sub-tab-btn:hover:not(:disabled) { background: var(--bg-hover); color: var(--text); }
+.sub-tab-btn:disabled { opacity: .4; cursor: not-allowed; }
 .sub-tab-btn.active  { background: var(--accent-dim); color: var(--accent);
                        border-color: var(--accent); }
 .sub-panel { display: none; }
