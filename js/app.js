@@ -2337,6 +2337,8 @@ async function loadAdminStoragePanel() {
 // ── Admin system-maintenance panel ──────────────────────────────────────────────
 // Actions that act on the whole server, every namespace at once. The background
 // workers run each of them on their own schedule; these run one now.
+const SYSTEM_FIELD_ACTION_REASON = 'System namespaces have no field indexes. Clear the selection (×) or select a user store to run a field index checkpoint.';
+
 const MAINTENANCE_ACTIONS = [
   { label: '⚡ Trigger GC', fn: 'adminTriggerGc()', title: 'Value-log GC',
     tip: 'POST /admin/storage/gc — reclaim value-log garbage in every namespace now. The GC worker does this every value_log_gc_interval_secs for namespaces over value_log_waste_threshold.',
@@ -2347,7 +2349,7 @@ const MAINTENANCE_ACTIONS = [
   { label: '⚡ Compact LSM', fn: 'adminCompact()', title: 'LSM compaction',
     tip: 'POST /admin/storage/compact — merge pending LSM files in every namespace now. The compaction worker does this whenever a memtable fills, and every lsm_compaction_interval_secs.',
     text: 'Flushes sealed memtables and merges level-0 files into level 1, in every namespace.' },
-  { label: '⚡ Field Index Checkpoint', fn: 'adminIndexCheckpoint(this)', title: 'Field index checkpoint',
+  { label: '⚡ Field Index Checkpoint', fn: 'adminIndexCheckpoint(this)', title: 'Field index checkpoint', fieldIndex: true,
     tip: 'POST /admin/storage/index-checkpoint — make every field index durable now and compact bitmap stores over index_blob_waste_threshold. The checkpoint worker does this every index_checkpoint_interval_ms.',
     text: 'Writes every field index and row map to disk, and compacts any field-index bitmap store over the waste threshold. Runs in the background, one run at a time; progress is in the server log.' },
   { label: '🗑 Clear Query Cache', fn: 'adminClearQueryCache()', title: 'Clear query-embedding cache', danger: true,
@@ -2366,12 +2368,17 @@ function loadAdminMaintenancePanel() {
         background workers already run them on a schedule; use these to run one now.
       </div>
       <div class="maint-list">
-        ${MAINTENANCE_ACTIONS.map(a => `
+        ${MAINTENANCE_ACTIONS.map(a => {
+          // Field-index actions do not apply to a selected system namespace.
+          const off = a.fieldIndex && isSystemStore();
+          return `
           <div class="maint-row">
             <div><div class="maint-title">${esc(a.title)}</div>
               <div class="text-muted maint-text">${esc(a.text)}</div></div>
-            <button class="btn ${a.danger ? 'btn-danger' : 'btn-ghost'}" onclick="${a.fn}" title="${esc(a.tip)}">${a.label}</button>
-          </div>`).join('')}
+            <button class="btn ${a.danger ? 'btn-danger' : 'btn-ghost'}" onclick="${a.fn}"
+                    ${off ? 'disabled' : ''} title="${esc(off ? SYSTEM_FIELD_ACTION_REASON : a.tip)}">${a.label}</button>
+          </div>`;
+        }).join('')}
       </div>
       <div id="admin-action-result"></div>
     </div>`;
