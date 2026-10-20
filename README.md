@@ -40,7 +40,8 @@ and Vector Indexes show only that store, or say it has no index of that kind. Un
 by default) the sidebar also lists the engine's own namespaces: the embedding
 queue, the query-embedding cache and the partition history. A system namespace
 opens in Admin only; Schema, Documents and Query do not apply to it, and the
-Field Indexes sub-tab is greyed out because system namespaces have no field indexes.
+Field Indexes sub-tab and the System Maintenance → Field Index Checkpoint button
+are greyed out because system namespaces have no field indexes.
 
 ---
 
