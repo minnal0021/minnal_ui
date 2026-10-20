@@ -30,7 +30,7 @@ The interface is organised into four tabs, each mapping onto a part of the minna
 | **Schema** | Create, view, amend, and delete document stores and KV stores; manage field indices and embedding fields; view a semantic-search store's vector-index settings and change its search and maintenance settings (see [Vector-index settings](#vector-index-settings)). |
 | **Documents** | Browse, get, put, and delete documents; range scans and prefix scans with pagination. |
 | **Query** | Run predicate queries against field indices, plus semantic search and filtered semantic search. |
-| **Admin** | Five sub-tabs. **Storage**: server health, storage stats, WAL/LSM/value-log inspection, schema import. **Ops Metrics**: engine-wide and per-store counters, including the field-index write buffer. **Field Indexes**: builds, health and repair, waste, blob and row-map stats, reindex and drop. **Vector Indexes**: every vector store, and one store in detail, including whether a partition rebuild would help (see [Vector Indexes](#vector-indexes)). **System Maintenance**: the server-wide actions — value-log GC, WAL GC, LSM compaction, index checkpoint and clearing the query-embedding cache — each with what it does; they cover every namespace, whatever the sidebar selects. |
+| **Admin** | Five sub-tabs. **Storage**: server health, storage stats, WAL/LSM/value-log inspection, schema import. **Ops Metrics**: engine-wide and per-store counters, including the field-index write buffer. **Field Indexes**: builds, health and repair, waste, blob and row-map stats, reindex and drop. **Vector Indexes**: every vector store, and one store in detail, including whether a partition rebuild would help (see [Vector Indexes](#vector-indexes)). **System Maintenance**: the server-wide actions — value-log GC, WAL GC, LSM compaction, field index checkpoint and clearing the query-embedding cache — each with what it does; they cover every namespace, whatever the sidebar selects. |
 
 **The sidebar picks the store everywhere.** The store selected in the sidebar is
 the one every per-store section shows, including in Admin; nothing in Admin has a
@@ -39,7 +39,8 @@ selected entry), Admin shows its all-stores views. With one selected, Field Inde
 and Vector Indexes show only that store, or say it has no index of that kind. Under **System** (collapsed
 by default) the sidebar also lists the engine's own namespaces: the embedding
 queue, the query-embedding cache and the partition history. A system namespace
-opens in Admin only; Schema, Documents and Query do not apply to it.
+opens in Admin only; Schema, Documents and Query do not apply to it, and the
+Field Indexes sub-tab is greyed out because system namespaces have no field indexes.
 
 ---
 
