@@ -2345,7 +2345,7 @@ const MAINTENANCE_ACTIONS = [
     text: 'Rewrites every value-log segment whose garbage is over segment_gc_threshold, in every namespace, without waiting for a namespace to reach its GC trigger. Waits for the result and reports what each namespace reclaimed.' },
   { label: '⚡ Trigger WAL GC', fn: 'adminTriggerWalGc()', title: 'WAL GC',
     tip: 'POST /admin/storage/gc/wal — delete WAL segments that are no longer needed for recovery. The WAL GC worker does this every wal_gc_interval_secs.',
-    text: 'Deletes write-ahead-log segments every namespace has persisted and every field index has checkpointed past.' },
+    text: 'Deletes write-ahead-log segments wholly below the cut (every entry in them is in an SSTable) that every field index has checkpointed past.' },
   { label: '⚡ Compact LSM', fn: 'adminCompact()', title: 'LSM compaction',
     tip: 'POST /admin/storage/compact — merge pending LSM files in every namespace now. The compaction worker does this whenever a memtable fills, and every lsm_compaction_interval_secs.',
     text: 'Flushes sealed memtables and merges level-0 files into level 1, in every namespace.' },
@@ -2520,7 +2520,9 @@ function renderOpsMetricsHtml(m, opts = {}) {
         ${row('No-WAL Puts', fmt(w.no_wal_puts), '', 'Upserts written bypassing every log (skip_wal — the query-embedding cache). Vector payloads and partition-maintenance copies are not counted here: they go to the vector index WAL.')}
         ${row('No-WAL Deletes', fmt(w.no_wal_deletes), '', 'Deletes written bypassing the WAL (delete_no_wal callers).')}
         ${row('WAL Appended', fmtBytes(w.wal_bytes_appended), '', 'Total bytes appended to the WAL.')}
-        ${row('WAL Fsyncs', fmt(w.wal_fsyncs), '', 'WAL fsyncs — one per WAL-backed write. The durability cost of writes.')}
+        ${row('WAL Writes', fmt(w.wal_writes), '', 'WAL-backed writes. Each returned only once a WAL fsync covered it.')}
+        ${row('Commit Rounds', fmt(w.wal_commit_rounds), '', 'Main-WAL fsyncs. Concurrent writes share one (group commit), so this is the durability cost of writes. Engine-wide only: 0 on a per-namespace view.')}
+        ${row('Writes / Round', w.writes_per_commit_round != null ? w.writes_per_commit_round.toFixed(1) : '—', '', 'Writes one fsync covered, on average. 1 means writes arrived one at a time; higher means concurrent writes shared fsyncs.')}
         ${row('Apply Failures', fmt(w.apply_failures), apFailCls, 'In-memory applies that failed after retry. Data is still durable in the WAL.')}
       </div>
 
@@ -2659,19 +2661,18 @@ function renderSegmentList(id, title, segments, rowFn) {
     </div>`;
 }
 
-// The WAL is a sequence of segment files; each row is one file and its entry
-// backlog. Pending entries are what a restart would replay, so a segment carrying
-// pending entries is one the LSM has not caught up with yet; fully-persisted
-// segments below the live window are what WAL GC unlinks.
+// The WAL is a sequence of segment files, from the head to the tail. A segment
+// wholly below the cut is retired: every entry in it is in an SSTable, nothing
+// in it is replayed, and WAL GC deletes it (unless a field index still needs
+// it). The bytes from the cut to the tail are what a restart would replay.
 function renderWalSegments(segments) {
-  return renderSegmentList('wal-segs', 'Every WAL segment file currently tracked.', segments, s => {
-    const pc = s.pending_entries > 0 ? 'warn' : 'good';
+  return renderSegmentList('wal-segs', 'Every WAL segment file from the head to the tail.', segments, s => {
+    const pc = s.pending_bytes > 0 ? 'warn' : 'good';
     return `
-      <div class="vlog-seg" title="${fmt(s.total_entries)} entries — ${fmt(s.persisted_entries)} persisted to the LSM, ${fmt(s.pending_entries)} would be replayed on the next open">
+      <div class="vlog-seg" title="Bytes ${fmt(s.start)} – ${fmt(s.end)} of the log. ${s.retired ? 'Wholly below the cut: retired, WAL GC may delete it.' : `${fmtBytes(s.pending_bytes)} of it would be replayed on the next open.`}">
         <span class="vlog-seg-id">seg ${fmt(s.segment_id)}</span>
-        <span class="stat-val">${fmt(s.total_entries)} entries</span>
-        <span class="stat-val good">${fmt(s.persisted_entries)} persisted</span>
-        <span class="stat-val ${pc}">${fmt(s.pending_entries)} pending</span>
+        <span class="stat-val ${s.retired ? 'good' : ''}">${s.retired ? 'retired' : 'live'}</span>
+        <span class="stat-val ${pc}">${fmtBytes(s.pending_bytes)} to replay</span>
       </div>`;
   });
 }
@@ -2754,7 +2755,10 @@ async function loadStorageStats() {
     );
 
     const wasteClass = s.waste_ratio_pct > 40 ? 'bad' : s.waste_ratio_pct > 20 ? 'warn' : 'good';
-    const pendClass  = w.pending_entries > 1000 ? 'warn' : 'good';
+    const pendClass  = w.pending_bytes > 16 * 1024 * 1024 ? 'warn' : 'good';
+    const walHolding = (w.namespaces_holding_cut ?? []).map(esc).join(', ') || '—';
+    const walAhead   = (w.namespaces_ahead_of_cut ?? [])
+      .map(n => `<span title="Replay for this namespace starts at byte ${fmt(n.safe_offset)}">${esc(n.namespace)}</span>`).join(', ') || '—';
 
     area.innerHTML = `
       <div class="admin-grid">
@@ -2790,23 +2794,22 @@ async function loadStorageStats() {
 
         <div class="admin-card">
           <div class="admin-card-title" title="Write-ahead log metadata, read from on-disk state — survives restart.">WAL</div>
-          <div class="stat-row"><span class="stat-key" title="Entries currently tracked in the WAL.">Total Entries</span>
-            <span class="stat-val">${fmt(w.total_entries)}</span></div>
-          <div class="stat-row"><span class="stat-key" title="Entries already applied and persisted to the LSM tree.">Persisted</span>
-            <span class="stat-val good">${fmt(w.persisted_entries)}</span></div>
-          <div class="stat-row"><span class="stat-key" title="Total − Persisted. Entries that would be replayed on the next open. A large backlog hints at flush lag.">Pending</span>
-            <span class="stat-val ${pendClass}">${fmt(w.pending_entries)}</span></div>
+          <div class="stat-row"><span class="stat-key" title="Every entry below the cut is in an SSTable; the tail is where the next write goes.">Cut → Tail</span>
+            <span class="stat-val" style="font-size:11px">${fmt(w.cut)} → ${fmt(w.tail)}</span></div>
+          <div class="stat-row"><span class="stat-key" title="Tail − cut: the bytes a restart would replay. A large backlog hints at flush lag.">To Replay</span>
+            <span class="stat-val ${pendClass}">${fmtBytes(w.pending_bytes)}</span></div>
+          <div class="stat-row"><span class="stat-key" title="Namespaces with writes not yet in an SSTable; the slowest holds the cut. The WAL GC tick flushes them.">Holding Cut</span>
+            <span class="stat-val" style="font-size:11px">${walHolding}</span></div>
+          <div class="stat-row"><span class="stat-key" title="Namespaces whose writes are in SSTables past the cut: a restart skips their entries below their own offset. Hover a name for it.">Ahead of Cut</span>
+            <span class="stat-val" style="font-size:11px">${walAhead}</span></div>
           <div class="stat-row"><span class="stat-key" title="WAL GC passes ever run (persisted).">GC Runs</span>
             <span class="stat-val">${fmt(w.total_gc_runs)}</span></div>
           <div class="stat-row"><span class="stat-key" title="Bytes ever reclaimed by WAL GC (persisted).">Bytes Reclaimed</span>
             <span class="stat-val">${fmtBytes(w.total_bytes_reclaimed)}</span></div>
-          ${w.live_segments != null ? `
-          <div class="stat-row"><span class="stat-key" title="Tracked WAL segments still carrying entries (lower segments have been trimmed).">Live Segments</span>
-            <span class="stat-val">${fmt(w.live_segments)}${w.base_segment_id != null ? ` <span class="text-muted" style="font-size:11px">from #${fmt(w.base_segment_id)}</span>` : ''}</span></div>` : ''}
           ${w.last_sequence != null ? `
           <div class="stat-row"><span class="stat-key" title="Highest write sequence number the WAL has observed.">Last Sequence</span>
             <span class="stat-val">${fmt(w.last_sequence)}</span></div>` : ''}
-          <div class="stat-row"><span class="stat-key" title="WAL byte offsets of the live window (start → end).">Head → Tail</span>
+          <div class="stat-row"><span class="stat-key" title="Byte offsets of the oldest byte still on disk and of the next write.">Head → Tail</span>
             <span class="stat-val" style="font-size:11px">${fmt(w.head)} → ${fmt(w.tail)}</span></div>
           ${renderWalSegments(w.segments)}
         </div>
@@ -3419,13 +3422,9 @@ async function adminTriggerWalGc() {
   el.innerHTML = '<div class="spinner"></div>';
   try {
     const r = await Api.triggerWalGc();
-    // Servers before minnal#28 sent these two values under the wrong names
-    // (total_entries = bytes reclaimed, persisted_entries = entries still unpersisted).
-    const reclaimed = r.bytes_reclaimed ?? r.total_entries;
-    const unpersisted = r.unpersisted_entries ?? r.persisted_entries;
     el.innerHTML = `<div class="alert alert-success">
-      WAL GC complete — reclaimed ${fmtBytes(reclaimed)};
-      ${fmt(unpersisted)} entries still waiting to be persisted
+      WAL GC complete — reclaimed ${fmtBytes(r.bytes_reclaimed)};
+      ${fmtBytes(r.pending_bytes)} of WAL still to replay on recovery
     </div>`;
     toast('WAL GC complete');
     loadStorageStats();
