@@ -2562,13 +2562,14 @@ function renderOpsMetricsHtml(m, opts = {}) {
 }
 
 // Vector index WAL counters (`vector_index_wal`). The vector worker logs its
-// chunk and whole-document codes there and makes each batch durable with one
-// fsync, so Appends per Fsync is the batch size. The counters are engine-global:
+// chunk and whole-document codes there, and partition maintenance its
+// per-document writes; each makes a batch durable with one sync, and syncs that
+// arrive together share one fsync. The counters are engine-global:
 // a per-namespace body reports zeros, so that column shows a pointer instead.
 // Absent on a server without the log — the card is then hidden.
 function renderVectorIndexWalMetricsCard(v, row, perNs) {
   if (!v) return '';
-  const title = `<div class="admin-card-title" title="The log the vector worker writes its codes to; one fsync per batch makes them durable. In-memory, reset on restart.">VECTOR INDEX WAL</div>`;
+  const title = `<div class="admin-card-title" title="The log the vector worker writes its codes to, and partition maintenance its per-document writes; one sync per batch makes them durable. In-memory, reset on restart.">VECTOR INDEX WAL</div>`;
   if (perNs) {
     return `<div class="admin-card">${title}
       <div class="stat-row text-muted" style="font-size:12px"><span>The vector index WAL is engine-global — see the engine-wide panel.</span></div>
@@ -2578,7 +2579,8 @@ function renderVectorIndexWalMetricsCard(v, row, perNs) {
   return `<div class="admin-card">${title}
     ${row('Appends', fmt(v.appends), '', 'Records appended to the vector index WAL.')}
     ${row('Bytes Appended', fmtBytes(v.bytes_appended), '', 'Bytes appended to it, frames included.')}
-    ${row('Fsyncs', fmt(v.fsyncs), '', 'Its fsyncs: one per batch of vector writes made durable.')}
+    ${row('Fsyncs', fmt(v.fsyncs), '', 'Its fsyncs. The vector worker, partition maintenance and memtable flushes each sync once per batch; syncs that arrive together share one fsync.')}
+    ${row('Flush Syncs', fmt(v.flush_syncs), '', 'Syncs a memtable flush asked for before writing its L0 files, because its namespace had records not yet durable in this log (so an L0 file never holds a write the log could lose). Usually far fewer than Fsyncs.')}
     ${row('Appends per Fsync', apf, '', 'Appends / Fsyncs: records made durable per fsync. Blank before the first fsync.')}
     ${row('GC Runs', fmt(v.gc_runs), '', 'Its GC passes: WAL GC ticks that found a segment wholly below the retired cut to delete.')}
     ${row('Segments Deleted', fmt(v.segments_deleted), '', 'Its segments deleted by GC.')}
@@ -2683,7 +2685,9 @@ function fmtVwalPos(p) {
 }
 
 // The vector index WAL (`GET /admin/storage/vector-index-wal`): one log per
-// database where the vector worker writes its codes. A record is retired once
+// database where the vector worker writes its codes and partition maintenance
+// its per-document writes. Segments are created at their full size, so a
+// segment's file size says nothing about what it holds. A record is retired once
 // the memtable holding its write is flushed; restart replays only records at or
 // above the retired cut, and GC deletes segments wholly below it. Namespaces
 // holding the cut have records no flush has covered yet; the WAL GC tick
@@ -2700,13 +2704,12 @@ function renderVectorIndexWalCard(v) {
     return `
       <div class="vlog-seg" title="${retired ? 'Wholly below the retired cut: GC will delete it.' : 'Holds records at or above the retired cut: a restart would replay them.'}">
         <span class="vlog-seg-id">seg ${fmt(s.segment_id)}</span>
-        <span class="stat-val">${fmtBytes(s.bytes)}</span>
         <span class="stat-val ${retired ? 'good' : ''}">${retired ? 'retired, GC will delete' : 'live'}</span>
       </div>`;
   });
   return `
         <div class="admin-card">
-          <div class="admin-card-title" title="The log the vector worker writes its chunk and whole-document codes to; one fsync per batch makes them durable. One log per database. Read from on-disk state — survives restart.">VECTOR INDEX WAL</div>
+          <div class="admin-card-title" title="The log the vector worker writes its chunk and whole-document codes to, and partition maintenance its per-document writes; one sync per batch makes them durable. One log per database. Read from on-disk state — survives restart.">VECTOR INDEX WAL</div>
           ${'stopped' in v ? `
           <div class="stat-row"><span class="stat-key" title="${esc(v.stopped
             ? `An fsync of the log failed: ${v.stopped}. The log refuses appends and syncs until the server restarts, so vector indexing has stopped (documents stay queued).`
@@ -2714,9 +2717,9 @@ function renderVectorIndexWalCard(v) {
             <span class="stat-val ${v.stopped ? 'bad' : 'good'}">${v.stopped ? 'stopped — restart needed' : 'ok'}</span></div>` : ''}
           <div class="stat-row"><span class="stat-key" title="Segment files of the vector index WAL.">Segment Files</span>
             <span class="stat-val">${fmt(v.segment_count)}</span></div>
-          <div class="stat-row"><span class="stat-key" title="Total size of those segment files.">On-disk</span>
+          <div class="stat-row"><span class="stat-key" title="Total size of those segment files. Each is created at its full size (64 MiB), whatever it holds.">On-disk</span>
             <span class="stat-val">${fmtBytes(v.disk_bytes)}</span></div>
-          <div class="stat-row"><span class="stat-key" title="Bytes at or above the retired cut (segment headers excluded): what a restart would replay.">Unretired</span>
+          <div class="stat-row"><span class="stat-key" title="Bytes of records at or above the retired cut (segment headers excluded): what a restart would replay.">Unretired</span>
             <span class="stat-val">${fmtBytes(v.unretired_bytes)}</span></div>
           <div class="stat-row"><span class="stat-key" title="Records below the retired cut are in SSTables; the tail is where the next record goes.">Retired Cut → Tail</span>
             <span class="stat-val" style="font-size:11px">${fmtVwalPos(v.retired_cut)} → ${fmtVwalPos(v.tail)}</span></div>
