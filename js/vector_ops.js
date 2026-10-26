@@ -2,8 +2,8 @@
  * vector_ops.js — Admin → Vector Indexes.
  *
  * With no semantic-search store selected in the sidebar, the tab shows every
- * vector store: queue totals, indexing progress, corruption, the global
- * reconcile and the retried-entries browser. With one selected, it shows that
+ * vector store: queue totals, indexing progress, corruption and the
+ * retried-entries browser. With one selected, it shows that
  * store in detail: its queue, actions and queue browser (Overview), its
  * partition (postings, sizes, maintenance), its code metrics (centre
  * drift and friends), the recall check that says whether a rebuild helps, the
@@ -69,7 +69,7 @@ const VTIP = {
   m_rebuild_moves: 'Chunks a rebuild moved into its fitted postings (every chunk, once per rebuild).',
   m_moves_total: 'All chunk moves by ongoing maintenance (reassign + drain), excluding rebuilds: the write cost of keeping the partition in shape.',
   // corruption
-  c_sparse: 'Pass-1 (1-bit chunk) entries search skipped because they did not decode, since server start. Should be 0; if not, run the validating reconcile (Admin → Vector Indexes, all-stores view).',
+  c_sparse: 'Pass-1 (1-bit chunk) entries search skipped because they did not decode, since server start. Should be 0; if not, run Reindex All on the store (Overview sub-tab) to re-embed its documents.',
   c_dense: 'Pass-2 (8-bit whole-document) entries search skipped because they did not decode, since server start. Should be 0.',
   c_total: 'Sum of the two. Any non-zero value means some documents are silently missing from search results.',
   // rebuild
@@ -247,10 +247,7 @@ function renderVectorLanding(el) {
   el.innerHTML = `
     <div class="admin-actions">
       <button class="btn btn-secondary" onclick="loadVectorLanding()">↻ Refresh</button>
-      <button class="btn btn-ghost" onclick="adminVectorReconcile(this)"
-              title="Scan every vector store and re-enqueue any document missing a vector entry">⚡ Reconcile All Vector Stores</button>
     </div>
-    <div id="admin-index-action-result"></div>
     <div id="vidx-landing"><div class="spinner"></div></div>
     ${renderVqBrowserHtml(null)}`;
   loadVectorLanding();
@@ -327,7 +324,7 @@ function renderVectorStoresTable(progress, byNs, corruption) {
   return `
     <div class="section">
       <div class="section-header"><span class="section-title">VECTOR STORES (${semanticStores().length})</span></div>
-      ${corruptTotal > 0 ? `<div class="alert alert-error">${fmt(corruptTotal)} corrupt vector entries were skipped on read since server start: searches on those stores are degraded. Run Reconcile All Vector Stores, or Reindex All on the affected store.</div>` : ''}
+      ${corruptTotal > 0 ? `<div class="alert alert-error">${fmt(corruptTotal)} corrupt vector entries were skipped on read since server start: searches on those stores are degraded. Run Reindex All on the affected store to re-embed its documents.</div>` : ''}
       <div class="tbl-wrap"><table class="tbl">
         <thead><tr>
           <th>Store</th>

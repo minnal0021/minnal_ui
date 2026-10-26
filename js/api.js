@@ -167,7 +167,6 @@ const Api = (() => {
 
   // ── Admin Indices — query embedding cache ─────────────────────────
   const clearQueryEmbeddingCache = () => req('DELETE', '/admin/indices/vector/query-cache');
-  const vectorReconcile          = () => req('POST',   '/admin/indices/vector/reconcile');
 
   // ── Admin Indices — vector corruption metrics ─────────────────────
   const vectorCorruptionMetrics = () => req('GET', '/admin/indices/vector/corruption-metrics');
@@ -289,8 +288,8 @@ const Api = (() => {
     health, stats, opsMetrics, opsMetricsByNamespace, indexWaste, wal, vectorIndexWal, lsm, valueLog, namespaces, physicalNamespaces,
     systemStores, systemStoreMeta, storeKvMeta,
     triggerGc, triggerWalGc, compact, indexCheckpoint,
-    // admin indices — cache / reconcile
-    clearQueryEmbeddingCache, vectorReconcile,
+    // admin indices — cache
+    clearQueryEmbeddingCache,
     // admin indices — corruption / blob stats / single-doc reindex
     vectorCorruptionMetrics, fieldBlobStats, attributeReindexDoc, vectorReindexDoc,
     // admin indices — field index health / repair
