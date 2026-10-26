@@ -4001,27 +4001,6 @@ function renderVqBrowserHtml(ns) {
   `;
 }
 
-// ── Global vector reconcile ───────────────────────────────────────────────────
-
-async function adminVectorReconcile(btn) {
-  const el = document.getElementById('admin-index-action-result');
-  btn.disabled = true;
-  if (el) el.innerHTML = '<div class="spinner"></div>';
-  try {
-    await Api.vectorReconcile();
-    const msg = 'Vector index reconcile started — it runs in the background. '
-      + 'Check the server log file for progress, the re-enqueued count, and any errors.';
-    if (el) el.innerHTML = `<div class="alert alert-success">${msg}</div>`;
-    toast('Reconcile started — see log for progress');
-    await adminIndexRefresh();
-  } catch (e) {
-    if (el) el.innerHTML = `<div class="alert alert-error">${esc(e.message)}</div>`;
-    toast(`Reconcile failed: ${e.message}`, 'error');
-  } finally {
-    btn.disabled = false;
-  }
-}
-
 // ── Namespace index operations (async 202) ────────────────────────────────────
 
 async function adminAttrReindexAll(ns, btn) {
