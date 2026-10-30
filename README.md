@@ -155,8 +155,8 @@ four groups of settings, all shown under **Schema → Vector Index Settings**:
 
 | Group | Settings | Can change? |
 |---|---|---|
-| Embedding and chunking | `embedding_model`, `embedding_dim`, `chunking.window_size`, `chunking.sliding_size` | Set when semantic search is enabled, then fixed |
-| Quantisation | `pass1_bits`, `pass2_bits`, `pass2_centre`, `rotation_seed` | Read-only; `rotation_seed` can be given at enable time |
+| Embedding, chunking and code width | `embedding_model`, `embedding_dim`, `chunking.window_size`, `chunking.sliding_size`, `quantisation.pass1_bits` (1, 2 or 4) | Set when semantic search is enabled, then fixed |
+| Quantisation | `pass2_bits`, `pass2_centre`, `rotation_seed` | Read-only; `rotation_seed` can be given at enable time |
 | Search defaults | `max_probes` (postings, or clusters, each search reads: its nearest this many), `min_probes` (a floor for overrides), `first_pass_top_k`, `top_k` | Any time; each search can also override them |
 | Partition maintenance | `target_posting_size`, `reassign_range`, `merge_ratio`, `skip_uncertain_moves`, `split_*` | Any time; later splits and merges use them |
 

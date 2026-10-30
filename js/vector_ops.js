@@ -51,7 +51,7 @@ const VTIP = {
   retired: 'Postings emptied by a split, merge or rebuild. Kept only as small records (for the split/merge lineage); never searched, hold no keys.',
   centres: 'Centres stored, including those of retired postings. A chunk code keeps the centre it was encoded against until the document is re-embedded, so old centres stay.',
   entries: 'One per (document, posting) pair: a document whose chunks fall in 3 postings counts 3.',
-  chunks: 'Sentence-window chunks indexed for Pass 1 (one 1-bit code each), across live postings.',
+  chunks: 'Sentence-window chunks indexed for Pass 1 (one code each, pass1_bits per dimension), across live postings.',
   sizes: 'Chunks per live posting: 10th, 50th and 90th percentile, and the largest. A posting splits above the split limit and merges at or below the merge limit.',
   target: 'target_posting_size: the posting size maintenance aims for, in chunks.',
   split_limit: 'A posting holding more chunks than this (2 × target) is split in two by the maintenance task.',
@@ -69,7 +69,7 @@ const VTIP = {
   m_rebuild_moves: 'Chunks a rebuild moved into its fitted postings (every chunk, once per rebuild).',
   m_moves_total: 'All chunk moves by ongoing maintenance (reassign + drain), excluding rebuilds: the write cost of keeping the partition in shape.',
   // corruption
-  c_sparse: 'Pass-1 (1-bit chunk) entries search skipped because they did not decode, since server start. Should be 0; if not, run Reindex All on the store (Overview sub-tab) to re-embed its documents.',
+  c_sparse: 'Pass-1 (chunk code) entries search skipped because they did not decode, since server start. Should be 0; if not, run Reindex All on the store (Overview sub-tab) to re-embed its documents.',
   c_dense: 'Pass-2 (8-bit whole-document) entries search skipped because they did not decode, since server start. Should be 0.',
   c_total: 'Sum of the two. Any non-zero value means some documents are silently missing from search results.',
   // rebuild
@@ -86,7 +86,7 @@ const VTIP = {
   zero_centre: 'Share of codes still encoded against the zero centre: written while the store was one root posting, before its first split. Scored correctly; re-embedding encodes them against a real centre.',
   drift_mean: 'Centre drift = ‖c − c′‖ / ‖r‖: how far the code\'s current posting centre c′ is from the centre c it was encoded against, relative to the code\'s residual length ‖r‖. 0 = the code sits in the posting it was encoded in. It measures CODE PRECISION, not partition quality. A rebuild RAISES it (moves every code, re-encodes none); only re-embedding (vector reindex-all) resets it.',
   drift_p90: '90th percentile of centre drift over the codes: the tail of the codes that have moved furthest.',
-  error_band: 'Mean error_bound of the 1-bit codes, in score units: the width of the estimator\'s confidence band, proportional to each code\'s residual length. Larger = less precise Pass-1 scores.',
+  error_band: 'Mean error_bound of the chunk (Pass-1) codes, in score units: the width of the estimator\'s confidence band, proportional to each code\'s residual length. Larger = less precise Pass-1 scores.',
   reencode: 'The (up to) 20 postings with the highest mean drift: where re-embedding would restore the most code precision. NOT a reason to rebuild.',
   // recall check
   verdict: 'read_in_full: every search already reads every posting, so no partition can change its results. ok: overlap@10 ≥ the threshold. below_target: searches miss part of what a full read finds. empty: nothing stored.',
@@ -109,7 +109,7 @@ const VTIP = {
   embedding_dim: 'Embedding dimension. Fixed for the store\'s life.',
   window_size: 'Sentences per document chunk (sliding window). Fixed: changing it would leave old documents with old chunks.',
   sliding_size: 'Sentences the chunk window advances by. Fixed.',
-  pass1_bits: 'Bits per dimension of chunk (Pass-1) codes. Read-only.',
+  pass1_bits: 'Bits per dimension of chunk (Pass-1) codes: 1 (default), 2 or 4. Chosen when semantic search is enabled, then fixed. Wider codes rank Pass-1 candidates better and keep more chunks in their nearest posting, at the cost of Pass-1 storage (about 1.7× at 2 bits, 3× at 4) and, at 4 bits, slower searches.',
   pass2_bits: 'Bits per dimension of whole-document (Pass-2) codes. Read-only.',
   pass2_centre: 'Centre whole-document codes are encoded against ("zero": no partition centre, so they never drift).',
   rotation_seed: 'Seed of the random rotation codes and queries are computed in. Read-only.',
@@ -839,7 +839,7 @@ function renderVopsCodes() {
   return `
     <div class="admin-card vops-wide vops-explain">
       <div class="admin-card-title">WHAT THESE MEASURE, AND WHAT THEY DO NOT</div>
-      <p>Every chunk is stored as a 1-bit <b>code</b>: its direction relative to a <b>centre</b>, the centre of the posting it was
+      <p>Every chunk is stored as a <b>code</b> (1, 2 or 4 bits per dimension, the store's <code>pass1_bits</code>): its direction relative to a <b>centre</b>, the centre of the posting it was
         written into. When maintenance (a split, merge or rebuild) moves a chunk to another posting, the code is <b>not</b>
         re-encoded: it keeps its own centre, and search scores it against that centre, so results stay correct. What changes is
         precision: a code encoded against a centre far from where it now sits is a coarser approximation.</p>
@@ -1066,13 +1066,13 @@ function renderVopsSettings() {
       <div class="tbl-wrap"><table class="tbl vops-settings">
         <thead><tr><th title="The setting's name in the store's schema (vector_index).">Setting</th><th title="This store's value. Highlighted where it differs from the server default.">This store</th><th title="What the server gives a store when it enables semantic search ([semantic_search] defaults).">Server default</th><th title="fixed: set once for the store's life. read-only: chosen by minnal. yes: change with the update_vector_search schema amendment; per request: overridable on one search or check.">Can change?</th><th title="What the setting does.">Meaning</th></tr></thead>
         <tbody>
-          ${group('Embedding and chunking', [
+          ${group('Embedding, chunking and code width', [
             row('embedding_model', s.embedding_model, undefined, 'fixed'),
             row('embedding_dim', s.embedding_dim, undefined, 'fixed'),
             row('window_size', ch.window_size, undefined, 'fixed'),
-            row('sliding_size', ch.sliding_size, undefined, 'fixed')])}
+            row('sliding_size', ch.sliding_size, undefined, 'fixed'),
+            row('pass1_bits', q.pass1_bits, undefined, 'fixed')])}
           ${group('Quantisation', [
-            row('pass1_bits', q.pass1_bits, undefined, 'read-only'),
             row('pass2_bits', q.pass2_bits, undefined, 'read-only'),
             row('pass2_centre', q.pass2_centre, undefined, 'read-only'),
             row('rotation_seed', q.rotation_seed, undefined, 'read-only')])}

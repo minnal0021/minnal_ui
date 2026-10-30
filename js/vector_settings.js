@@ -4,8 +4,9 @@
  * and set when semantic search is first enabled.
  *
  * What may change (minnal_db `doc_store/vector_settings.rs`):
- *   embedding_model, embedding_dim, chunking.*  fixed once semantic search is on
- *   quantisation.*                              read-only (rotation_seed may be
+ *   embedding_model, embedding_dim, chunking.*, fixed once semantic search is on
+ *   quantisation.pass1_bits (1, 2 or 4)
+ *   quantisation.* (the rest)                   read-only (rotation_seed may be
  *                                               chosen at enable time, then fixed)
  *   search.*, maintenance.*                     changeable any time:
  *       PATCH /stores/{ns}/schema {"op":"update_vector_search", search, maintenance}
@@ -19,20 +20,20 @@
 
 const VSET_GROUPS = [
   {
-    id: 'embedding', title: 'Embedding and chunking', rule: 'fixed',
-    ruleTip: 'Fixed for the life of the store: they decide what the stored vectors are. To change them, drop the vector index and enable it again.',
+    id: 'embedding', title: 'Embedding, chunking and code width', rule: 'fixed',
+    ruleTip: 'Fixed for the life of the store (kept if the vector index is dropped): they decide what the stored vectors are. To change them, create a new store.',
     fields: [
       { key: 'embedding_model', path: ['embedding_model'], type: 'model' },
       { key: 'embedding_dim',   path: ['embedding_dim'],   type: 'int' },
       { key: 'window_size',     path: ['chunking', 'window_size'],  type: 'int' },
       { key: 'sliding_size',    path: ['chunking', 'sliding_size'], type: 'int' },
+      { key: 'pass1_bits',      path: ['quantisation', 'pass1_bits'], type: 'choice', choices: [1, 2, 4] },
     ],
   },
   {
     id: 'quantisation', title: 'Quantisation', rule: 'read-only',
     ruleTip: 'Chosen by minnal. The rotation seed can be given when semantic search is enabled, then stays fixed.',
     fields: [
-      { key: 'pass1_bits',    path: ['quantisation', 'pass1_bits'],    type: 'int' },
       { key: 'pass2_bits',    path: ['quantisation', 'pass2_bits'],    type: 'int' },
       { key: 'pass2_centre',  path: ['quantisation', 'pass2_centre'],  type: 'str' },
       { key: 'rotation_seed', path: ['quantisation', 'rotation_seed'], type: 'seed' },
@@ -154,6 +155,12 @@ function vsetInput(prefix, f, value, placeholder) {
     return `<select id="${id}"><option value="true" ${value ? 'selected' : ''}>on</option>
       <option value="false" ${!value ? 'selected' : ''}>off</option></select>`;
   }
+  if (f.type === 'choice') {
+    // Fixed fields are only set at enable time, so there is no current value to select.
+    return `<select id="${id}">
+      <option value="">default${placeholder != null ? ` (${placeholder})` : ''}</option>
+      ${f.choices.map(c => `<option value="${c}">${c}</option>`).join('')}</select>`;
+  }
   const step = f.type === 'ratio' ? 'any' : '1';
   const kind = f.type === 'int' || f.type === 'ratio' ? `type="number" min="0" step="${step}"` : 'type="text"';
   return `<input id="${id}" ${kind} value="${value == null ? '' : esc(String(value))}" ${ph} />`;
@@ -166,7 +173,7 @@ function vsetRead(prefix, f) {
   const raw = el.value.trim();
   if (raw === '') return undefined;
   if (f.type === 'bool') return raw === 'true';
-  if (f.type === 'int') return Number.parseInt(raw, 10);
+  if (f.type === 'int' || f.type === 'choice') return Number.parseInt(raw, 10);
   if (f.type === 'ratio') return Number.parseFloat(raw);
   return raw;
 }
@@ -186,8 +193,8 @@ function showEditVectorSettingsModal(ns) {
     <div class="modal-title">Vector Index Settings — ${esc(ns)}</div>
     <p class="text-muted" style="margin:0 0 12px">
       Search defaults apply to every later search (each search can still override them).
-      Maintenance settings apply to later splits and merges. The embedding model, dimension
-      and chunking are fixed; to change them, drop the vector index and enable it again.
+      Maintenance settings apply to later splits and merges. The embedding model, dimension,
+      chunking and Pass-1 code width are fixed for the life of the store.
     </p>
     ${editable.map(g => `
       <div class="modal-section">
@@ -242,7 +249,7 @@ function renderVectorSpecForm(prefix) {
   return `
     <div id="${prefix}-vset" class="vset-spec">
       <div class="text-muted" style="font-size:12px;margin-bottom:8px">
-        Model, dimension and chunking are <strong>fixed</strong> once the store is created.
+        Model, dimension, chunking and Pass-1 code width are <strong>fixed</strong> once semantic search is enabled.
         Leave a field empty to use the server's default.
       </div>
       <div class="vset-form">
@@ -251,7 +258,7 @@ function renderVectorSpecForm(prefix) {
             <option value="gemma">gemma</option>
           </select></label>
         ${fixed.filter(f => f.key !== 'embedding_model').map(f => vsetFieldRow(prefix, f, undefined,
-          { embedding_dim: 768, window_size: 4, sliding_size: 2 }[f.key])).join('')}
+          { embedding_dim: 768, window_size: 4, sliding_size: 2, pass1_bits: 1 }[f.key])).join('')}
       </div>
       <details class="vset-more">
         <summary>Search, maintenance and rotation seed (optional; changeable later except the seed)</summary>
@@ -298,7 +305,7 @@ function onVectorSpecModelChange(prefix) {
 function collectVectorSpec(prefix) {
   const spec = {};
   const all = VSET_GROUPS.flatMap(g => g.fields)
-    .filter(f => f.type !== 'model' && (f.path[0] !== 'quantisation' || f.key === 'rotation_seed'));
+    .filter(f => f.type !== 'model' && (f.path[0] !== 'quantisation' || f.key === 'rotation_seed' || f.key === 'pass1_bits'));
   const model = document.getElementById(`${prefix}-embedding_model`)?.value.trim();
   if (model) spec.embedding_model = model;
   for (const f of all) {
