@@ -1041,8 +1041,9 @@ function showAddAttributeModal(ns) {
     <div class="modal-section">
       <div class="modal-section-title">EMBEDDING FIELDS</div>
       <p class="text-muted" style="margin:0 0 12px">
-        Each name declares a new <strong>str</strong> attribute that feeds the namespace's
-        single vector index. The text of all listed fields is embedded together for
+        Each name feeds the namespace's single vector index: an existing <strong>str</strong>
+        attribute (such as a field of a dropped vector index) is used as it is, and any other
+        name is declared as a new <strong>str</strong> attribute. The text of all listed fields is embedded together for
         semantic search. To change the field set later, drop the vector index and add it again.
       </p>
       <div id="vec-fields" class="field-builder"></div>
