@@ -247,9 +247,16 @@ const Api = (() => {
     req('GET', `/admin/indices/${enc(ns)}/vector/partition${codes ? '?codes=true' : ''}`);
   const vectorPostings = (ns, opts = {}) => {
     const p = new URLSearchParams();
-    for (const k of ['sort', 'order', 'cursor', 'limit']) if (opts[k] != null && opts[k] !== '') p.set(k, opts[k]);
+    for (const k of ['sort', 'order', 'cursor', 'limit', 'state']) if (opts[k] != null && opts[k] !== '') p.set(k, opts[k]);
     if (opts.codes) p.set('codes', 'true');
     return req('GET', `/admin/indices/${enc(ns)}/vector/postings?${p}`);
+  };
+  // centres: metadata only (no vectors); codes=true counts the chunk codes per centre (reads every code).
+  const vectorCentres = (ns, opts = {}) => {
+    const p = new URLSearchParams();
+    for (const k of ['sort', 'order', 'cursor', 'limit', 'state']) if (opts[k] != null && opts[k] !== '') p.set(k, opts[k]);
+    if (opts.codes) p.set('codes', 'true');
+    return req('GET', `/admin/indices/${enc(ns)}/vector/centres?${p}`);
   };
   const vectorRecallCheck = (ns, opts = {}) => {
     const p = new URLSearchParams();
@@ -307,7 +314,7 @@ const Api = (() => {
     // vector queue — per-entry
     vectorQueueGetEntry, vectorQueueDeleteEntry, vectorQueueRetryEntry,
     // vector index ops — partition, recall check, rebuild, history, settings
-    vectorPartition, vectorPostings, vectorRecallCheck, vectorRebuild, vectorHistory,
+    vectorPartition, vectorPostings, vectorCentres, vectorRecallCheck, vectorRebuild, vectorHistory,
     vectorServerSettings, vectorCorruptionMetricsNs,
   };
 })();

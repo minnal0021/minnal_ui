@@ -5,7 +5,7 @@
  * vector store: queue totals, indexing progress, corruption and the
  * retried-entries browser. With one selected, it shows that
  * store in detail: its queue, actions and queue browser (Overview), its
- * partition (postings, sizes, maintenance), its code metrics (centre
+ * partition (postings, sizes, maintenance), its centres, its code metrics (centre
  * drift and friends), the recall check that says whether a rebuild helps, the
  * rebuild itself, the recorded history of all three, and the store's
  * vector-index settings beside the server's defaults.
@@ -13,6 +13,7 @@
  * Endpoints (minnal branch dynamic-rabitq-index):
  *   GET  /admin/indices/{ns}/vector/partition[?codes=true]
  *   GET  /admin/indices/{ns}/vector/postings
+ *   GET  /admin/indices/{ns}/vector/centres
  *   GET  /admin/indices/{ns}/vector/recall-check
  *   POST /admin/indices/{ns}/vector/rebuild
  *   GET  /admin/indices/{ns}/vector/history
@@ -24,7 +25,7 @@
 
 const vops = {
   ns:          null,
-  sub:         'overview',   // overview | decision | partition | codes | postings | history | settings
+  sub:         'overview',   // overview | decision | partition | codes | postings | centres | history | settings
   queue:       null,         // this store's embedding-queue counts ({ pending, exhausted, … })
   progress:    null,         // this store's indexing progress
   partition:   null,         // GET partition (memory only)
@@ -35,7 +36,8 @@ const vops = {
   lastCheck:   null,         // the check run from this page, if any
   checking:    false,
   computingCodes: false,
-  postings:    { sort: 'id', order: 'asc', codes: false, limit: 100, stack: [null], idx: 0, data: null, next: null },
+  postings:    { sort: 'id', order: 'asc', state: 'active', codes: false, limit: 100, stack: [null], idx: 0, data: null, next: null },
+  centres:     { sort: 'id', order: 'asc', state: '', codes: false, limit: 100, stack: [null], idx: 0, data: null, next: null },
   allPostings: null,         // every posting (for the size histogram)
   historyKind: 'all',
   rebuildPoll: null,
@@ -202,6 +204,7 @@ function renderVectorIndexesTab() {
     ['partition', 'Partition'],
     ['codes', 'Code metrics'],
     ['postings', 'Postings'],
+    ['centres', 'Centres'],
     ['history', 'History'],
     ['settings', 'Settings'],
   ];
@@ -240,6 +243,7 @@ function resetVopsStore(ns) {
   vops.lastCheck = null;
   vops.allPostings = null;
   vops.postings = { ...vops.postings, stack: [null], idx: 0, data: null, next: null };
+  vops.centres = { ...vops.centres, stack: [null], idx: 0, data: null, next: null };
 }
 
 // ── All vector stores ────────────────────────────────────────────────────────
@@ -397,6 +401,7 @@ function switchVopsTab(id) {
   document.querySelectorAll('[data-vops-tab]').forEach(b => b.classList.toggle('active', b.dataset.vopsTab === id));
   renderVopsBody();
   if (id === 'postings' && !vops.postings.data) loadVopsPostings();
+  if (id === 'centres' && !vops.centres.data) loadVopsCentres();
   if (id === 'partition' && !vops.allPostings) loadVopsAllPostings();
 }
 
@@ -427,6 +432,7 @@ async function loadVectorOps() {
   if (pr.status === 'fulfilled') vops.progress = pr.value?.vector_progress?.find(x => x.namespace === ns) ?? null;
   renderVopsBody();
   if (vops.sub === 'postings') loadVopsPostings();
+  if (vops.sub === 'centres') loadVopsCentres();
   if (vops.sub === 'partition') loadVopsAllPostings();
   if (vops.partition?.rebuild?.state === 'running') startRebuildPoll();
 }
@@ -445,6 +451,7 @@ function renderVopsBody() {
     partition: renderVopsPartition,
     codes: renderVopsCodes,
     postings: renderVopsPostings,
+    centres: renderVopsCentres,
     history: renderVopsHistory,
     settings: renderVopsSettings,
   }[vops.sub];
@@ -909,7 +916,7 @@ async function computeVopsCodes() {
 async function loadVopsPostings() {
   const st = vops.postings;
   try {
-    const r = await Api.vectorPostings(vops.ns, { sort: st.sort, order: st.order, codes: st.codes, limit: st.limit, cursor: st.stack[st.idx] });
+    const r = await Api.vectorPostings(vops.ns, { sort: st.sort, order: st.order, state: st.state, codes: st.codes, limit: st.limit, cursor: st.stack[st.idx] });
     st.data = r;
     st.next = r.next_cursor ?? null;
     if (st.codes || st.sort === 'drift') {
@@ -947,6 +954,8 @@ function renderVopsPostings() {
         ${['id', 'entries', 'chunks', 'drift'].map(s => `<option ${s === st.sort ? 'selected' : ''}>${s}</option>`).join('')}</select></label>
       <label>Order <select onchange="setVopsPostings({order:this.value})">
         ${['asc', 'desc'].map(s => `<option ${s === st.order ? 'selected' : ''}>${s}</option>`).join('')}</select></label>
+      <label title="Only postings in this state. Retired postings are empty records kept for the split/merge lineage.">State <select onchange="setVopsPostings({state:this.value})">
+        ${[['', 'all'], ['active', 'active'], ['draining', 'draining'], ['retired', 'retired']].map(([v, l]) => `<option value="${v}" ${v === st.state ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
       <label title="Rows per page (at most 10,000).">Rows <input type="number" min="1" max="10000" value="${st.limit}" onchange="setVopsPostings({limit:this.value})"></label>
       <label title="Add each posting's code metrics. Reads every chunk code of the store (costly on large stores); sorting by drift implies it."><input type="checkbox" ${codes ? 'checked' : ''} onchange="setVopsPostings({codes:this.checked})"> Code metrics</label>
     </div>`;
@@ -954,7 +963,7 @@ function renderVopsPostings() {
   if (d.error) return head + `<div class="alert alert-error">${esc(d.error)}</div>`;
   const rows = d.results ?? [];
   return head + `
-    <div class="text-muted vops-note">${fmt(d.postings)} live postings, ${fmt(d.entries)} entries, ${fmt(d.chunks)} chunks. Retired postings are listed as the parents of the split/merge tree; they hold nothing.</div>
+    <div class="text-muted vops-note">${fmt(d.postings)} live postings, ${fmt(d.entries)} entries, ${fmt(d.chunks)} chunks${st.state ? `; ${fmt(d.matched ?? rows.length)} ${esc(st.state)} shown` : ''}. Retired postings are kept as the parents of the split/merge tree; they hold nothing.</div>
     <div class="tbl-wrap"><table class="tbl">
       <thead><tr>
         <th title="The posting's id (its key prefix).">Posting</th>
@@ -982,6 +991,83 @@ function renderVopsPostings() {
       <button class="btn btn-secondary btn-sm" onclick="vopsPostingsPage(-1)" ${st.idx === 0 ? 'disabled' : ''}>← Prev</button>
       <span class="text-muted">Page ${st.idx + 1}</span>
       <button class="btn btn-secondary btn-sm" onclick="vopsPostingsPage(1)" ${st.next ? '' : 'disabled'}>Next →</button>
+    </div>`;
+}
+
+// ── Centres sub-tab ──────────────────────────────────────────────────────────
+// Metadata only: the centre vectors themselves are never fetched.
+async function loadVopsCentres() {
+  const st = vops.centres;
+  try {
+    const r = await Api.vectorCentres(vops.ns, { sort: st.sort, order: st.order, state: st.state, codes: st.codes, limit: st.limit, cursor: st.stack[st.idx] });
+    st.data = r;
+    st.next = r.next_cursor ?? null;
+  } catch (e) {
+    st.data = { error: e.message };
+  }
+  if (vops.sub === 'centres') renderVopsBody();
+}
+
+function setVopsCentres(changes) {
+  Object.assign(vops.centres, changes, { stack: [null], idx: 0, data: null });
+  renderVopsBody();
+  loadVopsCentres();
+}
+function vopsCentresPage(dir) {
+  const st = vops.centres;
+  if (dir > 0 && st.next) { st.stack = st.stack.slice(0, st.idx + 1); st.stack.push(st.next); st.idx++; }
+  if (dir < 0 && st.idx > 0) st.idx--;
+  st.data = null;
+  renderVopsBody();
+  loadVopsCentres();
+}
+
+function renderVopsCentres() {
+  const st = vops.centres;
+  const d = st.data;
+  const codes = st.codes || st.sort === 'codes';
+  const head = `
+    <div class="vops-form vops-postings-ctl">
+      <label title="Order of the rows.">Sort <select onchange="setVopsCentres({sort:this.value})">
+        ${['id', 'codes', 'postings'].map(s => `<option ${s === st.sort ? 'selected' : ''}>${s}</option>`).join('')}</select></label>
+      <label>Order <select onchange="setVopsCentres({order:this.value})">
+        ${['asc', 'desc'].map(s => `<option ${s === st.order ? 'selected' : ''}>${s}</option>`).join('')}</select></label>
+      <label title="Only centres whose postings are in this state (the most live one when several name it). none: no posting names it.">State <select onchange="setVopsCentres({state:this.value})">
+        ${[['', 'all'], ['active', 'active'], ['draining', 'draining'], ['retired', 'retired'], ['none', 'none']].map(([v, l]) => `<option value="${v}" ${v === st.state ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
+      <label title="Rows per page (at most 10,000).">Rows <input type="number" min="1" max="10000" value="${st.limit}" onchange="setVopsCentres({limit:this.value})"></label>
+      <label title="Count the chunk codes still encoded against each centre. Reads every chunk code of the store (costly on large stores); sorting by codes implies it."><input type="checkbox" ${codes ? 'checked' : ''} onchange="setVopsCentres({codes:this.checked})"> Code counts</label>
+    </div>`;
+  if (!d) return head + '<div class="spinner"></div>';
+  if (d.error) return head + `<div class="alert alert-error">${esc(d.error)}</div>`;
+  const rows = d.results ?? [];
+  const bs = d.by_state ?? {};
+  const states = ['active', 'draining', 'retired', 'none'].filter(k => bs[k]).map(k => `${fmt(bs[k])} ${k}`).join(', ');
+  return head + `
+    <div class="text-muted vops-note">${fmt(d.centres)} centres (${states || 'none'})${st.state ? `; ${fmt(d.matched ?? rows.length)} ${esc(st.state)} shown` : ''}.
+      A chunk code keeps the centre it was encoded against when a split or rebuild moves it, so a retired posting's centre stays in use until those documents are re-embedded or deleted.
+      ${d.unused != null ? `<b>${fmt(d.unused)}</b> centre${d.unused === 1 ? '' : 's'} no live posting names and no code uses (could be reclaimed).` : 'Tick Code counts to see which centres are still in use.'}</div>
+    <div class="tbl-wrap"><table class="tbl">
+      <thead><tr>
+        <th title="The centre's id: what chunk codes store as centre_id.">Centre</th>
+        <th title="State of the posting(s) that name this centre as theirs (the most live one). none: no posting names it.">State</th>
+        <th title="Postings that encode new chunks against this centre (usually one).">Posting</th>
+        <th title="How that posting was created: root, split, rebuild or seed.">Created by</th>
+        <th title="Euclidean length of the centre vector. 0 is the zero centre of a store's first (root) posting.">Norm</th>
+        ${codes ? `<th title="Chunk codes encoded against this centre. 0 on a retired centre: nothing decodes against it any more.">Codes</th>
+          <th title="Live postings those codes are filed under (they move with splits and rebuilds; the centre does not).">Held in postings</th>` : ''}
+      </tr></thead>
+      <tbody>${rows.map(r => {
+        const dead = codes && r.codes === 0 && (r.state === 'retired' || r.state === 'none');
+        return `<tr class="${r.state === 'retired' || r.state === 'none' ? 'text-muted' : ''}">
+          <td>${r.centre_id}</td><td>${esc(r.state)}</td><td>${r.postings.length ? r.postings.join(', ') : '—'}</td><td>${esc(r.created_by)}</td>
+          <td>${num3(r.norm)}</td>
+          ${codes ? `<td>${dead ? '<span class="stat-val warn" title="No code uses it: reclaimable">0</span>' : fmt(r.codes)}</td><td>${fmt(r.code_postings)}</td>` : ''}
+        </tr>`; }).join('')}</tbody>
+    </table></div>
+    <div class="vops-pager">
+      <button class="btn btn-secondary btn-sm" onclick="vopsCentresPage(-1)" ${st.idx === 0 ? 'disabled' : ''}>← Prev</button>
+      <span class="text-muted">Page ${st.idx + 1}</span>
+      <button class="btn btn-secondary btn-sm" onclick="vopsCentresPage(1)" ${st.next ? '' : 'disabled'}>Next →</button>
     </div>`;
 }
 
