@@ -63,9 +63,10 @@ function renderVopsTrace() {
         </div>
         <div class="admin-card pt-panel" id="pt-panel"></div>
       </div>
-      <div class="pt-chart-title" title="Each probe's lowest and highest Pass-1 document score. The highest falls as probes reach postings farther from the query: they add less and less to Pass 1's candidates.">
-        Pass-1 score range by probe</div>
-      <svg id="pt-chart" class="pt-chart" role="img" aria-label="Lowest and highest Pass-1 score per probe"></svg>
+      <div class="pt-chart-title" title="Each probe's lowest and highest Pass-1 document score, and the Pass-2 score (what results are ranked by) of its highest-scoring document. The highest falls as probes reach postings farther from the query: they add less and less to Pass 1's candidates.">
+        Score by probe <span class="pt-key pt-key-band"></span>Pass-1 range
+        <span class="pt-key pt-key-max"></span>Pass-1 max <span class="pt-key pt-key-pass2"></span>Pass 2 of that document</div>
+      <svg id="pt-chart" class="pt-chart" role="img" aria-label="Pass-1 score range and the best document's Pass-2 score per probe"></svg>
     </div>` : ''}`;
 }
 
@@ -166,7 +167,8 @@ function drawProbeTrace() {
       tip.hidden = false;
       tip.innerHTML = `<b>Posting ${n.p.posting_id}</b> · probe ${n.p.rank + 1}<br>
         ${fmt(n.p.documents)} documents · distance ${num3(n.p.distance)}<br>
-        max ${num3(n.p.max?.dot_product)} · min ${num3(n.p.min?.dot_product)}`;
+        Pass 1: max ${num3(n.p.max?.dot_product)} · min ${num3(n.p.min?.dot_product)}<br>
+        Pass 2 of max doc: ${num3(n.p.max?.pass2)}`;
     })
     .on('mousemove', e => {
       const box = svgEl.parentElement.getBoundingClientRect();
@@ -200,7 +202,10 @@ function drawProbeTraceChart() {
   const scored = ps.filter(p => p.max);
   const x = d3.scaleLinear().domain([1, Math.max(ps.length, 2)]).range([m.l, W - m.r]);
   const y = d3.scaleLinear()
-    .domain([Math.min(0, d3.min(scored, p => p.min.dot_product) ?? 0), d3.max(scored, p => p.max.dot_product) ?? 1]).nice()
+    .domain([
+      Math.min(0, d3.min(scored, p => Math.min(p.min.dot_product, p.max.pass2 ?? Infinity)) ?? 0),
+      d3.max(scored, p => Math.max(p.max.dot_product, p.max.pass2 ?? -Infinity)) ?? 1,
+    ]).nice()
     .range([H - m.b, m.t]);
   svg.append('g').attr('class', 'pt-axis').attr('transform', `translate(0,${H - m.b})`)
     .call(d3.axisBottom(x).ticks(Math.min(ps.length, 10)).tickFormat(d3.format('d')));
@@ -211,6 +216,8 @@ function drawProbeTraceChart() {
     .attr('d', d3.area().x(p => x(p.rank + 1)).y0(p => y(p.min.dot_product)).y1(p => y(p.max.dot_product)));
   svg.append('path').attr('class', 'pt-max-line').datum(scored)
     .attr('d', d3.line().x(p => x(p.rank + 1)).y(p => y(p.max.dot_product)));
+  svg.append('path').attr('class', 'pt-pass2-line').datum(scored.filter(p => p.max.pass2 != null))
+    .attr('d', d3.line().x(p => x(p.rank + 1)).y(p => y(p.max.pass2)));
   svg.append('line').attr('class', 'pt-chart-cursor').attr('y1', m.t).attr('y2', H - m.b);
   // Click or drag on the chart to move the probe cursor.
   const pick = (e) => setProbeTraceRank(Math.round(x.invert(d3.pointer(e)[0])) - 1);
@@ -253,6 +260,7 @@ function renderProbeTracePanel(p, isCurrent) {
   const idLink = (s) => (s
     ? `<a class="pt-doc" onclick='showProbeTraceDoc(${JSON.stringify(s.id)})' title="Show the document">${esc(String(s.id))}</a>`
     : '—');
+  const pass2Tip = 'The document\'s Pass-2 score: its whole-document code against the query, what search results are ranked by.';
   const swatch = (s) => (s ? `<span class="pt-swatch" style="background:${ptrace.color(s.dot_product)}"></span>` : '');
   el.innerHTML = `
     <div class="admin-card-title">${isCurrent ? 'CURRENT PROBE' : 'SELECTED POSTING'}</div>
@@ -263,8 +271,10 @@ function renderProbeTracePanel(p, isCurrent) {
     ${vrow('Documents', fmt(p.documents), '', 'Documents with chunks in this posting that were scored.')}
     ${vrow('Max score', `${swatch(p.max)}${num3(p.max?.dot_product)}`, '', 'Highest Pass-1 score in the posting: its best document\'s best chunk.')}
     ${vrow('Max doc', idLink(p.max))}
+    ${vrow('Max doc Pass 2', num3(p.max?.pass2), '', pass2Tip)}
     ${vrow('Min score', num3(p.min?.dot_product), '', 'Lowest Pass-1 score in the posting (each document by its best chunk here).')}
     ${vrow('Min doc', idLink(p.min))}
+    ${vrow('Min doc Pass 2', num3(p.min?.pass2), '', pass2Tip)}
     <div class="text-muted pt-panel-note">${fmt(d.active_postings)} active postings · ${d.pass1_bits}-bit Pass-1 codes</div>`;
 }
 
