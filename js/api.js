@@ -264,6 +264,13 @@ const Api = (() => {
       if (opts[k] != null && opts[k] !== '') p.set(k, opts[k]);
     return req('GET', `/admin/indices/${enc(ns)}/vector/recall-check?${p}`);
   };
+  // probe-trace: one query's probed postings, nearest first, with each one's
+  // document count and lowest/highest Pass-1 score. Costs one Pass 1.
+  const vectorProbeTrace = (ns, query, nProbes) => {
+    const p = new URLSearchParams({ query });
+    if (nProbes != null) p.set('n_probes', nProbes);
+    return req('GET', `/admin/indices/${enc(ns)}/vector/probe-trace?${p}`);
+  };
   const vectorRebuild = (ns, postings) =>
     req('POST', `/admin/indices/${enc(ns)}/vector/rebuild`, postings ? { postings } : undefined);
   const vectorHistory = (ns, kind, limit) => {
@@ -314,7 +321,7 @@ const Api = (() => {
     // vector queue — per-entry
     vectorQueueGetEntry, vectorQueueDeleteEntry, vectorQueueRetryEntry,
     // vector index ops — partition, recall check, rebuild, history, settings
-    vectorPartition, vectorPostings, vectorCentres, vectorRecallCheck, vectorRebuild, vectorHistory,
+    vectorPartition, vectorPostings, vectorCentres, vectorRecallCheck, vectorProbeTrace, vectorRebuild, vectorHistory,
     vectorServerSettings, vectorCorruptionMetricsNs,
   };
 })();

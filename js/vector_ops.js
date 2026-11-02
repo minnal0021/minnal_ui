@@ -205,6 +205,7 @@ function renderVectorIndexesTab() {
     ['codes', 'Code metrics'],
     ['postings', 'Postings'],
     ['centres', 'Centres'],
+    ['trace', 'Probe trace'],
     ['history', 'History'],
     ['settings', 'Settings'],
   ];
@@ -234,6 +235,7 @@ function refreshVectorIndexes() {
 /** Forget everything loaded for the previous store. */
 function resetVopsStore(ns) {
   vops.ns = ns;
+  resetProbeTrace(ns);
   if (vops.rebuildPoll) { clearInterval(vops.rebuildPoll); vops.rebuildPoll = null; }
   vops.partition = null;
   vops.history = [];
@@ -454,8 +456,11 @@ function renderVopsBody() {
     centres: renderVopsCentres,
     history: renderVopsHistory,
     settings: renderVopsSettings,
+    trace: renderVopsTrace,
   }[vops.sub];
+  if (vops.sub !== 'trace') stopProbeTracePlay();
   body.innerHTML = r();
+  if (vops.sub === 'trace') drawProbeTrace();
 }
 
 // ── History helpers ──────────────────────────────────────────────────────────

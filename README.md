@@ -205,6 +205,14 @@ split and merge as data arrives. The store view answers one question above all:
   and calls for re-embedding (vector reindex-all), never for a rebuild; a rebuild
   raises it.
 - **Postings** — every posting, sortable, with its code metrics on request.
+- **Probe trace** — type a query and a number of probes to watch a search's
+  first pass walk the partition. The postings it probes appear one at a time
+  around the query in a d3 graph: link length is the posting's distance from the
+  query, size its document count, colour its highest score. A chart below plots
+  each probe's lowest and highest score, so you can see far postings add less
+  and less. Click a posting for its details; click a document id to open it.
+  The layout is computed once per trace, so stepping through up to 1,024
+  postings stays immediate.
 - **History** — recall checks and rebuilds as a timeline, with the change in
   overlap@10 between comparable checks (same seed, query source and `max_probes`).
 - **Settings** — the store's `vector_index` settings beside the server's
@@ -213,7 +221,8 @@ split and merge as data arrives. The store view answers one question above all:
 
 Every label has a tooltip. The store view needs a minnal server built from its
 `dynamic-rabitq-index` branch (the partition, recall-check, rebuild, history and
-settings endpoints).
+settings endpoints); Probe trace needs one with
+`GET /admin/indices/{ns}/vector/probe-trace`.
 
 ---
 
@@ -227,6 +236,8 @@ minnal_ui/
 │   ├── api.js      # Thin async wrapper over the minnal REST API
 │   ├── app.js      # UI logic, rendering, event handling
 │   ├── vector_ops.js # Admin → Vector Indexes
+│   ├── probe_trace.js # Admin → Vector Indexes → Probe trace (d3)
+│   ├── vendor/d3.min.js # d3 v7.9.0, vendored so the UI works offline
 │   └── vector_settings.js # A store's vector-index settings: Schema tab, create/enable forms, edit
 ├── img/logo.svg    # மின்னல் logo
 ├── server.py       # Static file server + /stores,/kv-stores,/admin proxy
