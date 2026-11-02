@@ -70,6 +70,11 @@ function renderVopsTrace() {
         <input id="pt-rank" class="pt-rank" type="range" min="1" max="${n}" value="${Math.min(ptrace.rank + 1, n)}"
                oninput="setProbeTraceRank(this.valueAsNumber - 1)" ${n ? '' : 'disabled'}>
         <span class="pt-rank-label" id="pt-rank-label"></span>
+        <span class="pt-store-note">
+          <span title="Postings (clusters) the store's partition has, not counting retired ones. Probes are numbered 1 to ${fmt(d.active_postings)} by distance from the query.">${fmt(d.active_postings)} active postings</span>
+          · <span title="Bits per dimension of the store's Pass-1 chunk codes (its pass1_bits: 1, 2 or 4). Fewer bits make Pass-1 scores rougher estimates.">${d.pass1_bits}-bit Pass-1 codes</span>
+          ${d.baseline ? `· <span title="Nearest postings the store's normal search reads (its max_probes, or every posting of a smaller store). The chart's dotted line marks where it stops; postings past it are never read by a search.">search probes ${fmt(d.baseline.n_probes)}</span>` : ''}
+        </span>
       </div>
       <div class="pt-layout">
         <div class="pt-graph-wrap">
@@ -318,16 +323,20 @@ function renderProbeTracePanel(p, isCurrent) {
   const idLink = (s) => (s
     ? `<a class="pt-doc" onclick='showProbeTraceDoc(${JSON.stringify(s.id)})' title="Show the document">${esc(String(s.id))}</a>`
     : '—');
-  const pass2Tip = 'The document\'s Pass-2 score: its whole-document code against the query, what search results are ranked by.';
   const swatch = (s) => (s ? `<span class="pt-swatch" style="background:${ptrace.color(s.dot_product)}"></span>` : '');
   const bar = d.baseline?.lowest_pass2 ?? null;
-  const returnedTip = `Whether the store's own search (${fmt(d.baseline?.n_probes)} probes, top_k ${fmt(d.baseline?.top_k)}) returns the document. Its last result scores ${num3(bar)} in Pass 2: a document above that but not returned was missed, because Pass 1 never made it a candidate.`;
-  const returned = (s, what) => {
-    if (s?.in_results == null) return '';
-    const missed = !s.in_results && bar != null && s.pass2 != null && s.pass2 > bar;
-    const v = s.in_results ? 'yes' : missed ? '<span class="pt-missed-text">no — missed</span>' : 'no';
-    return vrow(`${what} returned`, v, '', returnedTip);
+  const inResultsTip = `Whether the store's own search for this query (${fmt(d.baseline?.n_probes)} probes, top_k ${fmt(d.baseline?.top_k)}) returns the document. Its last result scores ${num3(bar)} in Pass 2: a document above that but not returned was missed, because Pass 1 never made it a candidate.`;
+  const inResults = (s) => {
+    if (s?.in_results == null) return '—';
+    if (s.in_results) return 'yes';
+    const missed = bar != null && s.pass2 != null && s.pass2 > bar;
+    return missed ? '<span class="pt-missed-text" title="Scores above the last result in Pass 2, but the search does not return it">no, missed</span>' : 'no';
   };
+  // The posting's two reported documents side by side: one row per measure.
+  const pair = (label, tip, cell) => `
+      <tr><th scope="row"><span class="stat-key" title="${esc(tip)}">${label}</span></th>
+        <td class="stat-val">${cell(p.max)}</td><td class="stat-val">${cell(p.min)}</td></tr>`;
+  const showInResults = p.max?.in_results != null || p.min?.in_results != null;
   el.innerHTML = `
     <div class="admin-card-title">${isCurrent ? 'CURRENT PROBE' : 'SELECTED POSTING'}</div>
     ${vrow('Probe', `${fmt(p.rank + 1)} of ${fmt(d.active_postings)}`, '', 'Rank by distance from the query; 1 is the nearest posting.')}
@@ -335,15 +344,17 @@ function renderProbeTracePanel(p, isCurrent) {
     ${vrow('Centre', p.centre_id ?? '—', '', 'The centre new codes in this posting are encoded against.')}
     ${vrow('Distance', num3(p.distance), '', 'Euclidean distance from the query to the posting\'s routing centroid: what probing ranks postings by.')}
     ${vrow('Documents', fmt(p.documents), '', 'Documents with chunks in this posting that were scored.')}
-    ${vrow('Max score', `${swatch(p.max)}${num3(p.max?.dot_product)}`, '', 'Highest Pass-1 score in the posting: its best document\'s best chunk.')}
-    ${vrow('Max doc', idLink(p.max))}
-    ${vrow('Max doc Pass 2', num3(p.max?.pass2), '', pass2Tip)}
-    ${returned(p.max, 'Max doc')}
-    ${vrow('Min score', num3(p.min?.dot_product), '', 'Lowest Pass-1 score in the posting (each document by its best chunk here).')}
-    ${vrow('Min doc', idLink(p.min))}
-    ${vrow('Min doc Pass 2', num3(p.min?.pass2), '', pass2Tip)}
-    ${returned(p.min, 'Min doc')}
-    <div class="text-muted pt-panel-note">${fmt(d.active_postings)} active postings · ${d.pass1_bits}-bit Pass-1 codes${d.baseline ? ` · search probes ${fmt(d.baseline.n_probes)}` : ''}</div>`;
+    <table class="pt-pair">
+      <thead><tr><th></th>
+        <th scope="col"><span class="stat-key" title="The document with the highest Pass-1 score in this posting (by its best chunk here).">Max</span></th>
+        <th scope="col"><span class="stat-key" title="The document with the lowest Pass-1 score in this posting (each document by its best chunk here).">Min</span></th></tr></thead>
+      <tbody>
+      ${pair('Document', 'The document\'s id. Click it to open the document.', idLink)}
+      ${pair('Pass-1 score', 'The document\'s best chunk here, scored with the store\'s Pass-1 codes against the query. The node\'s colour is the Max score.', (s) => (s ? `${s === p.max ? swatch(s) : ''}${num3(s.dot_product)}` : '—'))}
+      ${pair('Pass-2 score', 'The document\'s Pass-2 score: its whole-document code against the query, what search results are ranked by.', (s) => num3(s?.pass2))}
+      ${showInResults ? pair('In search results', inResultsTip, inResults) : ''}
+      </tbody>
+    </table>`;
 }
 
 async function showProbeTraceDoc(id) {
