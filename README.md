@@ -205,14 +205,19 @@ split and merge as data arrives. The store view answers one question above all:
   and calls for re-embedding (vector reindex-all), never for a rebuild; a rebuild
   raises it.
 - **Postings** — every posting, sortable, with its code metrics on request.
-- **Probe trace** — type a query and a number of probes to watch a search's
-  first pass walk the partition. The postings it probes appear one at a time
-  around the query in a d3 graph: link length is the posting's distance from the
-  query, size its document count, colour its highest score. A chart below plots
-  each probe's lowest and highest score, so you can see far postings add less
-  and less. Click a posting for its details; click a document id to open it.
-  The layout is computed once per trace, so stepping through up to 1,024
-  postings stays immediate.
+- **Probe trace** — type a query and a window of probes (say 1 to 256, or 300
+  to 1,000) to watch a search's first pass walk the partition. Probes are
+  numbered by distance from the query, 1 the nearest, and a window holds up to
+  1,024 of them, so you can look anywhere in a large partition. The window's
+  postings appear one at a time around the query in a d3 graph: link length is
+  the posting's distance from the query, size its document count, colour its
+  highest score. A chart below plots each probe's lowest and highest score, a
+  line where the store's own search stops probing, and a line at the score of
+  its last result. A red dot (and a red ring in the graph) marks a posting whose
+  best document scores above that line but is not returned: the search missed
+  it. Click a posting for its details; click a document id to open it. The
+  layout is computed once per trace, so stepping through a window stays
+  immediate.
 - **History** — recall checks and rebuilds as a timeline, with the change in
   overlap@10 between comparable checks (same seed, query source and `max_probes`).
 - **Settings** — the store's `vector_index` settings beside the server's

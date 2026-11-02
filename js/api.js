@@ -266,9 +266,11 @@ const Api = (() => {
   };
   // probe-trace: one query's probed postings, nearest first, with each one's
   // document count and lowest/highest Pass-1 score. Costs one Pass 1.
-  const vectorProbeTrace = (ns, query, nProbes) => {
+  // start/end: probe ranks start..end (0 is the nearest posting, end exclusive).
+  const vectorProbeTrace = (ns, query, start, end) => {
     const p = new URLSearchParams({ query });
-    if (nProbes != null) p.set('n_probes', nProbes);
+    if (start != null) p.set('start', start);
+    if (end != null) p.set('end', end);
     return req('GET', `/admin/indices/${enc(ns)}/vector/probe-trace?${p}`);
   };
   const vectorRebuild = (ns, postings) =>
