@@ -1,7 +1,11 @@
 // ── Probe trace sub-tab ──────────────────────────────────────────────────────
-// One query's walk through a store's IVF partition: the postings Pass 1 probes,
-// nearest first, each with its document count and its lowest and highest
-// Pass-1 score (GET /admin/indices/{ns}/vector/probe-trace).
+// One query's walk through a store's IVF partition: a window of the postings in
+// probe order (nearest first), each with its document count and its lowest and
+// highest Pass-1 score, plus a normal search of the same query: the Pass-2 score
+// of its last result, and whether it returns each reported document
+// (GET /admin/indices/{ns}/vector/probe-trace).
+// The window can sit anywhere in the order but is at most 1,024 postings wide,
+// what the graph shows usefully.
 //
 // Drawn with d3 as a force-directed graph: the query in the middle and one node
 // per probed posting, linked to the query at a length set by its distance. The
@@ -11,17 +15,24 @@
 const ptrace = {
   ns: null,
   query: '',
-  nProbes: null,
+  from: null,       // first probe shown in the form, 1-based (API start = from - 1)
+  to: null,         // last probe, inclusive (API end = to)
   data: null,       // the endpoint's response
   layout: null,     // { nodes, links } with fixed positions, built once per trace
-  rank: 0,          // probes shown: ranks 0..rank
-  selected: null,   // posting rank shown in the side panel (null: the current probe)
+  rank: 0,          // index into the window: its postings 0..rank are shown
+  selected: null,   // window index shown in the side panel (null: the current probe)
   timer: null,
   loading: false,
   error: null,
 };
 
-const PT_MAX_PROBES = 1024;
+const PT_MAX_WINDOW = 1024;
+
+/** A posting's best document scores above the search's last result, yet the search does not return it. */
+function probeTraceMissed(p, data = ptrace.data) {
+  const bar = data?.baseline?.lowest_pass2;
+  return bar != null && p.max?.in_results === false && p.max.pass2 != null && p.max.pass2 > bar;
+}
 
 function resetProbeTrace(ns) {
   stopProbeTracePlay();
@@ -31,18 +42,23 @@ function resetProbeTrace(ns) {
 function renderVopsTrace() {
   if (ptrace.ns !== vops.ns) resetProbeTrace(vops.ns);
   const postings = vops.partition?.postings ?? null;
-  const dflt = ptrace.nProbes ?? Math.min(effectiveProbes(vopsSettings(), postings ?? Infinity) ?? 64, PT_MAX_PROBES);
+  const from = ptrace.from ?? 1;
+  const to = ptrace.to ?? Math.min(effectiveProbes(vopsSettings(), postings ?? Infinity) ?? 64, PT_MAX_WINDOW);
+  const maxAttr = postings != null ? `max="${postings}"` : '';
+  const searchTip = postings == null ? 'its max_probes' : `${effectiveProbes(vopsSettings(), postings)} of ${postings}`;
   const d = ptrace.data;
   const n = d?.postings?.length ?? 0;
   return `
     <div class="section">
       <div class="section-header"><span class="section-title"
-        title="Embeds the query as a search does, then scores every document in the probed postings with the store's Pass-1 codes. Ranks nothing.">PROBE TRACE</span></div>
+        title="Embeds the query as a search does, ranks every posting by distance from it, then scores every document in the chosen window of postings with the store's Pass-1 codes. Also runs the store's own search, for the score its last result has.">PROBE TRACE</span></div>
       <form class="pt-form" onsubmit="event.preventDefault(); runProbeTrace()">
         <input id="pt-query" class="pt-query" type="text" placeholder="Query text" value="${esc(ptrace.query)}" required>
-        <label class="pt-label" title="Postings to probe, nearest first (1–${PT_MAX_PROBES}). The store probes ${postings == null ? 'its max_probes' : `${effectiveProbes(vopsSettings(), postings)} of ${postings}`} on a search.">
-          Probes <input id="pt-probes" type="number" min="1" max="${PT_MAX_PROBES}" value="${dflt}">
+        <label class="pt-label" title="Probes are numbered by distance from the query: 1 is the nearest posting${postings != null ? `, ${postings} the farthest` : ''}. A window holds up to ${fmt(PT_MAX_WINDOW)} probes. The store probes ${searchTip} on a search.">
+          Probes <input id="pt-from" type="number" min="1" ${maxAttr} value="${from}" oninput="probeTraceFromChanged()">
+          to <input id="pt-to" type="number" min="1" ${maxAttr} value="${to}">
         </label>
+        <span class="text-muted pt-hint">${postings != null ? `of ${fmt(postings)} postings · ` : ''}up to ${fmt(PT_MAX_WINDOW)} at a time</span>
         <button class="btn btn-accent" type="submit" ${ptrace.loading ? 'disabled' : ''}>${ptrace.loading ? 'Tracing…' : 'Trace'}</button>
       </form>
       ${ptrace.error ? `<div class="alert alert-error">${esc(ptrace.error)}</div>` : ''}
@@ -65,26 +81,44 @@ function renderVopsTrace() {
       </div>
       <div class="pt-chart-title" title="Each probe's lowest and highest Pass-1 document score, and the Pass-2 score (what results are ranked by) of its highest-scoring document. The highest falls as probes reach postings farther from the query: they add less and less to Pass 1's candidates.">
         Score by probe <span class="pt-key pt-key-band"></span>Pass-1 range
-        <span class="pt-key pt-key-max"></span>Pass-1 max <span class="pt-key pt-key-pass2"></span>Pass 2 of that document</div>
+        <span class="pt-key pt-key-max"></span>Pass-1 max <span class="pt-key pt-key-pass2"></span>Pass 2 of that document
+        ${d.baseline?.lowest_pass2 != null ? `<span class="pt-key pt-key-base"></span><span title="The Pass-2 score of the last of the ${fmt(d.baseline.results)} results the store's own search returns for this query (top_k ${fmt(d.baseline.top_k)}, ${fmt(d.baseline.n_probes)} probes). A document must score above it to be returned.">lowest search result</span>
+        <span class="pt-key-dot"></span><span title="The posting's highest-scoring document scores above the lowest search result in Pass 2, but the search does not return it: Pass 1 never made it a candidate. Only each posting's lowest and highest Pass-1 documents are checked.">missed by the search</span>` : ''}</div>
       <svg id="pt-chart" class="pt-chart" role="img" aria-label="Pass-1 score range and the best document's Pass-2 score per probe"></svg>
     </div>` : ''}`;
 }
 
+/** Keep the window valid when its first probe moves: "to" follows within the limit. */
+function probeTraceFromChanged() {
+  const fromEl = document.getElementById('pt-from'), toEl = document.getElementById('pt-to');
+  const from = fromEl?.valueAsNumber, to = toEl?.valueAsNumber;
+  if (!(from >= 1) || !toEl) return;
+  const last = vops.partition?.postings ?? Infinity;
+  if (!(to >= from) || to - from + 1 > PT_MAX_WINDOW) toEl.value = Math.min(from + PT_MAX_WINDOW - 1, last);
+}
+
 async function runProbeTrace() {
   const query = document.getElementById('pt-query')?.value.trim();
-  const nProbes = document.getElementById('pt-probes')?.valueAsNumber;
+  const from = document.getElementById('pt-from')?.valueAsNumber;
+  const to = document.getElementById('pt-to')?.valueAsNumber;
   if (!query) return;
-  if (!(nProbes >= 1 && nProbes <= PT_MAX_PROBES)) {
-    ptrace.error = `Probes must be between 1 and ${PT_MAX_PROBES}.`;
+  const postings = vops.partition?.postings;
+  const problem = !(Number.isInteger(from) && Number.isInteger(to) && from >= 1) ? 'Probes must be whole numbers from 1.'
+    : to < from ? `The last probe (${to}) is before the first (${from}).`
+    : to - from + 1 > PT_MAX_WINDOW ? `A window holds at most ${fmt(PT_MAX_WINDOW)} probes; ${from} to ${to} is ${fmt(to - from + 1)}.`
+    : postings != null && to > postings ? `The store has ${fmt(postings)} postings; the last probe can be at most ${fmt(postings)}.`
+    : null;
+  if (problem) {
+    ptrace.error = problem;
     renderVopsBody();
     return;
   }
   stopProbeTracePlay();
-  Object.assign(ptrace, { query, nProbes, loading: true, error: null });
+  Object.assign(ptrace, { query, from, to, loading: true, error: null });
   renderVopsBody();
   const ns = ptrace.ns;
   try {
-    const data = await Api.vectorProbeTrace(ns, query, nProbes);
+    const data = await Api.vectorProbeTrace(ns, query, from - 1, to);
     if (ns !== ptrace.ns) return;
     Object.assign(ptrace, { data, layout: buildProbeTraceLayout(data), rank: 0, selected: null });
   } catch (e) {
@@ -111,8 +145,9 @@ function buildProbeTraceLayout(data) {
   ps.forEach((p, i) => {
     // Seed on a spiral by rank so the simulation settles fast and near probes start near the middle.
     const a = i * 2.39996, rr = dist(p.distance ?? dists[0] ?? 0);
-    nodes.push({ id: p.posting_id, p, x: rr * Math.cos(a), y: rr * Math.sin(a), r: docs(p.documents) });
-    links.push({ source: 'q', target: p.posting_id, len: rr, rank: p.rank });
+    // i: position in the window, what stepping counts in (p.rank is the absolute probe rank).
+    nodes.push({ id: p.posting_id, p, i, x: rr * Math.cos(a), y: rr * Math.sin(a), r: docs(p.documents) });
+    links.push({ source: 'q', target: p.posting_id, len: rr, i });
   });
   const sim = d3.forceSimulation(nodes)
     .force('link', d3.forceLink(links).id(d => d.id).distance(l => l.len).strength(0.9))
@@ -163,12 +198,14 @@ function drawProbeTrace() {
     .attr('cx', n => n.x).attr('cy', n => n.y).attr('r', n => n.r)
     .attr('fill', n => (n.p.max ? color(n.p.max.dot_product) : 'transparent'))
     .classed('pt-empty', n => !n.p.documents)
+    .classed('pt-missed', n => probeTraceMissed(n.p))
     .on('mouseenter', (e, n) => {
       tip.hidden = false;
-      tip.innerHTML = `<b>Posting ${n.p.posting_id}</b> · probe ${n.p.rank + 1}<br>
+      tip.innerHTML = `<b>Posting ${n.p.posting_id}</b> · probe ${fmt(n.p.rank + 1)}<br>
         ${fmt(n.p.documents)} documents · distance ${num3(n.p.distance)}<br>
         Pass 1: max ${num3(n.p.max?.dot_product)} · min ${num3(n.p.min?.dot_product)}<br>
-        Pass 2 of max doc: ${num3(n.p.max?.pass2)}`;
+        Pass 2 of max doc: ${num3(n.p.max?.pass2)}${n.p.max?.in_results != null ? (n.p.max.in_results ? ' · in the results' : ' · not in the results') : ''}
+        ${probeTraceMissed(n.p) ? '<br><b class="pt-missed-text">Missed: scores above the lowest result</b>' : ''}`;
     })
     .on('mousemove', e => {
       const box = svgEl.parentElement.getBoundingClientRect();
@@ -176,7 +213,7 @@ function drawProbeTrace() {
       tip.style.top = `${e.clientY - box.top + 12}px`;
     })
     .on('mouseleave', () => { tip.hidden = true; })
-    .on('click', (e, n) => { ptrace.selected = n.p.rank; updateProbeTrace(); });
+    .on('click', (e, n) => { ptrace.selected = n.i; updateProbeTrace(); });
 
   g.append('circle').attr('class', 'pt-query-node').attr('r', 9);
   g.append('text').attr('class', 'pt-query-label').attr('y', -14).attr('text-anchor', 'middle').text('query');
@@ -200,15 +237,27 @@ function drawProbeTraceChart() {
   const svg = d3.select(svgEl).attr('viewBox', [0, 0, W, H]);
   svg.selectAll('*').remove();
   const scored = ps.filter(p => p.max);
-  const x = d3.scaleLinear().domain([1, Math.max(ps.length, 2)]).range([m.l, W - m.r]);
+  const base = ptrace.data.baseline;
+  const bar = base?.lowest_pass2 ?? null;
+  // Probe numbers on the axis are absolute (1 is the nearest posting), whatever the window.
+  const first = ps[0].rank + 1, last = ps[ps.length - 1].rank + 1;
+  const x = d3.scaleLinear().domain([first, Math.max(last, first + 1)]).range([m.l, W - m.r]);
   const y = d3.scaleLinear()
     .domain([
-      Math.min(0, d3.min(scored, p => Math.min(p.min.dot_product, p.max.pass2 ?? Infinity)) ?? 0),
-      d3.max(scored, p => Math.max(p.max.dot_product, p.max.pass2 ?? -Infinity)) ?? 1,
+      Math.min(0, d3.min(scored, p => Math.min(p.min.dot_product, p.max.pass2 ?? Infinity)) ?? 0, bar ?? Infinity),
+      Math.max(d3.max(scored, p => Math.max(p.max.dot_product, p.max.pass2 ?? -Infinity)) ?? 1, bar ?? -Infinity),
     ]).nice()
     .range([H - m.b, m.t]);
   svg.append('g').attr('class', 'pt-axis').attr('transform', `translate(0,${H - m.b})`)
     .call(d3.axisBottom(x).ticks(Math.min(ps.length, 10)).tickFormat(d3.format('d')));
+  // Where the store's own search stops probing, when that falls inside the window.
+  const edge = base?.n_probes;
+  if (edge != null && edge >= first && edge < last) {
+    const ex = (x(edge) + x(edge + 1)) / 2;
+    svg.append('line').attr('class', 'pt-search-edge').attr('x1', ex).attr('x2', ex).attr('y1', m.t).attr('y2', H - m.b);
+    svg.append('text').attr('class', 'pt-axis-label').attr('x', ex + 4).attr('y', m.t + 10)
+      .text(`search stops (${fmt(edge)} probes)`);
+  }
   svg.append('g').attr('class', 'pt-axis').attr('transform', `translate(${m.l},0)`).call(d3.axisLeft(y).ticks(5));
   svg.append('text').attr('class', 'pt-axis-label').attr('x', W - m.r).attr('y', H - 2).attr('text-anchor', 'end').text('probe (nearest first)');
   svg.append('line').attr('class', 'pt-zero').attr('x1', m.l).attr('x2', W - m.r).attr('y1', y(0)).attr('y2', y(0));
@@ -218,38 +267,47 @@ function drawProbeTraceChart() {
     .attr('d', d3.line().x(p => x(p.rank + 1)).y(p => y(p.max.dot_product)));
   svg.append('path').attr('class', 'pt-pass2-line').datum(scored.filter(p => p.max.pass2 != null))
     .attr('d', d3.line().x(p => x(p.rank + 1)).y(p => y(p.max.pass2)));
+  if (bar != null) {
+    svg.append('line').attr('class', 'pt-baseline-line').attr('x1', m.l).attr('x2', W - m.r).attr('y1', y(bar)).attr('y2', y(bar));
+  }
+  svg.append('g').selectAll('circle').data(scored.filter(p => probeTraceMissed(p))).join('circle')
+    .attr('class', 'pt-missed-dot').attr('r', 3.5).attr('cx', p => x(p.rank + 1)).attr('cy', p => y(p.max.pass2));
   svg.append('line').attr('class', 'pt-chart-cursor').attr('y1', m.t).attr('y2', H - m.b);
   // Click or drag on the chart to move the probe cursor.
-  const pick = (e) => setProbeTraceRank(Math.round(x.invert(d3.pointer(e)[0])) - 1);
+  const pick = (e) => setProbeTraceRank(Math.round(x.invert(d3.pointer(e)[0])) - first);
   svg.append('rect').attr('x', m.l).attr('y', m.t).attr('width', W - m.l - m.r).attr('height', H - m.t - m.b)
     .attr('fill', 'transparent').style('cursor', 'ew-resize')
     .on('click', pick).call(d3.drag().on('drag', pick));
   ptrace.chartX = x;
 }
 
-/** Show probes 0..rank: toggles visibility only, no re-layout. */
+/** Show the window's postings 0..rank: toggles visibility only, no re-layout. */
 function updateProbeTrace() {
   const L = ptrace.layout, ps = ptrace.data?.postings ?? [];
   if (!L || !ps.length) return;
   const r = ptrace.rank;
   d3.select('#pt-graph .pt-nodes').selectAll('circle')
-    .attr('display', n => (n.p.rank <= r ? null : 'none'))
-    .classed('pt-current', n => n.p.rank === r);
+    .attr('display', n => (n.i <= r ? null : 'none'))
+    .classed('pt-current', n => n.i === r);
   d3.select('#pt-graph .pt-links').selectAll('line')
-    .attr('display', l => (l.rank <= r ? null : 'none'))
-    .classed('pt-current', l => l.rank === r);
+    .attr('display', l => (l.i <= r ? null : 'none'))
+    .classed('pt-current', l => l.i === r);
   const shown = ptrace.selected != null && ptrace.selected <= r ? ptrace.selected : r;
   const cur = L.posting[shown];
   d3.select('#pt-graph .pt-cursor').attr('cx', cur.x).attr('cy', cur.y).attr('r', cur.r + 5);
   if (ptrace.chartX) {
-    const cx = ptrace.chartX(r + 1);
+    const cx = ptrace.chartX(ps[r].rank + 1);
     d3.select('#pt-chart .pt-chart-cursor').attr('x1', cx).attr('x2', cx);
   }
   const slider = document.getElementById('pt-rank');
   if (slider) slider.value = r + 1;
   const docsSoFar = ps.slice(0, r + 1).reduce((s, p) => s + p.documents, 0);
   const label = document.getElementById('pt-rank-label');
-  if (label) label.textContent = `${r + 1} of ${ps.length} postings probed · ${fmt(docsSoFar)} documents scored`;
+  if (label) {
+    const d = ptrace.data;
+    const span = d.start === 0 ? '' : ` (probes ${fmt(d.start + 1)}–${fmt(d.end)})`;
+    label.textContent = `probe ${fmt(ps[r].rank + 1)} · ${fmt(r + 1)} of ${fmt(ps.length)} in the window${span} · ${fmt(docsSoFar)} documents scored`;
+  }
   renderProbeTracePanel(ps[shown], shown === r);
 }
 
@@ -262,9 +320,17 @@ function renderProbeTracePanel(p, isCurrent) {
     : '—');
   const pass2Tip = 'The document\'s Pass-2 score: its whole-document code against the query, what search results are ranked by.';
   const swatch = (s) => (s ? `<span class="pt-swatch" style="background:${ptrace.color(s.dot_product)}"></span>` : '');
+  const bar = d.baseline?.lowest_pass2 ?? null;
+  const returnedTip = `Whether the store's own search (${fmt(d.baseline?.n_probes)} probes, top_k ${fmt(d.baseline?.top_k)}) returns the document. Its last result scores ${num3(bar)} in Pass 2: a document above that but not returned was missed, because Pass 1 never made it a candidate.`;
+  const returned = (s, what) => {
+    if (s?.in_results == null) return '';
+    const missed = !s.in_results && bar != null && s.pass2 != null && s.pass2 > bar;
+    const v = s.in_results ? 'yes' : missed ? '<span class="pt-missed-text">no — missed</span>' : 'no';
+    return vrow(`${what} returned`, v, '', returnedTip);
+  };
   el.innerHTML = `
     <div class="admin-card-title">${isCurrent ? 'CURRENT PROBE' : 'SELECTED POSTING'}</div>
-    ${vrow('Probe', `${p.rank + 1} of ${d.postings.length}`, '', 'Rank by distance from the query; 1 is the nearest posting.')}
+    ${vrow('Probe', `${fmt(p.rank + 1)} of ${fmt(d.active_postings)}`, '', 'Rank by distance from the query; 1 is the nearest posting.')}
     ${vrow('Posting', p.posting_id, '', 'The posting (cluster) id.')}
     ${vrow('Centre', p.centre_id ?? '—', '', 'The centre new codes in this posting are encoded against.')}
     ${vrow('Distance', num3(p.distance), '', 'Euclidean distance from the query to the posting\'s routing centroid: what probing ranks postings by.')}
@@ -272,10 +338,12 @@ function renderProbeTracePanel(p, isCurrent) {
     ${vrow('Max score', `${swatch(p.max)}${num3(p.max?.dot_product)}`, '', 'Highest Pass-1 score in the posting: its best document\'s best chunk.')}
     ${vrow('Max doc', idLink(p.max))}
     ${vrow('Max doc Pass 2', num3(p.max?.pass2), '', pass2Tip)}
+    ${returned(p.max, 'Max doc')}
     ${vrow('Min score', num3(p.min?.dot_product), '', 'Lowest Pass-1 score in the posting (each document by its best chunk here).')}
     ${vrow('Min doc', idLink(p.min))}
     ${vrow('Min doc Pass 2', num3(p.min?.pass2), '', pass2Tip)}
-    <div class="text-muted pt-panel-note">${fmt(d.active_postings)} active postings · ${d.pass1_bits}-bit Pass-1 codes</div>`;
+    ${returned(p.min, 'Min doc')}
+    <div class="text-muted pt-panel-note">${fmt(d.active_postings)} active postings · ${d.pass1_bits}-bit Pass-1 codes${d.baseline ? ` · search probes ${fmt(d.baseline.n_probes)}` : ''}</div>`;
 }
 
 async function showProbeTraceDoc(id) {
