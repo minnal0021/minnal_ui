@@ -16,6 +16,7 @@ const ptrace = {
   ns: null,
   query: '',
   from: null,       // first probe shown in the form, 1-based (API start = from - 1)
+  topK: null,       // results the baseline search returns (null: the store's top_k)
   to: null,         // last probe, inclusive (API end = to)
   data: null,       // the endpoint's response
   layout: null,     // { nodes, links } with fixed positions, built once per trace
@@ -27,6 +28,8 @@ const ptrace = {
 };
 
 const PT_MAX_WINDOW = 1024;
+/** Most results the trace's baseline search can return (the API's MAX_TRACE_TOP_K). */
+const PT_MAX_TOP_K = 10000;
 
 /** A posting's best document scores above the search's last result, yet the search does not return it. */
 function probeTraceMissed(p, data = ptrace.data) {
@@ -36,7 +39,7 @@ function probeTraceMissed(p, data = ptrace.data) {
 
 function resetProbeTrace(ns) {
   stopProbeTracePlay();
-  Object.assign(ptrace, { ns, data: null, layout: null, rank: 0, selected: null, error: null });
+  Object.assign(ptrace, { ns, data: null, layout: null, rank: 0, selected: null, error: null, topK: null });
 }
 
 function renderVopsTrace() {
@@ -45,6 +48,8 @@ function renderVopsTrace() {
   const from = ptrace.from ?? 1;
   const to = ptrace.to ?? Math.min(effectiveProbes(vopsSettings(), postings ?? Infinity) ?? 64, PT_MAX_WINDOW);
   const maxAttr = postings != null ? `max="${postings}"` : '';
+  const storeTopK = vopsSettings()?.search?.top_k ?? null;
+  const topK = ptrace.topK ?? storeTopK ?? 100;
   const searchTip = postings == null ? 'its max_probes' : `${effectiveProbes(vopsSettings(), postings)} of ${postings}`;
   const d = ptrace.data;
   const n = d?.postings?.length ?? 0;
@@ -57,6 +62,9 @@ function renderVopsTrace() {
         <label class="pt-label" title="Probes are numbered by distance from the query: 1 is the nearest posting${postings != null ? `, ${postings} the farthest` : ''}. A window holds up to ${fmt(PT_MAX_WINDOW)} probes. The store probes ${searchTip} on a search.">
           Probes <input id="pt-from" type="number" min="1" ${maxAttr} value="${from}" oninput="probeTraceFromChanged()">
           to <input id="pt-to" type="number" min="1" ${maxAttr} value="${to}">
+        </label>
+        <label class="pt-label" title="Results the comparison search returns: up to ${fmt(PT_MAX_TOP_K)}. A larger top_k reaches further down the ranking, so the lowest search result falls and fewer documents count as missed. Its Pass 1 keeps the store's first_pass_top_k candidates, or top_k when that is more. The store's own settings do not change.${storeTopK != null ? ` The store returns ${fmt(storeTopK)}.` : ''}">
+          Top k <input id="pt-top-k" type="number" min="1" max="${PT_MAX_TOP_K}" value="${topK}">
         </label>
         <span class="text-muted pt-hint">${postings != null ? `of ${fmt(postings)} postings · ` : ''}up to ${fmt(PT_MAX_WINDOW)} at a time</span>
         <button class="btn btn-accent" type="submit" ${ptrace.loading ? 'disabled' : ''}>${ptrace.loading ? 'Tracing…' : 'Trace'}</button>
@@ -73,7 +81,8 @@ function renderVopsTrace() {
         <span class="pt-store-note">
           <span title="Postings (clusters) the store's partition has, not counting retired ones. Probes are numbered 1 to ${fmt(d.active_postings)} by distance from the query.">${fmt(d.active_postings)} active postings</span>
           · <span title="Bits per dimension of the store's Pass-1 chunk codes (its pass1_bits: 1, 2 or 4). Fewer bits make Pass-1 scores rougher estimates.">${d.pass1_bits}-bit Pass-1 codes</span>
-          ${d.baseline ? `· <span title="Nearest postings the store's normal search reads (its max_probes, or every posting of a smaller store). The chart's dotted line marks where it stops; postings past it are never read by a search.">search probes ${fmt(d.baseline.n_probes)}</span>` : ''}
+          ${d.baseline ? `· <span title="Nearest postings the store's normal search reads (its max_probes, or every posting of a smaller store). The chart's dotted line marks where it stops; postings past it are never read by a search.">search probes ${fmt(d.baseline.n_probes)}</span>
+          · <span title="Results the comparison search returns at most, and the Pass-1 candidates it re-ranks to choose them (the store's first_pass_top_k, or top_k when that is more).">top_k ${fmt(d.baseline.top_k)} of ${fmt(d.baseline.first_pass_top_k)} candidates</span>` : ''}
         </span>
       </div>
       <div class="pt-layout">
@@ -87,7 +96,7 @@ function renderVopsTrace() {
       <div class="pt-chart-title" title="Each probe's lowest and highest Pass-1 document score, and the Pass-2 score (what results are ranked by) of its highest-scoring document. The highest falls as probes reach postings farther from the query: they add less and less to Pass 1's candidates.">
         Score by probe <span class="pt-key pt-key-band"></span>Pass-1 range
         <span class="pt-key pt-key-max"></span>Pass-1 max <span class="pt-key pt-key-pass2"></span>Pass 2 of that document
-        ${d.baseline?.lowest_pass2 != null ? `<span class="pt-key pt-key-base"></span><span title="The Pass-2 score of the last of the ${fmt(d.baseline.results)} results the store's own search returns for this query (top_k ${fmt(d.baseline.top_k)}, ${fmt(d.baseline.n_probes)} probes). A document must score above it to be returned.">lowest search result</span>
+        ${d.baseline?.lowest_pass2 != null ? `<span class="pt-key pt-key-base"></span><span title="The Pass-2 score of the last of the ${fmt(d.baseline.results)} results the store's own search returns for this query (top_k ${fmt(d.baseline.top_k)}, ${fmt(d.baseline.n_probes)} probes, ${fmt(d.baseline.first_pass_top_k)} Pass-1 candidates). A document must score above it to be returned.">lowest search result</span>
         <span class="pt-key-dot"></span><span title="The posting's highest-scoring document scores above the lowest search result in Pass 2, but the search does not return it: Pass 1 never made it a candidate. Only each posting's lowest and highest Pass-1 documents are checked.">missed by the search</span>` : ''}</div>
       <svg id="pt-chart" class="pt-chart" role="img" aria-label="Pass-1 score range and the best document's Pass-2 score per probe"></svg>
     </div>` : ''}`;
@@ -106,12 +115,14 @@ async function runProbeTrace() {
   const query = document.getElementById('pt-query')?.value.trim();
   const from = document.getElementById('pt-from')?.valueAsNumber;
   const to = document.getElementById('pt-to')?.valueAsNumber;
+  const topK = document.getElementById('pt-top-k')?.valueAsNumber;
   if (!query) return;
   const postings = vops.partition?.postings;
   const problem = !(Number.isInteger(from) && Number.isInteger(to) && from >= 1) ? 'Probes must be whole numbers from 1.'
     : to < from ? `The last probe (${to}) is before the first (${from}).`
     : to - from + 1 > PT_MAX_WINDOW ? `A window holds at most ${fmt(PT_MAX_WINDOW)} probes; ${from} to ${to} is ${fmt(to - from + 1)}.`
     : postings != null && to > postings ? `The store has ${fmt(postings)} postings; the last probe can be at most ${fmt(postings)}.`
+    : !(Number.isInteger(topK) && topK >= 1 && topK <= PT_MAX_TOP_K) ? `Top k must be a whole number from 1 to ${fmt(PT_MAX_TOP_K)}.`
     : null;
   if (problem) {
     ptrace.error = problem;
@@ -119,11 +130,11 @@ async function runProbeTrace() {
     return;
   }
   stopProbeTracePlay();
-  Object.assign(ptrace, { query, from, to, loading: true, error: null });
+  Object.assign(ptrace, { query, from, to, topK, loading: true, error: null });
   renderVopsBody();
   const ns = ptrace.ns;
   try {
-    const data = await Api.vectorProbeTrace(ns, query, from - 1, to);
+    const data = await Api.vectorProbeTrace(ns, query, from - 1, to, topK);
     if (ns !== ptrace.ns) return;
     Object.assign(ptrace, { data, layout: buildProbeTraceLayout(data), rank: 0, selected: null });
   } catch (e) {

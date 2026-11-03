@@ -215,7 +215,10 @@ split and merge as data arrives. The store view answers one question above all:
   line where the store's own search stops probing, and a line at the score of
   its last result. A red dot (and a red ring in the graph) marks a posting whose
   best document scores above that line but is not returned: the search missed
-  it. Click a posting for its details; click a document id to open it. The
+  it. **Top k** (default the store's `top_k`, up to 10,000) sets how many
+  results that search returns, without changing the store's settings: a deeper
+  search lowers the line, so you can see how far down the ranking the store's
+  probes still reach. Click a posting for its details; click a document id to open it. The
   layout is computed once per trace, so stepping through a window stays
   immediate.
 - **History** — recall checks and rebuilds as a timeline, with the change in
