@@ -21,6 +21,9 @@ import sys
 
 API_UPSTREAM = os.environ.get("API_UPSTREAM", "http://localhost:8080").rstrip("/")
 PORT         = int(os.environ.get("PORT", "3000"))
+# Seconds to wait for the backend. Some admin reads (a recall check, code
+# metrics over every chunk) take minutes on a large store.
+TIMEOUT      = float(os.environ.get("API_TIMEOUT", "600"))
 
 # Paths forwarded to the backend — everything else is served as a static file.
 API_PREFIXES = ("/kv-stores", "/stores", "/admin")
@@ -69,7 +72,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             req.add_header("Content-Type", ct)
 
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
                 self._forward(resp.status, resp.headers, resp.read())
         except urllib.error.HTTPError as e:
             self._forward(e.code, e.headers, e.read())
@@ -79,7 +82,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def _forward(self, status, headers, body):
         self.send_response(status)
-        skip = {"transfer-encoding", "connection", "keep-alive"}
+        # Content-Length is set from the body below; forwarding the upstream one
+        # too sends it twice, which strict clients (Node's fetch) reject.
+        skip = {"transfer-encoding", "connection", "keep-alive", "content-length"}
         for k, v in headers.items():
             if k.lower() not in skip:
                 self.send_header(k, v)
@@ -98,7 +103,8 @@ if __name__ == "__main__":
     # Serve files relative to this script's directory
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
-    with http.server.HTTPServer(("0.0.0.0", PORT), Handler) as httpd:
+    # One thread per request: a slow admin call must not hold up the UI's others.
+    with http.server.ThreadingHTTPServer(("0.0.0.0", PORT), Handler) as httpd:
         print("─────────────────────────────────────────")
         print("  Minnal UI")
         print(f"  Listening on  http://0.0.0.0:{PORT}")

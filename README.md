@@ -98,7 +98,7 @@ Browser ──▶ Minnal UI (server.py, :3000) ──▶ minnal REST API (:8080)
 `start.sh` is a thin wrapper that sets the environment and launches `server.py`:
 
 ```bash
-# Defaults: API_UPSTREAM=http://localhost:8080, PORT=3000
+# Defaults: API_UPSTREAM=http://localhost:8080, PORT=3000, API_TIMEOUT=600 (seconds to wait for the backend)
 ./start.sh
 
 # Point at a different backend and/or port
