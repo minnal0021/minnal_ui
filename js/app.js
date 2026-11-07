@@ -3807,8 +3807,9 @@ function showIndexGap(idx) {
   if (!entry) return;
   openModal(`
     <div class="modal-title">Gap Record — ${esc(entry.ns)} / ${esc(entry.field)}</div>
+    ${entry.gap.to ? `
     <div class="stat-row"><span class="stat-key" title="The WAL range the field is missing updates from (positions: segment @ byte).">WAL Range</span>
-      <span class="stat-val" style="font-size:12px">${fmtLogPos(entry.gap.from)} → ${fmtLogPos(entry.gap.to)}</span></div>
+      <span class="stat-val" style="font-size:12px">${fmtLogPos(entry.gap.from)} → ${fmtLogPos(entry.gap.to)}</span></div>` : ''}
     ${(entry.gap.missing_segments ?? []).length ? `
     <div class="stat-row"><span class="stat-key" title="WAL segment files that were gone when the gap was found.">Missing Segments</span>
       <span class="stat-val" style="font-size:12px">${entry.gap.missing_segments.map(fmt).join(', ')}</span></div>` : ''}
