@@ -185,6 +185,11 @@ a { color: var(--accent); text-decoration: none; }
 .badge-kv       { background: rgba(168,85,247,.18);        color: #a855f7; }
 .badge-f32      { background: var(--warning-dim);          color: var(--warning); }
 .badge-vec_f32  { background: rgba(16,185,129,.12);        color: #34d399; }
+/* A store's lifecycle state (shown when it is not simply created). */
+.badge-state                     { background: var(--warning-dim); color: var(--warning); }
+.badge-state-creating            { background: var(--info-dim);    color: var(--info); }
+.badge-state-index_maintenance   { background: var(--warning-dim); color: var(--warning); }
+.badge-state-deleting            { background: var(--error-dim);   color: var(--error); }
 
 /* ── Form controls ───────────────────────────────────────────────────── */
 .form-group { display: flex; flex-direction: column; gap: 6px; }

@@ -278,9 +278,9 @@ function renderSidebar() {
     </div>`;
   };
 
-  const docItems = state.stores.map(s => item(s, 'doc', keyTypeBadge(s.key_type))).join('');
+  const docItems = state.stores.map(s => item(s, 'doc', storeStateBadge(s) + keyTypeBadge(s.key_type))).join('');
   const kvItems  = state.kvStores.map(s => item(s, 'kv',
-    `<span class="badge badge-kv">KV</span>${kvValueTypeBadge(s.value_type)}`)).join('');
+    `${storeStateBadge(s)}<span class="badge badge-kv">KV</span>${kvValueTypeBadge(s.value_type)}`)).join('');
 
   let html = '';
   if (!hasDoc && !hasKv) html = '<div class="empty-sidebar">No stores yet</div>';
@@ -431,6 +431,7 @@ function renderSchemaTab() {
   el.innerHTML = `
     <div class="store-header">
       <span class="store-ns">${esc(s.namespace)}</span>
+      ${storeStateBadge(s)}
       ${keyTypeBadge(s.key_type)}
       ${s.semantic_search_enabled
           ? '<span class="badge badge-indexed">✨ Semantic ON</span>'
@@ -438,8 +439,7 @@ function renderSchemaTab() {
       <div style="margin-left:auto;display:flex;gap:8px">
         <button class="btn btn-ghost btn-sm"
                 onclick="adminExportSchema('${esc(s.namespace)}')">⬇ Export Schema</button>
-        <button class="btn btn-danger btn-sm"
-                onclick="confirmDeleteStore('${esc(s.namespace)}')">🗑 Delete Store</button>
+        ${deleteStoreButton(s)}
       </div>
     </div>
 
@@ -475,6 +475,9 @@ function renderSchemaTab() {
       </div>
     </div>
     ${renderVectorSettingsSection(s)}`;
+  // A build running now (started here, by another client or before a reload)
+  // shows its progress in the Progress column.
+  if (s.state === 'index_maintenance') resumeBuildPolls(s.namespace);
 }
 
 function renderKvSchemaTab(el, s) {
@@ -482,6 +485,7 @@ function renderKvSchemaTab(el, s) {
     <div class="store-header">
       <span class="store-ns">${esc(s.namespace)}</span>
       <span class="badge badge-kv">KV</span>
+      ${storeStateBadge(s)}
       ${keyTypeBadge(s.key_type)}
       ${kvValueTypeBadge(s.value_type)}
       ${s.semantic_search_enabled
@@ -490,8 +494,7 @@ function renderKvSchemaTab(el, s) {
       <div style="margin-left:auto;display:flex;gap:8px">
         <button class="btn btn-ghost btn-sm"
                 onclick="adminExportKvSchema('${esc(s.namespace)}')">⬇ Export Schema</button>
-        <button class="btn btn-danger btn-sm"
-                onclick="confirmDeleteStore('${esc(s.namespace)}')">🗑 Delete Store</button>
+        ${deleteStoreButton(s)}
       </div>
     </div>
 
@@ -862,10 +865,13 @@ async function submitCreateStore() {
       }
       await Api.createStore(payload);
       closeModal();
-      toast(`KV store '${ns}' created`);
+      toast(`KV store '${ns}' is being created…`);
       await loadStores();
       selectStore(ns, 'kv');
       switchTab('schema');
+      const reached = await waitForStoreState(ns, ['created', 'index_maintenance', 'gone']);
+      toast(reached === 'gone' || !reached ? `KV store '${ns}' was not created (see Admin → Lifecycle)` : `KV store '${ns}' created`, reached && reached !== 'gone' ? 'success' : 'error');
+      await loadStores();
     } catch (e) {
       toast(e.message, 'error');
       btn.disabled = false; btn.textContent = 'Create Store';
@@ -918,10 +924,13 @@ async function submitCreateStore() {
     }
     await Api.createStore(payload);
     closeModal();
-    toast(`Store '${ns}' created`);
+    toast(`Store '${ns}' is being created…`);
     await loadStores();
     selectStore(ns, 'doc');
     switchTab('schema');
+    const reached = await waitForStoreState(ns, ['created', 'index_maintenance', 'gone']);
+    toast(reached === 'gone' || !reached ? `Store '${ns}' was not created (see Admin → Lifecycle)` : `Store '${ns}' created`, reached && reached !== 'gone' ? 'success' : 'error');
+    await loadStores();
   } catch (e) {
     toast(e.message, 'error');
     btn.disabled = false; btn.textContent = 'Create Store';
@@ -929,6 +938,17 @@ async function submitCreateStore() {
 }
 
 // ── Delete store ──────────────────────────────────────────────────────────────
+/** The Delete Store button: refused by the server while the store is not
+ *  `created` (an index job runs, or it is being created or dropped). */
+function deleteStoreButton(s) {
+  const busy = s.state && s.state !== 'created';
+  const why = s.state === 'index_maintenance'
+    ? 'An index job is running: wait for it, or cancel it in Admin → Lifecycle, then drop the store.'
+    : `The store is ${s.state}.`;
+  return `<button class="btn btn-danger btn-sm" ${busy ? `disabled title="${esc(why)}"` : ''}
+                onclick="confirmDeleteStore('${esc(s.namespace)}')">🗑 Delete Store</button>`;
+}
+
 function confirmDeleteStore(ns) {
   const typeLabel = isKvStore() ? 'KV store' : 'store';
   const detail    = isKvStore()
@@ -952,7 +972,7 @@ async function doDeleteStore(ns) {
     // DELETE /stores/{ns} resolves the kind from the stored schema.
     await Api.deleteStore(ns);
     closeModal();
-    toast(`Store '${ns}' deleted`);
+    toast(`Store '${ns}' is being deleted…`);
     if (state.selectedStore?.namespace === ns) {
       state.selectedStore = null;
       state.selectedStoreType = null;
@@ -960,6 +980,9 @@ async function doDeleteStore(ns) {
     }
     await loadStores();
     renderSchemaTab();
+    const reached = await waitForStoreState(ns, ['gone']);
+    toast(reached ? `Store '${ns}' deleted` : `Store '${ns}' is still being deleted (see Admin → Lifecycle)`, reached ? 'success' : 'error');
+    await loadStores();
   } catch (e) { toast(e.message, 'error'); }
 }
 
@@ -981,7 +1004,8 @@ function showAddIndexModal(ns) {
         </select>
       </div>
       <p class="text-muted" style="margin-top:10px">
-        If the store already has documents, a background rebuild will start automatically.
+        The index takes new writes at once; a <code>field_build</code> job indexes the
+        documents already stored, in the background (Admin → Lifecycle shows it, and can cancel it).
       </p>
     </div>
     <div class="modal-actions">
@@ -997,13 +1021,14 @@ async function submitAddIndex(ns) {
   if (!field) { toast('Field name is required', 'error'); return; }
 
   try {
-    await Api.addIndex(ns, { field, index_type: type });
+    const r = await Api.addIndex(ns, { field, index_type: type });
     closeModal();
-    toast(`Index on '${field}' added — rebuild may be running`);
+    toast(`Index on '${field}' added — job ${r?.job ?? 'field_build'} is building it`);
     await loadStores();
     renderSchemaTab();
     // Start progress polling for the new index
     setTimeout(() => startProgressPoll(ns, field), 500);
+    afterJobStarted(ns);
   } catch (e) { toast(e.message, 'error'); }
 }
 
@@ -1028,8 +1053,9 @@ async function doDropIndex(ns, field) {
     await Api.dropIndex(ns, field);
     stopProgressPoll(ns, field);
     closeModal();
+    toast(`Dropping the index on '${field}'…`);
+    await afterJobStarted(ns);
     toast(`Index on '${field}' dropped`);
-    await loadStores();
     renderSchemaTab();
   } catch (e) { toast(e.message, 'error'); }
 }
@@ -1147,8 +1173,18 @@ function confirmRemoveAttribute(ns, name) {
 
 async function doRemoveAttribute(ns, name) {
   try {
-    await Api.amendSchema(ns, { op: 'remove_attribute', name });
-    closeModal(); toast(`Attribute '${name}' removed`);
+    const r = await Api.amendSchema(ns, { op: 'remove_attribute', name });
+    closeModal();
+    if (r?.job) {
+      // The last embedding field: semantic search is off, and a vector_cleanup
+      // job removes the vector index in the background.
+      toast(`Attribute '${name}' removed; semantic search is off and its vector index is being removed…`);
+      await loadStores(); renderSchemaTab();
+      await afterJobStarted(ns);
+      toast(`Vector index of '${ns}' removed`);
+    } else {
+      toast(`Attribute '${name}' removed`);
+    }
     await loadStores(); renderSchemaTab();
   } catch (e) { toast(e.message, 'error'); }
 }
@@ -2238,6 +2274,7 @@ const ADMIN_TABS = [
   ['ops',     'Ops Metrics',    null],
   ['field',   'Field Indexes',  'Field-index builds, health, waste and per-store operations'],
   ['vector',  'Vector Indexes', 'All vector stores, and the selected store in detail: queue, rebuild decision, partition, code metrics, postings, history and settings'],
+  ['lifecycle', 'Lifecycle', 'Index jobs (running and ended, with cancel) and the lifecycle audit log, for the selected store or every store'],
   ['maintenance', 'System Maintenance', 'Server-wide maintenance actions: GC, WAL GC, LSM compaction, field index checkpoint, query-cache clear'],
 ];
 
@@ -2246,6 +2283,7 @@ function loadAdminSubTab(tab) {
   if (tab === 'ops')         return loadAdminOpsPanel();
   if (tab === 'field')       return loadAdminFieldPanel();
   if (tab === 'maintenance') return loadAdminMaintenancePanel();
+  if (tab === 'lifecycle')   return loadAdminLifecyclePanel();
   return renderVectorIndexesTab();
 }
 
@@ -4006,12 +4044,13 @@ function renderVqBrowserHtml(ns) {
 // ── Namespace index operations (async 202) ────────────────────────────────────
 
 async function adminAttrReindexAll(ns, btn) {
-  if (!confirm(`Drop and rebuild all field indices for "${ns}"?\n\nThis runs in the background — monitor progress in Active Index Builds. It also frees the row IDs of deleted documents (see Row Map). Queries on an index list it in degraded_fields until its build finishes; a run interrupted by a restart is finished when the server starts again.`)) return;
+  if (!confirm(`Drop and rebuild all field indices for "${ns}"?\n\nThis runs in the background as a reindex_all job, which cannot be cancelled — monitor progress in Active Index Builds or Admin → Lifecycle. It also frees the row IDs of deleted documents (see Row Map). Queries on an index list it in degraded_fields until its build finishes; a run interrupted by a restart is finished when the server starts again.`)) return;
   btn.disabled = true;
   try {
     await Api.attributeReindexAll(ns);
-    toast(`Attribute reindex started for "${ns}"`);
+    toast(`Job reindex_all started for "${ns}" (Admin → Lifecycle)`);
     adminIndexRefresh();
+    afterJobStarted(ns).then(adminIndexRefresh);
   } catch (e) {
     toast('Failed: ' + e.message, 'error');
     btn.disabled = false;
@@ -4023,8 +4062,9 @@ async function adminAttrDropAll(ns, btn) {
   btn.disabled = true;
   try {
     await Api.attributeDropAll(ns);
+    toast(`Dropping all field indices of "${ns}"…`);
+    await afterJobStarted(ns);
     toast(`All field indices dropped for "${ns}"`);
-    await loadStores();
     adminIndexRefresh();
   } catch (e) {
     toast('Failed: ' + e.message, 'error');
@@ -4037,8 +4077,9 @@ async function adminVectorReindexAll(ns, btn) {
   btn.disabled = true;
   try {
     await Api.vectorReindexAll(ns);
-    toast(`Vector reindex started for "${ns}"`);
+    toast(`Job vector_reindex started for "${ns}" (Admin → Lifecycle)`);
     adminIndexRefresh();
+    afterJobStarted(ns).then(adminIndexRefresh);
   } catch (e) {
     toast('Failed: ' + e.message, 'error');
     btn.disabled = false;
@@ -4063,8 +4104,10 @@ async function adminVectorDropAll(ns, btn) {
   btn.disabled = true;
   try {
     await Api.vectorDropAll(ns);
-    toast(`Vector index dropped for "${ns}"`);
+    toast(`Semantic search is off for "${ns}"; removing its vector index…`);
     await loadStores();
+    await afterJobStarted(ns);
+    toast(`Vector index dropped for "${ns}"`);
     adminIndexRefresh();
   } catch (e) {
     toast('Failed: ' + e.message, 'error');
