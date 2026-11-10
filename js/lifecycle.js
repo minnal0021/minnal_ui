@@ -25,25 +25,36 @@ const STORE_STATE_TIP = {
   deleting: 'Being dropped in the background; it refuses every request.',
 };
 
-/** A badge for a store that is not simply `created`; empty otherwise. */
+/** A badge for a store that is not simply `created`; empty otherwise. A
+ *  store whose create or drop the server gave up on (`parked`, the last
+ *  error) gets a red badge saying so. */
 function storeStateBadge(s) {
   const st = s?.state;
   if (!st || st === 'created') return '';
+  if (s.parked) {
+    const what = st === 'creating' ? 'setup failed' : 'drop failed';
+    const tip = `${st === 'creating' ? 'Setup' : 'The drop'} failed every retry and is left until the server restarts`
+      + `${st === 'creating' ? '; the store can be deleted' : ''}. Last error: ${s.parked}`;
+    return `<span class="badge badge-error" title="${esc(tip)}">${esc(what)}</span>`;
+  }
   return `<span class="badge badge-state badge-state-${esc(st)}" title="${esc(STORE_STATE_TIP[st] ?? st)}">${esc(STORE_STATE_LABEL[st] ?? st)}</span>`;
 }
 
 /**
  * Wait until store `ns` is in one of `wanted` (state names, or 'gone' for no
- * store), polling `GET /stores`. Resolves with the state reached, or null
- * after `timeoutMs`.
+ * store), polling `GET /stores`. Resolves with the state reached, 'parked'
+ * if the server gave up on the store's create or drop (it will not move on
+ * by itself), or null after `timeoutMs`.
  */
 async function waitForStoreState(ns, wanted, timeoutMs = 120000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const all = (await Api.listStores().catch(() => null)) ?? null;
     if (all) {
-      const st = all.find(s => s.namespace === ns)?.state ?? (all.some(s => s.namespace === ns) ? 'created' : 'gone');
+      const store = all.find(s => s.namespace === ns);
+      const st = store ? (store.state ?? 'created') : 'gone';
       if (wanted.includes(st)) return st;
+      if (store?.parked) return 'parked';
     }
     await new Promise(r => setTimeout(r, 300));
   }
@@ -159,6 +170,7 @@ const AUDIT_EVENT_LABEL = {
   job_completed: 'job completed',
   job_failed: 'job failed',
   job_cancelled: 'job cancelled',
+  job_withdrawn: 'job withdrawn',
   resumed: 'resumed after restart',
   task_parked: 'given up on',
   governor_stopped: 'governor stopped',
@@ -167,7 +179,7 @@ const AUDIT_EVENT_LABEL = {
 const AUDIT_EVENT_CLASS = {
   created: 'badge-ok', job_completed: 'badge-ok',
   job_failed: 'badge-error', task_parked: 'badge-error', governor_stopped: 'badge-error',
-  deleted: 'badge-unknown', job_cancelled: 'badge-unknown',
+  deleted: 'badge-unknown', job_cancelled: 'badge-unknown', job_withdrawn: 'badge-unknown',
 };
 
 function auditRowsHtml(records, withNs) {

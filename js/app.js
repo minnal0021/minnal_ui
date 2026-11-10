@@ -870,7 +870,8 @@ async function submitCreateStore() {
       selectStore(ns, 'kv');
       switchTab('schema');
       const reached = await waitForStoreState(ns, ['created', 'index_maintenance', 'gone']);
-      toast(reached === 'gone' || !reached ? `KV store '${ns}' was not created (see Admin → Lifecycle)` : `KV store '${ns}' created`, reached && reached !== 'gone' ? 'success' : 'error');
+      const created = reached === 'created' || reached === 'index_maintenance';
+      toast(created ? `KV store '${ns}' created` : `KV store '${ns}' was not created (see Admin → Lifecycle)`, created ? 'success' : 'error');
       await loadStores();
     } catch (e) {
       toast(e.message, 'error');
@@ -929,7 +930,8 @@ async function submitCreateStore() {
     selectStore(ns, 'doc');
     switchTab('schema');
     const reached = await waitForStoreState(ns, ['created', 'index_maintenance', 'gone']);
-    toast(reached === 'gone' || !reached ? `Store '${ns}' was not created (see Admin → Lifecycle)` : `Store '${ns}' created`, reached && reached !== 'gone' ? 'success' : 'error');
+    const created = reached === 'created' || reached === 'index_maintenance';
+    toast(created ? `Store '${ns}' created` : `Store '${ns}' was not created (see Admin → Lifecycle)`, created ? 'success' : 'error');
     await loadStores();
   } catch (e) {
     toast(e.message, 'error');
@@ -939,9 +941,11 @@ async function submitCreateStore() {
 
 // ── Delete store ──────────────────────────────────────────────────────────────
 /** The Delete Store button: refused by the server while the store is not
- *  `created` (an index job runs, or it is being created or dropped). */
+ *  `created` (an index job runs, or it is being created or dropped), except
+ *  for a store whose setup the server gave up on (`parked` while `creating`). */
 function deleteStoreButton(s) {
-  const busy = s.state && s.state !== 'created';
+  const droppable = !s.state || s.state === 'created' || (s.state === 'creating' && s.parked);
+  const busy = !droppable;
   const why = s.state === 'index_maintenance'
     ? 'An index job is running: wait for it, or cancel it in Admin → Lifecycle, then drop the store.'
     : `The store is ${s.state}.`;
@@ -981,7 +985,8 @@ async function doDeleteStore(ns) {
     await loadStores();
     renderSchemaTab();
     const reached = await waitForStoreState(ns, ['gone']);
-    toast(reached ? `Store '${ns}' deleted` : `Store '${ns}' is still being deleted (see Admin → Lifecycle)`, reached ? 'success' : 'error');
+    const gone = reached === 'gone';
+    toast(gone ? `Store '${ns}' deleted` : reached === 'parked' ? `Store '${ns}' could not be deleted (see Admin → Lifecycle)` : `Store '${ns}' is still being deleted (see Admin → Lifecycle)`, gone ? 'success' : 'error');
     await loadStores();
   } catch (e) { toast(e.message, 'error'); }
 }
