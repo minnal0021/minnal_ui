@@ -736,7 +736,7 @@ async function doVopsRebuild(postings) {
   closeModal();
   try {
     await Api.vectorRebuild(vops.ns, postings);
-    toast('Rebuild started');
+    toast('Rebuild started — job partition_rebuild (cancel it in Admin → Lifecycle until its k-means ends)');
     await loadVectorOps();
     startRebuildPoll();
   } catch (e) {
@@ -753,7 +753,8 @@ function startRebuildPoll() {
       if (p.rebuild?.state !== 'running') {
         clearInterval(vops.rebuildPoll);
         vops.rebuildPoll = null;
-        toast(`Rebuild ${p.rebuild?.state}`, p.rebuild?.state === 'done' ? 'success' : 'error');
+        toast(`Rebuild ${p.rebuild?.state}${p.rebuild?.error ? `: ${p.rebuild.error}` : ''}`, p.rebuild?.state === 'done' ? 'success' : 'error');
+        loadStores(); // the store leaves index_maintenance
         const h = await Api.vectorHistory(vops.ns, null, 1000);
         vops.history = h.records ?? [];
         vops.allPostings = null;

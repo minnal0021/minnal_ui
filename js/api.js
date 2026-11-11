@@ -48,6 +48,20 @@ const Api = (() => {
   const deleteStore  = (ns)       => req('DELETE', `/stores/${ns}`);
   const amendSchema  = (ns, op)   => req('PATCH',  `/stores/${ns}/schema`, op);
 
+  // ── Index jobs and the lifecycle audit log ─────────────────────────
+  // Creating or dropping a store and every index operation answer 202 and run
+  // as jobs in the background; these read them, and cancel one.
+  const storeJobs  = (ns)      => req('GET',    `/admin/stores/${encodeURIComponent(ns)}/jobs`);
+  const liveJobs   = ()        => req('GET',    '/admin/jobs');
+  const cancelJob  = (ns, job) => req('DELETE', `/admin/stores/${encodeURIComponent(ns)}/jobs/${encodeURIComponent(job)}`);
+  const lifecycleAudit = ({ namespace, limit, cursor } = {}) => {
+    const p = new URLSearchParams();
+    if (namespace) p.set('namespace', namespace);
+    if (limit)     p.set('limit', limit);
+    if (cursor)    p.set('cursor', cursor);
+    return req('GET', `/admin/lifecycle/audit?${p}`);
+  };
+
   // ── Index management (per-store) ───────────────────────────────────
   const addIndex  = (ns, spec)  => req('POST',   `/stores/${ns}/indices`, spec);
   const dropIndex = (ns, field) => req('DELETE', `/stores/${ns}/indices/${field}`);
@@ -289,6 +303,7 @@ const Api = (() => {
     setBaseUrl,
     // stores (doc + KV, dispatched on store_type)
     listStores, createStore, deleteStore, amendSchema,
+    storeJobs, liveJobs, cancelJob, lifecycleAudit,
     // admin store ops (unified across kinds)
     storeRowCount, importStoreSchema, exportSchema,
     // indices (per-store)

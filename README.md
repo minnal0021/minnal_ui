@@ -30,7 +30,25 @@ The interface is organised into four tabs, each mapping onto a part of the minna
 | **Schema** | Create, view, amend, and delete document stores and KV stores; manage field indices and embedding fields; view a semantic-search store's vector-index settings and change its search and maintenance settings (see [Vector-index settings](#vector-index-settings)). |
 | **Documents** | Browse, get, put, and delete documents; range scans and prefix scans with pagination. |
 | **Query** | Run predicate queries against field indices, plus semantic search and filtered semantic search. |
-| **Admin** | Five sub-tabs. **Storage**: server health, storage stats, WAL/LSM/value-log inspection, schema import. **Ops Metrics**: engine-wide and per-store counters, including the field-index write buffer. **Field Indexes**: builds, health and repair, waste, blob and row-map stats, reindex and drop. **Vector Indexes**: every vector store, and one store in detail, including whether a partition rebuild would help (see [Vector Indexes](#vector-indexes)). **System Maintenance**: the server-wide actions — value-log GC, WAL GC, LSM compaction, field index checkpoint and clearing the query-embedding cache — each with what it does; they cover every namespace, whatever the sidebar selects. |
+| **Admin** | Six sub-tabs. **Storage**: server health, storage stats, WAL/LSM/value-log inspection, schema import. **Ops Metrics**: engine-wide and per-store counters, including the field-index write buffer. **Field Indexes**: builds, health and repair, waste, blob and row-map stats, reindex and drop. **Vector Indexes**: every vector store, and one store in detail, including whether a partition rebuild would help (see [Vector Indexes](#vector-indexes)). **Lifecycle**: the index jobs of the selected store (running and ended, with their progress and a Cancel button) or every store's running jobs, and the lifecycle audit log (see [Store lifecycle](#store-lifecycle)). **System Maintenance**: the server-wide actions — value-log GC, WAL GC, LSM compaction, field index checkpoint and clearing the query-embedding cache — each with what it does; they cover every namespace, whatever the sidebar selects. |
+
+### Store lifecycle
+
+Creating or dropping a store, and every operation that builds or removes an
+index (add or drop an index, reindex-all and drop-all, turning semantic search
+on or off, a vector reindex, a partition rebuild), runs in the background on
+the server: the UI says it has started, waits for the store's state to change,
+and says when it is done. A store that is not simply created shows its state in
+the sidebar and the Schema tab: **creating**, **maintenance** (an index job is
+running: it takes reads and writes, but cannot be dropped, so Delete Store is
+disabled) or **deleting**. Admin → **Lifecycle** lists the store's jobs, with
+progress and a Cancel button for those that can stop part-way (field builds,
+semantic-search enables, vector reindexes, partition rebuilds before their
+k-means ends), and the **lifecycle audit log**: every store's creation and
+drop, every job's start, cancel and end, work a restart picked up, and anything
+the server gave up on, newest first, kept for the server's
+`[lifecycle] audit_retention_days` and readable after a store is gone. With no
+store selected it shows every store's running jobs and the whole log.
 
 **The sidebar picks the store everywhere.** The store selected in the sidebar is
 the one every per-store section shows, including in Admin; nothing in Admin has a
@@ -243,6 +261,7 @@ minnal_ui/
 ├── js/
 │   ├── api.js      # Thin async wrapper over the minnal REST API
 │   ├── app.js      # UI logic, rendering, event handling
+│   ├── lifecycle.js # store states, Admin → Lifecycle (jobs, audit log)
 │   ├── vector_ops.js # Admin → Vector Indexes
 │   ├── probe_trace.js # Admin → Vector Indexes → Probe trace (d3)
 │   ├── vendor/d3.min.js # d3 v7.9.0, vendored so the UI works offline
