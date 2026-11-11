@@ -46,12 +46,13 @@ function storeStateBadge(s) {
  * if the server gave up on the store's create or drop (it will not move on
  * by itself), or null after `timeoutMs`.
  */
-async function waitForStoreState(ns, wanted, timeoutMs = 120000) {
+async function waitForStoreState(ns, wanted, timeoutMs = 120000, onPoll = null) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const all = (await Api.listStores().catch(() => null)) ?? null;
     if (all) {
       const store = all.find(s => s.namespace === ns);
+      if (onPoll) await onPoll(store);
       const st = store ? (store.state ?? 'created') : 'gone';
       if (wanted.includes(st)) return st;
       if (store?.parked) return 'parked';
@@ -61,9 +62,22 @@ async function waitForStoreState(ns, wanted, timeoutMs = 120000) {
   return null;
 }
 
-/** Wait until `ns` has no running index job (it is `created` again), then reload the stores. */
+/** The store's indexed fields, as one comparable string. */
+const indexFieldsOf = (store) => (store?.indices ?? []).map(i => i.field).join(',');
+
+/**
+ * Wait until `ns` has no running index job (it is `created` again), then reload
+ * the stores. A job changes the schema while it runs (a build lists its index
+ * only once it has activated it, moments after the 202), so the stores are
+ * reloaded whenever the index list moves: the new row appears and its build's
+ * progress is shown while it runs.
+ */
 async function afterJobStarted(ns) {
-  await waitForStoreState(ns, ['created', 'gone']);
+  let seen = indexFieldsOf([...state.stores, ...state.kvStores].find(s => s.namespace === ns));
+  await waitForStoreState(ns, ['created', 'gone'], undefined, async (store) => {
+    const now = indexFieldsOf(store);
+    if (now !== seen) { seen = now; await loadStores(); }
+  });
   await loadStores();
 }
 

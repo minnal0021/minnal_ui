@@ -542,7 +542,7 @@ function startProgressPoll(ns, field) {
   const key = `${ns}::${field}`;
   if (state.progressPolls[key]) return;
 
-  state.progressPolls[key] = setInterval(async () => {
+  const tick = async () => {
     try {
       const progress = await Api.indicesProgressNs(ns);
       const cell = document.getElementById(`progress-${field}`);
@@ -559,8 +559,11 @@ function startProgressPoll(ns, field) {
       }
 
       const status = (build.status ?? '').toLowerCase();
-      if (status === 'running') {
-        const pct = build.total > 0 ? (build.indexed / build.total * 100) : 0;
+      if (status === 'running' && !(build.total > 0)) {
+        // The build counts the stored documents before it indexes any.
+        cell.innerHTML = '<div class="progress-label">counting documents…</div>';
+      } else if (status === 'running') {
+        const pct = build.indexed / build.total * 100;
         cell.innerHTML = `
           <div class="progress-wrap"><div class="progress-bar" style="width:${pct.toFixed(1)}%"></div></div>
           <div class="progress-label">${pct.toFixed(1)}% (${fmt(build.indexed)} / ${fmt(build.total)})</div>`;
@@ -572,7 +575,11 @@ function startProgressPoll(ns, field) {
         stopProgressPoll(ns, field);
       }
     } catch { stopProgressPoll(ns, field); }
-  }, 2000);
+  };
+  // Show the progress at once, then every second: the schema tab is redrawn
+  // while a job runs, and each redraw starts with an empty Progress cell.
+  state.progressPolls[key] = setInterval(tick, 1000);
+  tick();
 }
 
 function stopProgressPoll(ns, field) {
@@ -1009,8 +1016,9 @@ function showAddIndexModal(ns) {
         </select>
       </div>
       <p class="text-muted" style="margin-top:10px">
-        The index takes new writes at once; a <code>field_build</code> job indexes the
-        documents already stored, in the background (Admin → Lifecycle shows it, and can cancel it).
+        A <code>field_build</code> job activates the index moments after you add it, so new
+        writes are indexed from then on, and indexes the documents already stored in the
+        background (Admin → Lifecycle shows it, and can cancel it).
       </p>
     </div>
     <div class="modal-actions">
@@ -1031,8 +1039,8 @@ async function submitAddIndex(ns) {
     toast(`Index on '${field}' added — job ${r?.job ?? 'field_build'} is building it`);
     await loadStores();
     renderSchemaTab();
-    // Start progress polling for the new index
-    setTimeout(() => startProgressPoll(ns, field), 500);
+    // The job lists the index once it has activated it; following the job
+    // shows the new row, and its build's progress, as soon as it is listed.
     afterJobStarted(ns);
   } catch (e) { toast(e.message, 'error'); }
 }

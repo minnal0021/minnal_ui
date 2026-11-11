@@ -60,6 +60,14 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if self._is_api(): self._proxy()
         else: self.send_error(405)
 
+    def end_headers(self):
+        # Static files are revalidated on every load (a 304 when unchanged).
+        # With only Last-Modified, browsers cache by heuristic and kept running
+        # the old scripts for hours after the UI was upgraded.
+        if not self._is_api():
+            self.send_header("Cache-Control", "no-cache")
+        super().end_headers()
+
     # ── Proxy ─────────────────────────────────────────────────────────────────
 
     def _proxy(self):
