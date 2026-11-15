@@ -3662,6 +3662,7 @@ async function loadAdminFieldPanel() {
         : 'All stores. Select one in the sidebar (or click its name) to see only that store.'}</span>
     </div>
     <div id="admin-index-builds"></div>
+    <div id="admin-index-updates"></div>
     <div id="admin-index-health"></div>
     <div id="admin-index-waste"></div>
     <div id="admin-index-operations"></div>
@@ -3717,12 +3718,167 @@ async function loadFieldIndexHealth() {
   if (!namespaces.length) { el.innerHTML = ''; return; }
 
   el.innerHTML = '<div class="spinner"></div>';
-  const results = await Promise.all(namespaces.map(ns =>
+  const results = await fetchFieldIndexHealth(namespaces);
+  el.innerHTML = renderFieldIndexHealthSection(results);
+  renderFieldIndexUpdates(results);
+}
+
+/** The indexed stores the Field Indexes tab shows (all, or the selected one). */
+function fieldIndexNamespaces() {
+  const scope = fieldScopeNs();
+  return state.stores
+    .filter(s => (s.indices?.length ?? 0) > 0 && (scope == null || s.namespace === scope))
+    .map(s => s.namespace);
+}
+
+function fetchFieldIndexHealth(namespaces) {
+  return Promise.all(namespaces.map(ns =>
     Api.indexHealth(ns)
       .then(data => ({ ns, data }))
       .catch(e => ({ ns, error: e.message }))
   ));
-  el.innerHTML = renderFieldIndexHealthSection(results);
+}
+
+// ── Field index updates: the field-index worker's progress ────────────────────
+//
+// A write queues its field-index changes and returns; a background worker
+// applies them, and queries read only what it has applied. This panel shows,
+// per field, how much is waiting and for how long, how fast it is being
+// applied, and who applied it — so a lagging index is visible, not guessed at.
+
+/** The queue length past which writers apply changes themselves (engine QUEUE_CAP). */
+const FIELD_QUEUE_CAP = 65536;
+/** A field whose oldest pending change is older than this reads as behind. */
+const FIELD_LAG_BEHIND_MS = 1000;
+
+const fiu = {
+  live: false,
+  timer: null,
+  // `${ns}/${field_id}` → { at: ms, applied: total applied } from the last sample.
+  last: new Map(),
+};
+
+function fieldAppliedTotal(q) {
+  return (q.applied_by_worker ?? 0) + (q.applied_by_writers ?? 0) + (q.applied_by_barriers ?? 0);
+}
+
+function renderFieldIndexUpdates(results) {
+  const el = document.getElementById('admin-index-updates');
+  if (!el) return;
+  const now = Date.now();
+  const rows = [];
+  let pendingTotal = 0;
+  let behind = 0;
+
+  results.forEach(r => {
+    (r.data?.fields ?? []).forEach(f => {
+      const q = f.apply_queue;
+      if (!q) return; // inactive: nothing is applied to it
+      const key = `${r.ns}/${f.field_id}`;
+      const applied = fieldAppliedTotal(q);
+      const prev = fiu.last.get(key);
+      fiu.last.set(key, { at: now, applied });
+      const rate = prev && now > prev.at ? ((applied - prev.applied) * 1000) / (now - prev.at) : null;
+
+      pendingTotal += q.pending;
+      const isBehind = q.oldest_pending_ms >= FIELD_LAG_BEHIND_MS;
+      if (isBehind) behind++;
+      const status = q.pending === 0
+        ? '<span class="badge badge-indexed" title="Every write that has returned is in this index.">✓ Caught up</span>'
+        : isBehind
+          ? `<span class="badge badge-error" title="The oldest waiting change is over ${FIELD_LAG_BEHIND_MS / 1000} s old: queries on this field are missing recent writes.">⚠ Behind</span>`
+          : '<span class="badge badge-attr" title="Changes are waiting and being applied; queries may miss the newest writes for a moment.">Applying</span>';
+
+      const pct = Math.min(100, (q.pending / FIELD_QUEUE_CAP) * 100);
+      const pendingCell = `
+        <div class="text-mono" style="text-align:right">${fmt(q.pending)}</div>
+        <div class="progress-wrap" title="${fmt(q.pending)} of the ${fmt(FIELD_QUEUE_CAP)} changes a field may queue before writers apply them themselves">
+          <div class="progress-bar" style="width:${pct.toFixed(1)}%"></div>
+        </div>`;
+      const lag = q.pending === 0
+        ? '<span class="text-muted">—</span>'
+        : `<span class="text-mono ${isBehind ? 'stat-val bad' : ''}">${fmtLagMs(q.oldest_pending_ms)}</span>`;
+      const rateCell = rate == null
+        ? '<span class="text-muted" title="Shown from the second refresh on">…</span>'
+        : `<span class="text-mono">${fmt(Math.round(rate))}/s</span>`;
+
+      rows.push({ behind: isBehind, pending: q.pending, html: `
+        <tr>
+          ${nsCell(r.ns)}
+          <td class="text-mono">${esc(f.field_name)}</td>
+          <td>${status}</td>
+          <td style="min-width:110px">${pendingCell}</td>
+          <td style="text-align:right">${lag}</td>
+          <td style="text-align:right">${rateCell}</td>
+          <td style="text-align:right" class="text-mono" title="Applied by the field-index worker">${fmt(q.applied_by_worker)}</td>
+          <td style="text-align:right" class="text-mono ${q.applied_by_writers > 0 ? 'stat-val warn' : ''}" title="Applied by writers themselves: the queue passed its cap (the worker had fallen behind) or no worker was running. A growing number means the worker cannot keep up.">${fmt(q.applied_by_writers)}</td>
+          <td style="text-align:right" class="text-mono" title="Applied by the index checkpoint (before it records its offset) or an explicit sync">${fmt(q.applied_by_barriers)}</td>
+          <td style="text-align:right" class="text-mono" title="The highest write sequence number whose change this field has applied">${fmt(q.applied_up_to_seq)}</td>
+        </tr>` });
+    });
+  });
+
+  if (!rows.length) { el.innerHTML = ''; return; }
+  // Behind first, then by how much is waiting.
+  rows.sort((a, b) => Number(b.behind) - Number(a.behind) || b.pending - a.pending);
+
+  const summary = behind > 0
+    ? `<div class="alert alert-warning">⚠ <strong>${fmt(behind)} field ${behind === 1 ? 'index is' : 'indices are'} behind.</strong>
+         Queries on ${behind === 1 ? 'it' : 'them'} are missing writes made in the last second or more.</div>`
+    : '';
+  el.innerHTML = `
+    <div class="section">
+      <div class="section-header">
+        <span class="section-title">FIELD INDEX UPDATES (${fmt(pendingTotal)} pending)</span>
+        <button class="btn btn-xs ${fiu.live ? 'btn-accent' : 'btn-ghost'}" onclick="toggleFieldIndexUpdatesLive()"
+                title="Refresh this panel every 2 seconds">${fiu.live ? '● Live' : '○ Live'}</button>
+      </div>
+      <div class="text-muted" style="font-size:12px;margin-bottom:6px">
+        A write returns once it is durable; a background worker then applies its field-index changes,
+        after a short delay (20 ms by default) so a burst is applied at once. Queries read only what has been applied.
+      </div>
+      ${summary}
+      <div class="tbl-wrap"><table class="tbl">
+        <thead><tr>
+          <th>Namespace</th><th>Field</th><th>Status</th>
+          <th title="Changes written but not yet applied: queries do not see them yet">Pending</th>
+          <th style="text-align:right" title="How long the oldest waiting change has waited">Lag</th>
+          <th style="text-align:right" title="Changes applied per second since the last refresh">Rate</th>
+          <th style="text-align:right" title="Changes the field-index worker applied">By worker</th>
+          <th style="text-align:right" title="Changes writers applied themselves: the queue passed its cap or no worker was running. Should stay 0 while the worker keeps up.">By writers</th>
+          <th style="text-align:right" title="Changes the index checkpoint (before recording its offset) or an explicit sync applied">By checkpoint</th>
+          <th style="text-align:right" title="Highest write sequence number applied">Applied up to seq</th>
+        </tr></thead>
+        <tbody>${rows.map(r => r.html).join('')}</tbody>
+      </table></div>
+    </div>`;
+}
+
+function fmtLagMs(ms) {
+  if (ms < 1000) return `${fmt(ms)} ms`;
+  if (ms < 60000) return `${(ms / 1000).toFixed(1)} s`;
+  return `${Math.floor(ms / 60000)} min ${Math.round((ms % 60000) / 1000)} s`;
+}
+
+function toggleFieldIndexUpdatesLive() {
+  fiu.live = !fiu.live;
+  clearInterval(fiu.timer);
+  fiu.timer = null;
+  if (fiu.live) fiu.timer = setInterval(pollFieldIndexUpdates, 2000);
+  pollFieldIndexUpdates();
+}
+
+async function pollFieldIndexUpdates() {
+  // Stop once the panel is gone (another tab or page).
+  if (!document.getElementById('admin-index-updates')) {
+    clearInterval(fiu.timer);
+    fiu.timer = null;
+    fiu.live = false;
+    return;
+  }
+  const namespaces = fieldIndexNamespaces();
+  if (!namespaces.length) return;
+  renderFieldIndexUpdates(await fetchFieldIndexHealth(namespaces));
 }
 
 // Cause and repair mode both matter: a wedged checkpoint worker, a crash after
